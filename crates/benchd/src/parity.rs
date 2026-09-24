@@ -109,6 +109,24 @@ const ROSTER: &[(&str, Bucket)] = &[
     ("metrics.correctness_seconds", Env),
 ];
 
+/// Keys the differ WAIVES outright: present or absent, on either side, they are never compared
+/// and never drift-fail.
+///
+/// `metrics.gates` is the run's gate log (David 2026-09-17). It is environmental BY CONSTRUCTION —
+/// how long a box took to go idle and to cool, and the load, utilization and temperature it
+/// reached, are facts about that box on that day, so two honest producers never agree on them. It
+/// cannot be ROSTERED as `Env`, because the roster's missing-key gate hard-fails any rostered key
+/// that is absent on a side, and the reference never emits this one; and it cannot be left
+/// UNKNOWN, because the unknown-key gate hard-fails any key that is present and unrostered. So it
+/// is named here, waived on both counts, and the value comparison below (which walks the ROSTER,
+/// not the keys) never reaches it.
+const WAIVED_KEYS: &[&str] = &["metrics.gates"];
+
+/// Whether the differ waives this flattened key entirely ([`WAIVED_KEYS`]).
+pub fn is_waived(key: &str) -> bool {
+    WAIVED_KEYS.contains(&key)
+}
+
 const DET_FLOAT_TOL: f64 = 1e-9;
 const PEAK_RAM_REL_TOL: f64 = 0.05;
 const TIMED_BAND: f64 = 0.10;
@@ -279,7 +297,7 @@ pub fn diff(a: &Value, b: &Value) -> Verdict {
     keys.sort();
     keys.dedup();
     for k in &keys {
-        if bucket_of(k).is_none() {
+        if bucket_of(k).is_none() && !is_waived(k) {
             hard(
                 &mut v,
                 "UNKNOWN-FIELD",
@@ -598,6 +616,7 @@ mod tests {
         "engine_backend",
         "engine_device",
         "engine_protocol_version",
+        "gates",
         "head_provenance_sha256",
         "local_phases",
         "paired_legs",
@@ -664,6 +683,7 @@ mod tests {
             candidate_leg_decode_window_seconds_per_token: Some(0.0113),
             baseline_leg_seed_prefill_window_seconds_per_token: Some(0.0006),
             candidate_leg_seed_prefill_window_seconds_per_token: Some(0.0004),
+            gates: vec![crate::quiescegate::GateRecord::default()],
             paired_legs: vec![crate::score::PairedLegRecord {
                 pair: 1,
                 control_prefill_seconds_per_token: 0.0006,
@@ -1097,6 +1117,55 @@ mod tests {
         assert!(
             diff(&sample, &sample).passed(),
             "a self-identical sample must PASS"
+        );
+    }
+
+    /// THE GATE LOG NEVER BREAKS PARITY (David 2026-09-17). Its waits, loads, utilizations and
+    /// temperatures are facts about one box on one day, so two honest producers never agree on
+    /// them — and the reference emits no such key at all. The differ waives the key outright: a
+    /// benchd payload that carries it, against a reference payload that does not, still PASSES,
+    /// and two payloads carrying DIFFERENT gate logs still PASS. Nothing in the verdict names it.
+    #[test]
+    fn the_gate_log_is_waived_by_the_differ() {
+        assert!(is_waived("metrics.gates"));
+        assert_eq!(bucket_of("metrics.gates"), None, "waived, never bucketed");
+
+        let gate_point = |waited: u64| {
+            serde_json::json!([{
+                "pair": 1,
+                "leg": "control",
+                "phase": "decode",
+                "quiescence": {"state": "passed", "waited_seconds": waited, "load": 0.8, "gpu_util": 0.02},
+                "cool": {"state": "passed", "waited_seconds": 0, "gpu_temp_c": 38.5},
+            }])
+        };
+
+        // Present on the benchd side only — the reference has no such key.
+        let mut a = base();
+        let b = base();
+        a["metrics"]["gates"] = gate_point(45);
+        let v = diff(&a, &b);
+        assert!(
+            v.passed(),
+            "gate log must not fail parity: {:?}",
+            v.hard_fail
+        );
+        assert!(
+            !v.hard_fail
+                .iter()
+                .chain(&v.info)
+                .any(|m| m.key == "metrics.gates"),
+            "the verdict must not name the waived key"
+        );
+
+        // Present on BOTH sides with different waits — still PASS.
+        let mut a = base();
+        let mut b = base();
+        a["metrics"]["gates"] = gate_point(45);
+        b["metrics"]["gates"] = gate_point(900);
+        assert!(
+            diff(&a, &b).passed(),
+            "two honest gate logs differ by design"
         );
     }
 

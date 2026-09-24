@@ -167,12 +167,50 @@ assemble the verdict, seal.
 
 | gate | module | refuses when |
 |---|---|---|
+| quiescence gate | `quiescegate` | The box is not idle before a timed phase. It polls the 1-minute load average and the GPU utilization, and refuses when the box stays busy. |
 | cool gate | `coolgate` | The GPU is above the platform's temperature before a timed phase. It streams the temperature reader and polls finely near the gate. |
 | weights preflight | `weights_preflight` | The checkpoint directory is not the declared shape. |
 | byte budget | `byte_budget` | The editable surface of a submission is over its budget. |
 | write-outside gate | `editable_divergence` | A submission differs from its base outside `editablePaths`. |
 | trusted-scope freeze | `trusted_scope` | An editable entry overlaps a trusted file. |
 | correctness | `correctness` | The engine's tokens diverge from the golden, or its `hello` disagrees with its manifest. |
+
+**The two timed-phase gates.** Every timed measurement runs behind BOTH of them, in one order:
+the quiescence gate first, then the cool gate. `quiescegate::run_timed_phase_gates` is the one
+place that order is written down. The thresholds are fixed, like the cool-gate temperature: the
+1-minute load average must be below 2.0 and the GPU utilization below 0.10. The gate samples every
+15 seconds and refuses with `QUIESCENCE-TIMEOUT` after 900 seconds. A dropped telemetry sample
+counts as busy, never as idle. It reads the load from `sysctl -n vm.loadavg` on a Mac and from
+`/proc/loadavg` on a Spark, and the utilization from the same `macmon` or `nvidia-smi` binary the
+cool gate reads the temperature from.
+
+The gates apply at three places: both legs of the paired official path, every pass of
+`calibrate-baseline`, and the local modes when the gates are on. One switch turns both off:
+`MLXFAST_LOCAL_COOL_GATE=0`, or the local-mode rule that leaves them off. There is no second
+switch. The ranked path fails closed when either gate finds no reader.
+
+**The sealed gate log (`gates`).** A run has many gate points, so the seal names each one
+separately. `score.json` carries `metrics.gates`: one record per gate point, in run order. A
+paired run of two pairs seals eight records — two pairs, two legs (`control`, `candidate`), two
+phases (`prefill`, `decode`) — and each record carries both gates:
+
+| field | meaning |
+|---|---|
+| `pair` | The pair the point belongs to. A calibration file carries `pass` here instead. |
+| `leg` | `control` or `candidate`. Absent on a calibration pass, which has one leg. |
+| `phase` | `prefill` or `decode`. |
+| `quiescence` | `state` (`passed` or `skipped`), `waited_seconds`, `load`, `gpu_util`, and `skip_reason` when it was skipped. |
+| `cool` | `state`, `waited_seconds`, `gpu_temp_c`, and `skip_reason` when it was skipped. |
+
+A gate that REFUSED never reaches a seal: the run stops instead, so only `passed` and `skipped`
+appear. The readings are present only when the gate ran. The calibration file
+(`baseline-calibration.json`) carries the same records under its own `gates` key, one set per
+pass, with the same field names. Both keys are omitted when the array is empty.
+
+`parity-diff` WAIVES `metrics.gates`. A wait, a load and a temperature are facts about one box on
+one day, so two honest producers never agree on them, and the reference emits no such key. The
+key is neither compared nor drift-failed. The per-leg gate states the `measure-job` seam records
+(`serial_gate_state`, `serial_quiesce_state` and their candidate twins) are unchanged.
 
 **Residency.** `legserve` boots and stops the resident engine of each leg from that leg's own
 workspace, through the engine repository's `tools/resident-up.sh` on a Mac and

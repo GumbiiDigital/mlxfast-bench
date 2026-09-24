@@ -911,8 +911,9 @@ where
 /// verb (`prefill`, then `free_decode_begin`). The reset is request-triggered, so a persistent worker
 /// gets exactly the reset a freshly-spawned one would. The prefill phase closes its own barrier
 /// inside [`measure_prefill`] (allocator drained to `cache_memory == 0`), so the decode phase enters
-/// clean. `cool_gate` is invoked once per phase (`"prefill"` before the prefill timer, `"decode"`
-/// before the decode timer). `verify` gates the oracle-mismatch abort.
+/// clean. `cool_gate` is the caller's per-phase GATE callback — benchd passes the quiescence gate
+/// and the cool gate, in that order — and it is invoked once per phase (`"prefill"` before the
+/// prefill timer, `"decode"` before the decode timer). `verify` gates the oracle-mismatch abort.
 pub fn run_timed_benchmark_persistent_on_session<T, G>(
     session: &mut Session<T>,
     cool_gate: &mut G,

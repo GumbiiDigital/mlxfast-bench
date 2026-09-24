@@ -27,7 +27,13 @@
 //! - missing reader / repeated unusable samples → SKIP (warn, never fail); a hot GPU that is
 //!   NOT trending down (stall) or that never reaches the gate (ceiling) → ABORT (error), so a
 //!   scripted loop stops instead of measuring a loaded GPU.
-//! - `MLXFAST_LOCAL_COOL_GATE=0` disables the gate (with a not-comparable warning).
+//! - `MLXFAST_LOCAL_COOL_GATE=0` disables the gate (with a not-comparable warning). The same
+//!   switch disables the quiescence gate, because the two gates guard the same window.
+//!
+//! This gate is the SECOND of the two gates every timed measurement runs behind. The box
+//! QUIESCENCE gate ([`crate::quiescegate`]) runs immediately before it, and
+//! [`crate::quiescegate::run_timed_phase_gates`] is the ONE place that order is written down: a
+//! cold GPU on a busy box is still not a measurable box.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -51,11 +57,33 @@ const PROGRESS_EPSILON_C: f64 = 0.25;
 /// POLL_SECONDS units, so every abort/ceiling comparison is unchanged (see the fine-poll block).
 const FINE_POLL_WINDOW_C: f64 = 1.0;
 
+/// The ONE environment switch BOTH timed-phase gates share — the cool gate and the box quiescence
+/// gate ([`crate::quiescegate`]). David 2026-09-17: the two gates guard the same window, so there
+/// is no second knob.
+pub(crate) const GATE_SWITCH_ENV: &str = "MLXFAST_LOCAL_COOL_GATE";
+
+/// Whether that switch turns both gates OFF. Pure, so both gates' skip path is testable without
+/// touching the process environment.
+pub(crate) fn gates_disabled_by(value: Option<&str>) -> bool {
+    value == Some("0")
+}
+
+/// The skip reason BOTH gates report when the shared switch turns them off.
+pub(crate) const GATE_SKIP_DISABLED: &str = "the gates are off (MLXFAST_LOCAL_COOL_GATE=0)";
+/// The cool gate's own no-reader skip reason.
+pub(crate) const COOL_GATE_SKIP_NO_READER: &str = "no GPU temperature reader";
+
+/// [`gates_disabled_by`] read from the process environment.
+pub(crate) fn gates_disabled() -> bool {
+    gates_disabled_by(std::env::var(GATE_SWITCH_ENV).ok().as_deref())
+}
+
 /// Outcome of the poll loop (the pure core, independent of subprocess/sleep).
 #[derive(Debug, PartialEq)]
 pub enum CoolGateOutcome {
-    /// GPU reached the gate temperature after `waited` seconds.
-    Passed { waited: u64 },
+    /// GPU reached the gate temperature after `waited` seconds, at `temp_c`. The temperature is
+    /// the SAMPLE THAT PASSED, so the seal records what the gate actually saw, not the last tick.
+    Passed { waited: u64, temp_c: f64 },
     /// The gate was skipped (unusable/absent reader) — never a failure.
     Skipped(String),
 }
@@ -130,7 +158,10 @@ where
         progress(waited, temp, min_temp.unwrap_or(temp));
 
         if temp <= gate_temp {
-            return Ok(CoolGateOutcome::Passed { waited });
+            return Ok(CoolGateOutcome::Passed {
+                waited,
+                temp_c: temp,
+            });
         }
 
         // Abort: hot AND not trending down (external GPU load) — more waiting won't help.
@@ -162,11 +193,12 @@ where
         if temp - gate_temp < FINE_POLL_WINDOW_C {
             for _ in 0..POLL_SECONDS {
                 sleep(1);
-                if read_temp().is_some_and(|t| t.is_finite() && t <= gate_temp) {
+                if let Some(t) = read_temp().filter(|t| t.is_finite() && *t <= gate_temp) {
                     // The SAME outcome the coarse loop reports when it observes this at the top of
                     // the next tick: `waited` is a logical counter in POLL_SECONDS units.
                     return Ok(CoolGateOutcome::Passed {
                         waited: waited + POLL_SECONDS,
+                        temp_c: t,
                     });
                 }
             }
@@ -205,14 +237,14 @@ impl TempReader {
 /// bare `cfg!`) so the per-platform reader dispatch ([`resolve_temp_reader_for`]) is unit-testable
 /// for BOTH platforms regardless of the host the tests run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostOs {
+pub(crate) enum HostOs {
     Linux,
     MacOs,
     Other,
 }
 
 /// The compile-time host OS.
-fn host_os() -> HostOs {
+pub(crate) fn host_os() -> HostOs {
     if cfg!(target_os = "linux") {
         HostOs::Linux
     } else if cfg!(target_os = "macos") {
@@ -263,10 +295,11 @@ fn resolve_temp_reader_for(os: HostOs) -> Option<TempReader> {
     }
 }
 
-/// Discover a macmon binary: PATH, then the homebrew / `~/bin` install locations.
-fn resolve_macmon() -> Option<TempReader> {
+/// Discover a macmon binary: PATH, then the homebrew / `~/bin` install locations. The quiescence
+/// gate reads GPU utilization from the SAME binary, so the discovery lives here once.
+pub(crate) fn macmon_bin() -> Option<PathBuf> {
     if let Some(p) = which("macmon") {
-        return Some(TempReader::Macmon(p));
+        return Some(p);
     }
     for cand in [
         "/opt/homebrew/bin/macmon",
@@ -275,16 +308,21 @@ fn resolve_macmon() -> Option<TempReader> {
     ] {
         let p = PathBuf::from(cand);
         if is_executable(&p) {
-            return Some(TempReader::Macmon(p));
+            return Some(p);
         }
     }
     None
 }
 
-/// Discover an nvidia-smi binary: PATH, then the usual `/usr/bin` install locations.
-fn resolve_nvidia_smi() -> Option<TempReader> {
+fn resolve_macmon() -> Option<TempReader> {
+    macmon_bin().map(TempReader::Macmon)
+}
+
+/// Discover an nvidia-smi binary: PATH, then the usual `/usr/bin` install locations. The
+/// quiescence gate reads GPU utilization from the SAME binary, so the discovery lives here once.
+pub(crate) fn nvidia_smi_bin() -> Option<PathBuf> {
     if let Some(p) = which("nvidia-smi") {
-        return Some(TempReader::NvidiaSmi(p));
+        return Some(p);
     }
     for cand in [
         "/usr/bin/nvidia-smi",
@@ -293,13 +331,17 @@ fn resolve_nvidia_smi() -> Option<TempReader> {
     ] {
         let p = PathBuf::from(cand);
         if is_executable(&p) {
-            return Some(TempReader::NvidiaSmi(p));
+            return Some(p);
         }
     }
     None
 }
 
-fn is_executable(p: &std::path::Path) -> bool {
+fn resolve_nvidia_smi() -> Option<TempReader> {
+    nvidia_smi_bin().map(TempReader::NvidiaSmi)
+}
+
+pub(crate) fn is_executable(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -493,10 +535,11 @@ fn read_temp(reader: &TempReader) -> Option<f64> {
 /// available — the documented skip; a HOT GPU that cannot cool is never silently skipped, it
 /// aborts). Recorded verbatim in the measure-job `results.json` so the run carries provenance
 /// of whether thermal enforcement actually happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GateState {
     Fired,
     Waited,
+    #[default]
     SkippedNoReader,
 }
 
@@ -515,6 +558,30 @@ impl GateState {
 // ONE `mtp-timed` verb with ONE cool gate, so there is a single gate state per leg to record —
 // there is no longer a prefill+decode pair of states to fold into one.
 
+/// What the cool gate sealed for one timed phase: its state, how long it waited, and the GPU
+/// temperature of the sample that passed. `skip_reason` says WHY on a skip, where no temperature
+/// was observed. Parallel in shape to the quiescence gate's
+/// [`crate::quiescegate::QuiesceRecord`], because the two gates guard the same window.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CoolGateRecord {
+    pub state: GateState,
+    pub waited_seconds: u64,
+    pub gpu_temp_c: Option<f64>,
+    pub skip_reason: Option<String>,
+}
+
+impl CoolGateRecord {
+    /// The record of a gate that did not run: no wait, no reading, and the reason it was skipped.
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            state: GateState::SkippedNoReader,
+            waited_seconds: 0,
+            gpu_temp_c: None,
+            skip_reason: Some(reason.into()),
+        }
+    }
+}
+
 /// Run the cool gate before a timed `phase` and REPORT its resolved state (measure-job
 /// finding 1). Uses the [`resolve_temp_reader`] discovery seam (never a hardcoded `/opt`
 /// macmon path) and does NOT swallow an abort into a silent pass: a stall/ceiling abort
@@ -525,13 +592,13 @@ impl GateState {
 /// `platform` keys the gate temperature ([`Platform::cool_gate_temp_c`]): Mac/MLX 40 C,
 /// GB10/CUDA 50 C (R21 lift, David 2026-08-30). It is the run's resolved platform, never a
 /// contract/candidate value.
-pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<GateState, RunnerError> {
+pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<CoolGateRecord, RunnerError> {
     let gate_temp = platform.cool_gate_temp_c();
-    if std::env::var("MLXFAST_LOCAL_COOL_GATE").ok().as_deref() == Some("0") {
+    if gates_disabled() {
         eprintln!(
             "benchd: {phase} cool gate disabled (MLXFAST_LOCAL_COOL_GATE=0); hot-start timings are not comparable to gated runs"
         );
-        return Ok(GateState::SkippedNoReader);
+        return Ok(CoolGateRecord::skipped(GATE_SKIP_DISABLED));
     }
     let reader = match resolve_temp_reader() {
         Some(r) => r,
@@ -539,7 +606,7 @@ pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<GateState, Ru
             eprintln!(
                 "benchd: skipping the {phase} GPU cool-down gate: no temperature reader (install macmon, set MLXFAST_MACMON_BIN, or set MLXFAST_GPU_TEMP_CMD)"
             );
-            return Ok(GateState::SkippedNoReader);
+            return Ok(CoolGateRecord::skipped(COOL_GATE_SKIP_NO_READER));
         }
     };
     eprintln!(
@@ -563,20 +630,25 @@ pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<GateState, Ru
             );
         },
     ) {
-        Ok(CoolGateOutcome::Passed { waited }) => {
+        Ok(CoolGateOutcome::Passed { waited, temp_c }) => {
             eprintln!(
-                "benchd: {phase} cool gate passed (waited {waited}s, target <={gate_temp:.0}C)"
+                "benchd: {phase} cool gate passed (waited {waited}s, gpu_temp {temp_c:.1}C, target <={gate_temp:.0}C)"
             );
             // waited==0 ⇒ already cool (fired without blocking); waited>0 ⇒ blocked to cool.
-            Ok(if waited == 0 {
-                GateState::Fired
-            } else {
-                GateState::Waited
+            Ok(CoolGateRecord {
+                state: if waited == 0 {
+                    GateState::Fired
+                } else {
+                    GateState::Waited
+                },
+                waited_seconds: waited,
+                gpu_temp_c: Some(temp_c),
+                skip_reason: None,
             })
         }
         Ok(CoolGateOutcome::Skipped(why)) => {
             eprintln!("benchd: {phase} cool gate skipped: {why}");
-            Ok(GateState::SkippedNoReader)
+            Ok(CoolGateRecord::skipped(why))
         }
         // A stall/ceiling abort is a TYPED gate rejection (the retry class), NOT swallowed.
         Err(e) => Err(RunnerError::GateRejected {
@@ -584,16 +656,6 @@ pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<GateState, Ru
             reason: e,
         }),
     }
-}
-
-/// Run the cool gate before a timed `phase` ("prefill"/"decode"). Returns `Ok(())` on pass
-/// or skip; `Err` on a stall/ceiling abort (which fails the timed run, as benchmark.sh
-/// `exit 1` aborts the benchmark). This is the closure benchd threads into the local
-/// timing path, and the body of the `--local-cool-gate-only` helper. Shares
-/// [`cool_gate_report`]'s discovery + fail-closed abort, discarding the recorded state. `platform`
-/// keys the gate temperature ([`Platform::cool_gate_temp_c`]).
-pub fn cool_gate(phase: &str, platform: Platform) -> Result<(), RunnerError> {
-    cool_gate_report(phase, platform).map(|_state| ())
 }
 
 #[cfg(test)]
@@ -659,7 +721,13 @@ mod tests {
     #[test]
     fn passes_immediately_when_already_cool() {
         let r = cool_gate_loop(mlx(), seq(vec![Some(38.0)]), |_| {});
-        assert_eq!(r, Ok(CoolGateOutcome::Passed { waited: 0 }));
+        assert_eq!(
+            r,
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 38.0
+            })
+        );
     }
 
     #[test]
@@ -672,7 +740,13 @@ mod tests {
             seq(vec![Some(50.0), Some(45.0), Some(41.0), Some(39.0)]),
             move |secs| *s.borrow_mut() += secs,
         );
-        assert_eq!(r, Ok(CoolGateOutcome::Passed { waited: 30 }));
+        assert_eq!(
+            r,
+            Ok(CoolGateOutcome::Passed {
+                waited: 30,
+                temp_c: 39.0
+            })
+        );
         assert_eq!(*slept.borrow(), 30);
     }
 
@@ -706,7 +780,13 @@ mod tests {
     fn tolerates_one_bad_sample_then_passes() {
         // A single unusable read (sleep 2, no waited bump), then a cool read passes at waited 0.
         let r = cool_gate_loop(mlx(), seq(vec![None, Some(35.0)]), |_| {});
-        assert_eq!(r, Ok(CoolGateOutcome::Passed { waited: 0 }));
+        assert_eq!(
+            r,
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 35.0
+            })
+        );
     }
 
     /// FINE POLL — the counter arithmetic. Within 1 C of the gate the loop samples every second,
@@ -723,7 +803,13 @@ mod tests {
         let r = cool_gate_loop(mlx(), seq(vec![Some(40.5), Some(39.0)]), move |secs| {
             *s.borrow_mut() += secs
         });
-        assert_eq!(r, Ok(CoolGateOutcome::Passed { waited: 10 }));
+        assert_eq!(
+            r,
+            Ok(CoolGateOutcome::Passed {
+                waited: 10,
+                temp_c: 39.0
+            })
+        );
         assert_eq!(
             *slept.borrow(),
             1,
@@ -737,7 +823,13 @@ mod tests {
         let r = cool_gate_loop(mlx(), seq(vec![Some(41.0), Some(39.0)]), move |secs| {
             *s.borrow_mut() += secs
         });
-        assert_eq!(r, Ok(CoolGateOutcome::Passed { waited: 10 }));
+        assert_eq!(
+            r,
+            Ok(CoolGateOutcome::Passed {
+                waited: 10,
+                temp_c: 39.0
+            })
+        );
         assert_eq!(*slept.borrow(), 10);
 
         // A GPU that sits just above the gate forever polls finely for the whole wait and still
@@ -840,17 +932,26 @@ mod tests {
         );
         assert_eq!(
             cool_gate_loop(cuda(), seq(vec![Some(41.0)]), |_| {}),
-            Ok(CoolGateOutcome::Passed { waited: 0 }),
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 41.0
+            }),
             "41C is below the 50C GB10 gate → passes (the R21 lift: GB10 idle no longer refuses)"
         );
         // Boundary: each platform passes AT its own gate temperature (inclusive).
         assert_eq!(
             cool_gate_loop(mlx(), seq(vec![Some(40.0)]), |_| {}),
-            Ok(CoolGateOutcome::Passed { waited: 0 })
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 40.0
+            })
         );
         assert_eq!(
             cool_gate_loop(cuda(), seq(vec![Some(50.0)]), |_| {}),
-            Ok(CoolGateOutcome::Passed { waited: 0 })
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 50.0
+            })
         );
     }
 
@@ -873,7 +974,10 @@ mod tests {
         // POSITIVE CONTROL: below the 50 C GB10 gate (e.g. 45 C) the gate passes.
         assert_eq!(
             cool_gate_loop(cuda(), seq(vec![Some(45.0)]), |_| {}),
-            Ok(CoolGateOutcome::Passed { waited: 0 })
+            Ok(CoolGateOutcome::Passed {
+                waited: 0,
+                temp_c: 45.0
+            })
         );
     }
 

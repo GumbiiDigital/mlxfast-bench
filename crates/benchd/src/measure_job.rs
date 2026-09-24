@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coolgate::GateState;
 use crate::iterate::{finite_nonneg, DirDigest};
+use crate::quiescegate::QuiesceRecord;
 
 /// One gated retry per LEG: `MAX_ATTEMPTS = 2` with a FULL precondition reset between attempts (a
 /// fresh worker per leg is spawned on every attempt, so the ONE cool gate + quiesce re-run before
@@ -3506,6 +3507,11 @@ pub struct LegInvocation {
     /// `run_decode_phase_fresh` / `run_free_run_decode_phase_fresh`'s own measured spt.
     pub benchd_seconds_per_token: f64,
     pub gate_state: GateState,
+    /// The QUIESCENCE gate that ran immediately BEFORE this leg's cool gate: its state, its wait,
+    /// and the load / GPU utilization it passed on (David 2026-09-17). Sealed beside the cool
+    /// gate's state so a run's artifact shows the window opened on an IDLE box, not only a cold
+    /// one.
+    pub quiesce: QuiesceRecord,
     /// R16 — the ONE telemetry sample the leg's cool gate observed (peak GPU temp + steady loaded
     /// clock), folded run-wide into the sealed `telemetry`. `None` when no sample was available (the
     /// on-box telemetry stream is deferred — the top-level `telemetry` is then OMITTED honestly).
@@ -3665,6 +3671,9 @@ struct LegMeasurement {
     /// ([`LegInvocation::benchd_seconds_per_token`]), NOT any worker-authored value.
     seconds_per_token: f64,
     gate_state: GateState,
+    /// The leg's quiescence-gate record (set by the caller from the `LegInvocation`, like
+    /// `gate_state`).
+    quiesce: QuiesceRecord,
     /// #109 window-2 finding 3 — the head the engine loaded, from the WIRE `hello`
     /// (`head_provenance.sha256`); `None` on a leg whose hello omitted the object (the v1-only
     /// surface). Required on the candidate leg.
@@ -3800,6 +3809,23 @@ pub struct PairRecord {
     /// gate's state directly, no prefill/decode fold.
     pub serial_gate_state: String,
     pub candidate_gate_state: String,
+    /// The QUIESCENCE-gate state of each leg (fired / waited / skipped-no-reader), with the wait
+    /// and the readings it passed on: the 1-minute load average and the GPU utilization fraction.
+    /// Same three spellings and the same per-leg shape as the cool gate's state above, because the
+    /// two gates guard the same window — quiescence first, then cool (David 2026-09-17). The
+    /// readings are OMITTED on a skip, where nothing was observed.
+    pub serial_quiesce_state: String,
+    pub candidate_quiesce_state: String,
+    pub serial_quiesce_waited_seconds: u64,
+    pub candidate_quiesce_waited_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_quiesce_load: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_quiesce_load: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_quiesce_gpu_util: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_quiesce_gpu_util: Option<f64>,
     /// The effective spec each leg actually ran. Sealed as fact, NEVER the declared value — the
     /// candidate's DECLARED mtp spec is `results.candidate_spec` provenance. On a free-run pair this
     /// is the engine's WIRE `effective_spec` ([`SpecConfig`]) the runner captured + validated
@@ -4833,6 +4859,7 @@ fn validate_leg_report(
     Ok(LegMeasurement {
         seconds_per_token: spt,
         gate_state: GateState::SkippedNoReader, // overwritten by the caller with the real state
+        quiesce: QuiesceRecord::default(),      // overwritten by the caller with the real record
         head_provenance_sha256: head,
         effective_mean_draft_len,
         non_drafting_round_count,
@@ -4946,6 +4973,7 @@ where
             ) {
                 Ok(mut m) => {
                     m.gate_state = inv.gate_state;
+                    m.quiesce = inv.quiesce;
                     m.telemetry = inv.telemetry;
                     // R16 — the real attempt count (1-based): this leg succeeded on attempt `_attempt`.
                     m.attempts = _attempt + 1;
@@ -5184,6 +5212,14 @@ where
         mtp_first_block_seconds: None,
         serial_gate_state: serial.gate_state.as_str().to_string(),
         candidate_gate_state: candidate.gate_state.as_str().to_string(),
+        serial_quiesce_state: serial.quiesce.state.as_str().to_string(),
+        candidate_quiesce_state: candidate.quiesce.state.as_str().to_string(),
+        serial_quiesce_waited_seconds: serial.quiesce.waited_seconds,
+        candidate_quiesce_waited_seconds: candidate.quiesce.waited_seconds,
+        serial_quiesce_load: serial.quiesce.load,
+        candidate_quiesce_load: candidate.quiesce.load,
+        serial_quiesce_gpu_util: serial.quiesce.gpu_util,
+        candidate_quiesce_gpu_util: candidate.quiesce.gpu_util,
         // The effective spec each leg ran, with its provenance. On a free-run job the CONTROL echoes
         // serial (depth 0) and the CANDIDATE echoes its speculating spec — the two legs' guards
         // enforce exactly that. On a teacher-forced job both legs are serial from the gate-off spawn
@@ -7767,6 +7803,7 @@ mod tests {
         LegInvocation {
             benchd_seconds_per_token: echo.spt,
             gate_state,
+            quiesce: QuiesceRecord::default(),
             telemetry,
             wire_effective_spec,
             // #109 W3 finding 5 — the gate-off surface: no head_provenance, ever, on a TF leg.
@@ -7796,6 +7833,7 @@ mod tests {
             benchd_seconds_per_token: spt,
             wire_head_provenance: head_prov(CANDIDATE_HEAD_SHA),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: candidate_telemetry(),
             wire_effective_spec: Some(SpecConfig::mtp(FREE_RUN_DEPTH)),
             regime: LegRegime::FreeRunV1_1,
@@ -7828,6 +7866,7 @@ mod tests {
             benchd_seconds_per_token: spt,
             wire_head_provenance: head_prov(CANDIDATE_HEAD_SHA),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: candidate_telemetry(),
             wire_effective_spec: Some(SpecConfig::dflash(depth)),
             regime: LegRegime::FreeRunV1_1,
@@ -7864,6 +7903,7 @@ mod tests {
             benchd_seconds_per_token: SERIAL_SPT,
             wire_head_provenance: head_prov(SERIAL_HEAD_SHA),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: serial_telemetry(),
             wire_effective_spec: Some(SpecConfig::serial()),
             regime: LegRegime::FreeRunV1_1,
@@ -8616,6 +8656,67 @@ mod tests {
         );
     }
 
+    /// David 2026-09-17 — the QUIESCENCE gate seals beside the cool gate, per leg: its state, the
+    /// seconds it waited, and the load / GPU utilization it passed on. A reader of the artifact can
+    /// see that the window opened on an IDLE box, not only on a cold one.
+    #[test]
+    fn leg_quiescence_gate_recorded_directly_per_leg() {
+        use crate::quiescegate::QuiesceState;
+        let cfg = test_cfg(1, 1);
+        let out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &cfg,
+            |_p| {
+                let mut leg = inv(echo(SERIAL_SPT), GateState::Fired, serial_telemetry());
+                leg.quiesce = QuiesceRecord {
+                    state: QuiesceState::Waited,
+                    waited_seconds: 45,
+                    load: Some(1.25),
+                    gpu_util: Some(0.03),
+                    skip_reason: None,
+                };
+                Ok(leg)
+            },
+            |_p| {
+                let mut leg = inv(echo(CANDIDATE_SPT), GateState::Fired, candidate_telemetry());
+                leg.quiesce = QuiesceRecord {
+                    state: QuiesceState::Fired,
+                    waited_seconds: 0,
+                    load: Some(0.50),
+                    gpu_util: Some(0.01),
+                    skip_reason: None,
+                };
+                Ok(leg)
+            },
+        )
+        .unwrap();
+        assert_eq!(out.results.accepted_pair_count, 1);
+        let pair = &out.results.pairs[0];
+        assert_eq!(pair.serial_quiesce_state, "waited");
+        assert_eq!(pair.serial_quiesce_waited_seconds, 45);
+        assert_eq!(pair.serial_quiesce_load, Some(1.25));
+        assert_eq!(pair.serial_quiesce_gpu_util, Some(0.03));
+        assert_eq!(pair.candidate_quiesce_state, "fired");
+        assert_eq!(pair.candidate_quiesce_waited_seconds, 0);
+        assert_eq!(pair.candidate_quiesce_load, Some(0.50));
+        assert_eq!(pair.candidate_quiesce_gpu_util, Some(0.01));
+        // A skipped gate seals the skip and OMITS the readings it never took.
+        let sealed = serde_json::to_value(pair).expect("the pair record serializes");
+        assert_eq!(sealed["serial_quiesce_state"], "waited");
+        assert_eq!(sealed["candidate_quiesce_gpu_util"], 0.01);
+        let skipped = serde_json::to_value(PairRecord {
+            serial_quiesce_state: QuiesceState::SkippedNoReader.as_str().to_string(),
+            serial_quiesce_load: None,
+            serial_quiesce_gpu_util: None,
+            ..pair.clone()
+        })
+        .expect("the pair record serializes");
+        assert_eq!(skipped["serial_quiesce_state"], "skipped-no-reader");
+        assert!(skipped.get("serial_quiesce_load").is_none());
+    }
+
     #[test]
     fn leg_gate_state_recorded_directly_per_leg() {
         // R15 — ONE cool gate per leg (a single `mtp-timed` invocation), so the recorded per-leg
@@ -9053,6 +9154,7 @@ mod tests {
                     // #109 W3 finding 5 — the conformant gate-off TF hello carries NO head.
                     wire_head_provenance: None,
                     gate_state: GateState::Fired,
+                    quiesce: QuiesceRecord::default(),
                     telemetry: candidate_telemetry(),
                     // The conformant gate-off TF shape (no echo) — so the ONLY thing wrong with this
                     // leg is the clock.
@@ -12048,6 +12150,7 @@ mod tests {
             // — benchd computes those from the histogram it collected.
             wire_head_provenance: wire_head_provenance.into_inner(),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: candidate_telemetry(),
             wire_effective_spec: timing.effective_spec,
             regime: LegRegime::FreeRunV1_1,
@@ -13201,6 +13304,7 @@ mod tests {
             benchd_seconds_per_token: spt,
             wire_head_provenance: head_prov(CANDIDATE_HEAD_SHA),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: candidate_telemetry(),
             wire_effective_spec: Some(SpecConfig::mtp(FREE_RUN_DEPTH)),
             regime: b8_regime(),
@@ -13223,6 +13327,7 @@ mod tests {
             benchd_seconds_per_token: SERIAL_SPT,
             wire_head_provenance: head_prov(SERIAL_HEAD_SHA),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: serial_telemetry(),
             wire_effective_spec: Some(SpecConfig::serial()),
             regime: b8_regime(),
@@ -14485,6 +14590,7 @@ mod tests {
                 SERIAL_HEAD_SHA
             }),
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: if candidate {
                 candidate_telemetry()
             } else {
@@ -15067,6 +15173,7 @@ mod tests {
         Ok(LegInvocation {
             benchd_seconds_per_token: t.seconds_per_token,
             gate_state: GateState::Fired,
+            quiesce: QuiesceRecord::default(),
             telemetry: None,
             wire_effective_spec: t.effective_spec,
             wire_head_provenance: wire_head_provenance.into_inner(),

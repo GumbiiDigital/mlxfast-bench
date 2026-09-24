@@ -74,12 +74,13 @@ Use the stock tree. Do not modify the engine for the capture.
 the flag when you parse the command line.
 
 Know the regime you capture in, and keep it the same for all four passes. The mode runs
-`local-iterate`, whose cool gate is OFF by default. Add `--cool-gate` to make it ON. The box
-cool-down rule tells you which of the two to use. Use the same one for every pass, and name it in
+`local-iterate`, whose timed-phase gates are OFF by default. Add `--cool-gate` to make them ON:
+the one flag controls BOTH the quiescence gate and the cool gate. The box cool-down rule tells you
+which of the two to use. Use the same one for every pass, and name it in
 the pull request.
 
 One pair serves BOTH local legs. `local-submit` scores against the same captured pair, but it
-runs its cool gate ON by default, and it uses the decode window the fixture declares in
+runs its gates ON by default, and it uses the decode window the fixture declares in
 `local_submit_benchmark_decode_steps` in place of `benchmark_decode_steps`. Ruling #127 makes
 both local legs score against the declared pair and nothing else, and the fixture declares one
 pair for each track. Record the regime you captured in, so that a later reader knows what the
@@ -166,7 +167,9 @@ Put this in the pull request body:
 * the whole capture record, with every identity field: `track_id`, `mode`, `decode_steps`,
   `engine_sha256`, `weights_sha256`, `golden_sha256`, `benchd_sha256`;
 * the merged engine head SHA and the benchd commit SHA;
-* the cool-gate setting the passes used.
+* the `--cool-gate` setting the passes used. It turns the quiescence gate and the cool gate on or
+  off together. With the gates on, the calibration file itself carries a `gates` array: one record
+  per gate point, naming its pass and phase and what both gates read.
 
 The record is OPERATOR-ATTESTED. It is not machine-attested. benchd merges each pass into
 whatever record parses at the path you give it, and no code reads the record again after that. A

@@ -125,6 +125,16 @@ pub struct BaselineCalibration {
     pub captured_at: String,
     /// The benchd source commit that measured the legs (40 lowercase hex).
     pub benchd_source_commit: String,
+    /// GATE LOG (David 2026-09-17): every GATE POINT the calibration passes ran behind, in run
+    /// order, each naming its PASS and the phase it guarded, and what BOTH gates read. Same
+    /// records and same field names as a score's `metrics.gates`, except that a pass has one leg,
+    /// so a record carries `pass` in place of `pair` and no `leg`.
+    ///
+    /// OMITTED when empty, so a file captured with the gates off keeps the key set it had, and
+    /// `default` lets this benchd read every calibration file written before the gates were
+    /// sealed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<crate::quiescegate::GateRecord>,
 }
 
 /// A calibration file together with the identity of the BYTES it was read from — the digest the
@@ -703,6 +713,7 @@ pub fn calibration_from_passes(
     identity: &CalibrationIdentity<'_>,
     prefill_legs: &[f64],
     decode_legs: &[f64],
+    gates: Vec<crate::quiescegate::GateRecord>,
 ) -> Result<BaselineCalibration, String> {
     if prefill_legs.len() != decode_legs.len() {
         return Err(format!(
@@ -754,6 +765,7 @@ pub fn calibration_from_passes(
         decode_band_high: DEFAULT_DECODE_BAND_HIGH,
         captured_at: identity.captured_at.to_string(),
         benchd_source_commit: identity.benchd_source_commit.to_string(),
+        gates,
     };
     // The file this run writes must be one this same benchd would accept.
     calibration.validate()?;
@@ -1181,6 +1193,7 @@ mod tests {
             &identity,
             &[0.001, 0.001, 0.001, 0.001],
             &[0.030, 0.030, 0.030, 0.030],
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(cal.passes, 4);
@@ -1195,6 +1208,7 @@ mod tests {
             &identity,
             &[0.001, 0.001, 0.001, 0.001],
             &[0.030, 0.032, 0.029, 0.031],
+            Vec::new(),
         )
         .unwrap_err();
         assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
@@ -1225,7 +1239,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // One pass has no coefficient of variation at all.
-        let err = calibration_from_passes(&identity, &[0.001], &[0.030]).unwrap_err();
+        let err = calibration_from_passes(&identity, &[0.001], &[0.030], Vec::new()).unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
+    }
+
+    /// THE CALIBRATION FILE CARRIES EVERY GATE POINT, PER PASS (David 2026-09-17), in the same
+    /// record shape a score's `metrics.gates` uses — `pass` in place of `pair`, and no leg. The
+    /// file survives the write/read round trip with the records intact, and a file with NO gate
+    /// points keeps the key set it always had.
+    #[test]
+    fn the_calibration_file_seals_the_gate_points_of_every_pass() {
+        use crate::quiescegate::{CoolReading, GateRecord, QuiescenceReading};
+        let identity = CalibrationIdentity {
+            track_id: "mlx-qwen38",
+            box_name: "box-3",
+            reference_commit: &"a".repeat(40),
+            prompt: "p",
+            benchd_source_commit: &"b".repeat(40),
+            captured_at: "2026-09-17T00:00:00Z",
+        };
+        let point = |pass: i64, phase: &str, waited: u64| GateRecord {
+            pair: None,
+            pass: Some(pass),
+            leg: None,
+            phase: phase.to_string(),
+            quiescence: QuiescenceReading {
+                state: "passed".to_string(),
+                waited_seconds: waited,
+                load: Some(0.40),
+                gpu_util: Some(0.01),
+                skip_reason: None,
+            },
+            cool: CoolReading {
+                state: "passed".to_string(),
+                waited_seconds: 0,
+                gpu_temp_c: Some(38.0),
+                skip_reason: None,
+            },
+        };
+        let gates = vec![
+            point(1, "prefill", 0),
+            point(1, "decode", 15),
+            point(2, "prefill", 30),
+            point(2, "decode", 45),
+        ];
+        let cal =
+            calibration_from_passes(&identity, &[0.001, 0.001], &[0.030, 0.030], gates.clone())
+                .unwrap();
+        assert_eq!(cal.gates, gates);
+
+        let dir = std::env::temp_dir().join(format!(
+            "benchd-calibration-gates-test.{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("baseline-calibration.json");
+        write_calibration(&out, &cal).unwrap();
+        let loaded = load_calibration(Some(&out), None).unwrap();
+        assert_eq!(
+            loaded.calibration.gates, gates,
+            "the file keeps every point"
+        );
+        let sealed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(sealed["gates"][2]["pass"], 2);
+        assert_eq!(sealed["gates"][2]["phase"], "prefill");
+        assert_eq!(sealed["gates"][2]["quiescence"]["waited_seconds"], 30);
+        assert!(sealed["gates"][2].get("pair").is_none());
+        assert!(sealed["gates"][2].get("leg").is_none());
+
+        // NO gate points (the gates were off): the key is omitted, so the file's key set is the
+        // one every calibration file before this change had.
+        let ungated =
+            calibration_from_passes(&identity, &[0.001, 0.001], &[0.030, 0.030], Vec::new())
+                .unwrap();
+        let out = dir.join("ungated.json");
+        write_calibration(&out, &ungated).unwrap();
+        let sealed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(sealed.get("gates").is_none());
+        // ...and this benchd still reads it.
+        assert!(load_calibration(Some(&out), None)
+            .unwrap()
+            .calibration
+            .gates
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,9 +37,11 @@ golden. Every pair is the same two legs in the same order. Leg 1 is the **serial
 the reference tree, with no speculation: benchd verifies its tokens against the serial tape
 (`--control-golden`), checks its cost against this box's band, and stops the run when the leg falls
 outside. Leg 2 is the **candidate leg**, on the submission tree at its declared draft depth,
-verified against that depth's tape. Each leg boots its own engine and loads the model once. benchd
-sums each role's per-token times over the pairs, and the score is the live ratio of the sums:
-`(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`.
+verified against that depth's tape. Each leg boots its own engine and loads the model once. Each
+pair has its own composite, `(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`,
+from its own control leg. benchd never averages the pairs: the run scores the pair whose composite
+is the lower median over the pairs (the middle pair on an odd count, the lower of the two central
+pairs on an even count), and seals every pair as measured in `metrics.paired_legs`.
 
 Two gates then apply to that ratio. The decode speedup must be at or above
 `decode_speedup_floor`, and the prefill speedup must be at or above
@@ -63,6 +65,17 @@ flowchart LR
   L1 --> S[score.json · live ratio]
   L2 --> S --> Y
 ```
+
+Every timed phase of both legs runs behind two gates, in one order: the **quiescence gate** first,
+then the **cool gate**. The quiescence gate waits until the box is idle, a 1-minute load average
+below 2.0 and a GPU utilization below 0.10, and refuses with `QUIESCENCE-TIMEOUT` after 900
+seconds. The cool gate then waits until the GPU is at or below the platform temperature, 40 C on a
+Mac and 50 C on a Spark. The same two gates guard every pass of `calibrate-baseline` and the local
+modes when the gates are on, and one switch, `MLXFAST_LOCAL_COOL_GATE=0`, turns both off. A ranked
+run refuses when a gate finds no reader, so keep `macmon` (Mac) or `nvidia-smi` (Spark) installed
+on the box. The score seals every gate point it ran behind, in run order, as `metrics.gates`: one
+record per pair, leg and phase, with what both gates read. A calibration file carries the same
+records per pass.
 
 ## 2. The four steps
 

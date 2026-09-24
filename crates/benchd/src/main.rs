@@ -24,6 +24,7 @@ mod official;
 mod overlay;
 mod parity;
 mod prefill_decompose;
+mod quiescegate;
 mod score;
 /// #63: the shared golden-document builder for unit tests (test builds only).
 #[cfg(test)]
@@ -968,9 +969,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--local-cool-gate-only`: run the local GPU cool-down gate for the phase named in
-/// `MLXFAST_LOCAL_COOL_GATE_PHASE`, then exit. Mirrors benchmark.sh's `--local-cool-gate-only`
-/// so the Swift harness can dispatch its `runLocalPhaseCoolGate` to benchd.
+/// `--local-cool-gate-only`: run the two timed-phase gates — quiescence, then cool-down — for the
+/// phase named in `MLXFAST_LOCAL_COOL_GATE_PHASE`, then exit. Mirrors benchmark.sh's
+/// `--local-cool-gate-only` so the Swift harness can dispatch its `runLocalPhaseCoolGate` to
+/// benchd, and gives that leg BOTH gates the native path runs (David 2026-09-17).
 /// `benchd harness-hash` — print the 9-root WORKSPACE HARNESS IDENTITY of the PROCESS CWD.
 ///
 /// A read-only diagnostic over [`HarnessIdentity::resolve_from_current_dir`] — the SAME resolution
@@ -1003,7 +1005,7 @@ fn run_harness_hash() -> ExitCode {
 fn run_cool_gate_only() -> ExitCode {
     let phase =
         std::env::var("MLXFAST_LOCAL_COOL_GATE_PHASE").unwrap_or_else(|_| "local".to_string());
-    match coolgate::cool_gate(&phase, cool_gate_platform_from_env()) {
+    match quiescegate::timed_phase_gates(&phase, cool_gate_platform_from_env()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("benchd --local-cool-gate-only: {e}");
@@ -2947,6 +2949,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         let extra_args = base_args.to_vec();
 
         let mut recorded = coolgate::GateState::SkippedNoReader;
+        let mut recorded_quiesce = quiescegate::QuiesceRecord::default();
         // #109 window-2 finding 3 — capture the hello's `head_provenance` (the engine's echo of the
         // head bytes it loaded) from the LAST spawn this leg made: the retired report file was the
         // only other channel that ever carried the candidate's head identity. Same capture pattern
@@ -2959,7 +2962,12 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             Ok(session)
         };
         let mut gate = |phase: &str| -> bench_runner::Result<()> {
-            recorded = coolgate::cool_gate_report(phase, bench_core::constants::Platform::Mlx)?;
+            // BOTH gates guard the timed window, quiescence first: the box must be idle before the
+            // GPU temperature is even read (David 2026-09-17).
+            let (quiesced, cooled) =
+                quiescegate::timed_phase_gates_report(phase, bench_core::constants::Platform::Mlx)?;
+            recorded_quiesce = quiesced;
+            recorded = cooled.state;
             Ok(())
         };
         // H1 (cycle-3) — benchd's OWN parent-side wall clock, measured here, is the SCORED spt.
@@ -3043,6 +3051,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             // H1 (cycle-3) — the ONLY scored number: benchd's own parent clock.
             benchd_seconds_per_token: seconds_per_token,
             gate_state: recorded,
+            quiesce: recorded_quiesce,
             telemetry: None,
             // The WIRE engine-echoed effective_spec benchd's runner captured + validated (equal to the
             // request; a divergence would have already discarded the session above). Sealed per leg.
@@ -3113,6 +3122,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
      -> bench_runner::Result<measure_job::LegInvocation> {
         let extra_args = base_args.to_vec();
         let mut recorded = coolgate::GateState::SkippedNoReader;
+        let mut recorded_quiesce = quiescegate::QuiesceRecord::default();
         let wire_head_provenance = std::cell::RefCell::new(None);
         let mut spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let transport = spawn_official_worker(plan, engine, weights, &extra_args, &[])?;
@@ -3121,7 +3131,12 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             Ok(session)
         };
         let mut gate = |phase: &str| -> bench_runner::Result<()> {
-            recorded = coolgate::cool_gate_report(phase, bench_core::constants::Platform::Mlx)?;
+            // BOTH gates guard the timed window, quiescence first: the box must be idle before the
+            // GPU temperature is even read (David 2026-09-17).
+            let (quiesced, cooled) =
+                quiescegate::timed_phase_gates_report(phase, bench_core::constants::Platform::Mlx)?;
+            recorded_quiesce = quiesced;
+            recorded = cooled.state;
             Ok(())
         };
         let band_ceiling_spt = match calibration.as_ref() {
@@ -3151,6 +3166,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         Ok(measure_job::LegInvocation {
             benchd_seconds_per_token: t.seconds_per_token,
             gate_state: recorded,
+            quiesce: recorded_quiesce,
             telemetry: None,
             wire_effective_spec: t.effective_spec,
             wire_head_provenance: wire_head_provenance.into_inner(),
@@ -4794,9 +4810,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             )?;
             connect_retaining_hello(transport, &timed_hello)
         };
+        // THE GATE LOG of this run (David 2026-09-17): the closure records every gate point on it,
+        // the paired core names the pair and the leg of each point, and the payload seals the whole
+        // array below — including on a run that stopped part-way.
+        let gate_log = std::rc::Rc::new(quiescegate::GateLog::new());
         let cool_gate_fn = official_cool_gate(
             args.cool_gate
                 .unwrap_or_else(|| args.mode.cool_gate_on_by_default()),
+            std::rc::Rc::clone(&gate_log),
         );
         eprintln!(
             "benchd iterate: paired official run on box {box_name:?}, {pairs} pair(s) — in each pair \
@@ -4842,6 +4863,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 // over ONE attached worker: the load-once window, on both platforms.
                 spec: args.spec.clone(),
                 cool_gate: cool_gate_fn,
+                gate_log: std::rc::Rc::clone(&gate_log),
                 pairs,
                 floors,
                 weights,
@@ -4850,6 +4872,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         if let Some(hello) = timed_hello.borrow().as_ref() {
             official::seal_engine_identity(&mut payload.metrics, hello);
         }
+        // `metrics.gates` is sealed by the paired core itself, on every payload it can return.
         payload
     } else if let RunBaselines::Decided {
         prefill,
@@ -5003,9 +5026,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 // Mode::Official, `--no-cool-gate` turns it off for a local dry run. Official
                 // fails CLOSED without a temperature reader: a ranked run that silently skipped
                 // the gate would seal a number the contract does not cover.
+                // The SINGLE-LEG official arm measures one leg, so its gate points are pair 1 of
+                // the candidate leg. It seals the same `gates` array the paired arm does.
+                let gate_log = std::rc::Rc::new(quiescegate::GateLog::new());
+                gate_log.enter_leg(1, quiescegate::LEG_CANDIDATE);
                 let cool_gate_fn = official_cool_gate(
                     args.cool_gate
                         .unwrap_or_else(|| args.mode.cool_gate_on_by_default()),
+                    std::rc::Rc::clone(&gate_log),
                 );
                 let mut payload = official::official_core_windowed(
                     official::OfficialParams {
@@ -5028,6 +5056,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 if let Some(hello) = timed_hello.borrow().as_ref() {
                     official::seal_engine_identity(&mut payload.metrics, hello);
                 }
+                payload.metrics.gates = gate_log.records();
                 payload
             }
         }
@@ -5136,37 +5165,64 @@ enum RunBaselines {
     ResolveFromOverrideOrGolden,
 }
 
-/// The LOCAL modes' per-phase cool gate (`local-iterate`, `local-submit`, and the capture
-/// passes). Disabled → a no-op, so the gate machinery stays wired for the facade, which always
-/// passes `--cool-gate`.
+/// The LOCAL modes' per-phase gates (`local-iterate`, `local-submit`, and the capture passes):
+/// QUIESCENCE first, then COOL (David 2026-09-17). Disabled → a no-op for both, so the gate
+/// machinery stays wired for the facade, which always passes `--cool-gate`. The one switch turns
+/// both gates on or off; there is no second knob.
 ///
 /// The gate temperature is keyed by the platform resolved from the track-id env, defaulting to
-/// the Mac/MLX 40 C gate (R21 lift, David 2026-08-30).
+/// the Mac/MLX 40 C gate (R21 lift, David 2026-08-30). The quiescence thresholds are fixed
+/// ([`quiescegate::LOAD_MAX`] / [`quiescegate::GPU_UTIL_MAX`]).
 fn local_cool_gate(enabled: bool) -> impl Fn(&str) -> Result<(), RunnerError> {
     move |phase: &str| {
         if enabled {
-            coolgate::cool_gate(phase, cool_gate_platform_from_env())
+            quiescegate::timed_phase_gates(phase, cool_gate_platform_from_env())
         } else {
             Ok(())
         }
     }
 }
 
-/// The RANKED path's per-phase cool gate (David 2026-09-06). Official fails CLOSED without a
-/// temperature reader: a ranked run that silently skipped the gate would seal a number the
-/// contract does not cover. `--no-cool-gate` turns it off for a local dry run.
-fn official_cool_gate(enabled: bool) -> impl Fn(&str) -> bench_runner::Result<()> {
+/// The RANKED path's per-phase gates: QUIESCENCE first, then COOL (David 2026-09-06, extended by
+/// the 2026-09-17 quiescence ruling). Official fails CLOSED without a reader for EITHER gate: a
+/// ranked run that silently skipped a gate would seal a number the contract does not cover — a
+/// measurement on a busy box is as far outside the contract as one on a hot GPU.
+/// `--no-cool-gate` turns both off for a local dry run.
+fn official_cool_gate(
+    enabled: bool,
+    gate_log: std::rc::Rc<quiescegate::GateLog>,
+) -> impl Fn(&str) -> bench_runner::Result<()> {
     move |phase: &str| {
         if !enabled {
             return Ok(());
         }
-        match coolgate::cool_gate_report(phase, cool_gate_platform_from_env())? {
-            coolgate::GateState::SkippedNoReader => Err(bench_runner::RunnerError::GateRejected {
-                phase: phase.to_string(),
-                reason: "official mode requires a GPU temperature reader for the cool gate (install macmon or set MLXFAST_MACMON_BIN)".to_string(),
-            }),
-            _ => Ok(()),
-        }
+        // BOTH gates, quiescence first, and official fails CLOSED on either skip.
+        let (quiescence, cool) = quiescegate::run_timed_phase_gates(
+            || {
+                match quiescegate::quiesce_gate_report(phase)? {
+                r if r.state == quiescegate::QuiesceState::SkippedNoReader => {
+                    Err(bench_runner::RunnerError::GateRejected {
+                        phase: phase.to_string(),
+                        reason: "official mode requires a load and GPU utilization reader for the quiescence gate (install macmon or set MLXFAST_MACMON_BIN)".to_string(),
+                    })
+                }
+                r => Ok(r),
+            }
+            },
+            || {
+                let cool = coolgate::cool_gate_report(phase, cool_gate_platform_from_env())?;
+                if cool.state == coolgate::GateState::SkippedNoReader {
+                    return Err(bench_runner::RunnerError::GateRejected {
+                        phase: phase.to_string(),
+                        reason: "official mode requires a GPU temperature reader for the cool gate (install macmon or set MLXFAST_MACMON_BIN)".to_string(),
+                    });
+                }
+                Ok(cool)
+            },
+        )?;
+        // ONE RECORD PER GATE POINT: the paired core has already named the pair and the leg.
+        gate_log.record(phase, &quiescence, &cool);
+        Ok(())
     }
 }
 

@@ -73,14 +73,19 @@ The ranked path of these tracks is `benchd iterate --mode official`, and it seal
 (`prefill_speedup`, `decode_speedup`) and the composite as the run's `score`.
 `metrics.paired_legs` carries one row for each measured pair.
 
-The gains are ratios of the summed per-token times over the pairs the fixture
-declares in `official_pairs`:
+benchd measures the pairs the fixture declares in `official_pairs` and scores
+one of them. Each pair has its own composite, from its own control leg:
 
 ```
-prefill_gain = sum(control prefill s/tok) / sum(candidate prefill s/tok)
-decode_gain  = sum(control decode s/tok)  / sum(candidate decode s/tok)
+prefill_gain = control prefill s/tok / candidate prefill s/tok
+decode_gain  = control decode s/tok  / candidate decode s/tok
 composite    = prefill_gain ^ 0.25 * decode_gain ^ 0.75
 ```
+
+The run scores the pair whose composite is the lower median over the pairs:
+the middle pair on an odd count, the lower of the two central pairs on an even
+count. Pairs are never averaged. Every enforced figure in `score.json` is that
+one pair's, and the other pairs stay in `metrics.paired_legs` as measured.
 
 The window split of section 2 is what makes the two gains separable. Without it
 there is one whole-window number and no prefill half to score.

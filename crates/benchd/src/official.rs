@@ -857,6 +857,12 @@ pub struct PairedWindow<G> {
     /// it declares them and from the in-tree constants when it does not.
     pub window: WindowShape,
     pub cool_gate: G,
+    /// THE GATE LOG this run records every gate POINT on (David 2026-09-17). The pair loop names
+    /// the pair and the leg before each leg runs, so the points the `cool_gate` closure records
+    /// carry their place in the run. The caller owns the log and seals it as `metrics.gates`
+    /// after the run: the log outlives the refusal paths, so a run that stopped part-way still
+    /// seals the gate points it did reach.
+    pub gate_log: std::rc::Rc<crate::quiescegate::GateLog>,
     /// Pairs per scored run, from the pinned track fixture (`official_pairs`; David 2026-09-09
     /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
     pub pairs: usize,
@@ -911,6 +917,35 @@ where
     FT: FnMut() -> bench_runner::Result<Session<T>>,
     G: FnMut(&str) -> bench_runner::Result<()>,
 {
+    // THE GATE LOG is sealed HERE, on ONE way out, so every payload the run can return carries it
+    // — the scored one and every refusal alike. What a run gated on before it stopped is exactly
+    // what a reader of a refused run needs (David 2026-09-17).
+    let gate_log = std::rc::Rc::clone(&window.gate_log);
+    let mut payload =
+        official_core_paired_inner(goldens, calibration, seal, digests, commit, legs, window);
+    payload.metrics.gates = gate_log.records();
+    payload
+}
+
+/// [`official_core_paired`]'s body, which returns from many places. The wrapper above seals the
+/// gate log on all of them at once.
+fn official_core_paired_inner<T, L, LB, LC, FB, FT, G>(
+    goldens: PairedGoldens<'_>,
+    calibration: &crate::baseline::BaselineCalibration,
+    seal: PairedBaselineSeal<'_>,
+    digests: RunDigests<'_>,
+    commit: &str,
+    legs: PairedLegs<LB, LC, FB, FT>,
+    window: PairedWindow<G>,
+) -> ScorePayload
+where
+    T: LineTransport,
+    LB: FnMut() -> Result<L, String>,
+    LC: FnMut() -> Result<L, String>,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
     let PairedGoldens {
         candidate: golden,
         control: control_golden,
@@ -926,6 +961,7 @@ where
         spec,
         window: window_shape,
         mut cool_gate,
+        gate_log,
         pairs,
         floors,
         weights,
@@ -984,6 +1020,9 @@ where
                 )
             }
         };
+        // NAME THE GATE POINTS this leg is about to make: pair N, the control leg. Every gate the
+        // leg's timed phases run is recorded under that name (David 2026-09-17).
+        gate_log.enter_leg(pair, crate::quiescegate::LEG_CONTROL);
         let control_result = run_serial_control_leg(
             control_golden,
             &window_shape,
@@ -1051,6 +1090,7 @@ where
                 )
             }
         };
+        gate_log.enter_leg(pair, crate::quiescegate::LEG_CANDIDATE);
         let (timing, session) = match measure_candidate_window(
             OfficialParams {
                 golden,
@@ -1105,14 +1145,21 @@ where
         }
     }
 
-    // AGGREGATE (the track fixture's formula, applied per leg role): the elapsed per-token time of
-    // a role is summed over the pairs, and the ratio of the two sums is the gain — i.e. the mean
-    // per-token time of the control legs over the mean per-token time of the candidate legs, per
-    // component. With ONE pair this is exactly the single-pair ratio.
-    let (control_prefill, control_decode) = aggregate_control(&records);
-    let candidate = aggregate_candidate(&candidate_timings);
-    // The scored run's inputs: the control legs' aggregate as the denominator, the track fixture's
-    // floors as the gate. One value, so the floors this run enforces are the floors it seals.
+    // THE SCORED PAIR (David ruling 2026-09-17, the Laguna rule): pairs are NEVER averaged. Each
+    // pair is scored on its own control leg, and the run scores ONE measured pair — the one whose
+    // composite is the lower median over the pairs. Every other pair stays in `paired_legs` as
+    // measured. With ONE pair this is that pair.
+    let scored = scored_pair_index(&records, weights);
+    let scored_record = records[scored].clone();
+    let candidate = candidate_timings
+        .into_iter()
+        .nth(scored)
+        .expect("one candidate timing per sealed pair");
+    let control_prefill = scored_record.control_prefill_seconds_per_token;
+    let control_decode = scored_record.control_decode_seconds_per_token;
+    // The scored run's inputs: the scored pair's control leg as the denominator, the track
+    // fixture's floors as the gate. One value, so the floors this run enforces are the floors it
+    // seals.
     let paired_scoring = ScoringInputs {
         baseline_prefill_spt: control_prefill,
         baseline_decode_spt: control_decode,
@@ -1143,7 +1190,7 @@ where
     seal.band_passed = true;
     seal.leg = Some((control_prefill, control_decode));
     seal_paired_baseline(&mut payload.metrics, &seal);
-    seal_window_means(&mut payload.metrics, &records);
+    seal_window_split(&mut payload.metrics, &scored_record);
     payload.metrics.paired_legs = records;
     payload
 }
@@ -1151,8 +1198,6 @@ where
 /// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
 pub use crate::score::PairedLegRecord;
 
-/// The control legs' aggregate: mean per-token time per component over the pairs (= the ratio of
-/// the summed per-token times, the fixture's aggregate rule).
 /// One leg's free-run window SPLIT per token — `(seed prefill / seed length, decode / N)` — or
 /// `(None, None)` when the leg timed a teacher-forced window that has no split. REPORT-ONLY.
 fn window_per_token(timing: &TimingResult) -> (Option<f64>, Option<f64>) {
@@ -1168,80 +1213,43 @@ fn window_per_token(timing: &TimingResult) -> (Option<f64>, Option<f64>) {
     )
 }
 
-/// Seal the per-role MEANS of the pairs' window splits onto the flat metrics
-/// (`ScoreMetrics::*_leg_*_window_seconds_per_token`). A role's mean is absent unless EVERY
-/// measured pair carried that split, so a mean never quietly averages over fewer pairs than the
-/// enforced figures do.
-fn seal_window_means(metrics: &mut ScoreMetrics, records: &[PairedLegRecord]) {
-    fn mean(values: Vec<Option<f64>>) -> Option<f64> {
-        if values.is_empty() || values.iter().any(Option::is_none) {
-            return None;
-        }
-        Some(values.iter().map(|v| v.unwrap()).sum::<f64>() / values.len() as f64)
-    }
-    metrics.baseline_leg_decode_window_seconds_per_token = mean(
-        records
-            .iter()
-            .map(|r| r.control_decode_window_seconds_per_token)
-            .collect(),
-    );
-    metrics.candidate_leg_decode_window_seconds_per_token = mean(
-        records
-            .iter()
-            .map(|r| r.candidate_decode_window_seconds_per_token)
-            .collect(),
-    );
-    metrics.baseline_leg_seed_prefill_window_seconds_per_token = mean(
-        records
-            .iter()
-            .map(|r| r.control_seed_prefill_window_seconds_per_token)
-            .collect(),
-    );
-    metrics.candidate_leg_seed_prefill_window_seconds_per_token = mean(
-        records
-            .iter()
-            .map(|r| r.candidate_seed_prefill_window_seconds_per_token)
-            .collect(),
-    );
+/// Seal the SCORED pair's window split onto the flat metrics
+/// (`ScoreMetrics::*_leg_*_window_seconds_per_token`). These are the same row's figures as the
+/// enforced ones, never a mean over pairs. A split is absent when that pair timed a teacher-forced
+/// window.
+fn seal_window_split(metrics: &mut ScoreMetrics, record: &PairedLegRecord) {
+    metrics.baseline_leg_decode_window_seconds_per_token =
+        record.control_decode_window_seconds_per_token;
+    metrics.candidate_leg_decode_window_seconds_per_token =
+        record.candidate_decode_window_seconds_per_token;
+    metrics.baseline_leg_seed_prefill_window_seconds_per_token =
+        record.control_seed_prefill_window_seconds_per_token;
+    metrics.candidate_leg_seed_prefill_window_seconds_per_token =
+        record.candidate_seed_prefill_window_seconds_per_token;
 }
 
-fn aggregate_control(records: &[PairedLegRecord]) -> (f64, f64) {
-    let n = records.len() as f64;
-    let prefill = records
-        .iter()
-        .map(|r| r.control_prefill_seconds_per_token)
-        .sum::<f64>()
-        / n;
-    let decode = records
-        .iter()
-        .map(|r| r.control_decode_seconds_per_token)
-        .sum::<f64>()
-        / n;
-    (prefill, decode)
-}
-
-/// The candidate legs' aggregate: the LAST pair's timing (its spec audit and diagnostics) with the
-/// per-token times replaced by the per-component means over the pairs and the elapsed seconds
-/// summed, so `timed_benchmark_seconds` still reads as the total timed candidate work.
-fn aggregate_candidate(timings: &[TimingResult]) -> TimingResult {
-    let n = timings.len() as f64;
-    let mut agg = timings
-        .last()
-        .cloned()
-        .expect("aggregate_candidate is called with at least one pair");
-    agg.prefill_seconds_per_token = timings
-        .iter()
-        .map(|t| t.prefill_seconds_per_token)
-        .sum::<f64>()
-        / n;
-    agg.decode_seconds_per_token = timings
-        .iter()
-        .map(|t| t.decode_seconds_per_token)
-        .sum::<f64>()
-        / n;
-    agg.prefill_elapsed_seconds = timings.iter().map(|t| t.prefill_elapsed_seconds).sum();
-    agg.decode_elapsed_seconds = timings.iter().map(|t| t.decode_elapsed_seconds).sum();
-    agg
+/// The index of the pair the run scores (David ruling 2026-09-17, the Laguna rule): the LOWER
+/// MEDIAN of the per-pair composites — the order statistic at index `(n - 1) / 2` of the pairs
+/// sorted by composite, which on an even count is the lower of the two central pairs, never their
+/// mean. Each pair's composite is the track's weighted score of its candidate leg over its OWN
+/// control leg. Ties keep measurement order, so equal pairs score the earlier one.
+///
+/// This is the same rule the measure job's `lower_median` applied to Laguna's per-pair ratios,
+/// lifted to the whole pair so that every enforced figure the run seals comes from one measured
+/// pair.
+fn scored_pair_index(records: &[PairedLegRecord], weights: ScoringWeights) -> usize {
+    let composite = |r: &PairedLegRecord| {
+        bench_core::score::score_weighted(
+            r.candidate_decode_seconds_per_token,
+            r.candidate_prefill_seconds_per_token,
+            r.control_decode_seconds_per_token,
+            r.control_prefill_seconds_per_token,
+            weights,
+        )
+    };
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by(|&a, &b| composite(&records[a]).total_cmp(&composite(&records[b])));
+    order[(records.len() - 1) / 2]
 }
 
 /// A refusal that also seals the pairs already measured before it (`metrics.paired_legs`).
@@ -4499,6 +4507,7 @@ mod tests {
             decode_band_high: 1e6,
             captured_at: "2026-09-08T00:00:00Z".to_string(),
             benchd_source_commit: "b".repeat(40),
+            gates: Vec::new(),
         }
     }
 
@@ -4542,11 +4551,113 @@ mod tests {
             spec: None,
             window: test_window(),
             cool_gate,
+            gate_log: std::rc::Rc::new(crate::quiescegate::GateLog::new()),
             pairs: 1,
             // The tests drive the ruled floors; the per-project arms set their own.
             floors: SpeedupFloors::DEFAULT,
             weights: ScoringWeights::DEFAULT,
         }
+    }
+
+    /// EVERY GATE POINT OF THE RUN IS SEALED SEPARATELY, IN RUN ORDER (David 2026-09-17).
+    ///
+    /// A two-pair run gates EIGHT times: two pairs x two legs (control, candidate) x two phases
+    /// (prefill, decode), and each point runs BOTH gates. The seal names every one of them, so a
+    /// reader can see that each timed window — not just the first — opened on an idle, cool box.
+    /// The fake gate pair below records a different wait at each point, and the assertion is the
+    /// whole array: place, phase, and both gates' readings.
+    #[test]
+    fn every_gate_point_of_a_two_pair_run_is_sealed_in_order() {
+        use crate::quiescegate::{CoolReading, GateLog, QuiescenceReading};
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let log = std::rc::Rc::new(GateLog::new());
+        let log_for_gate = std::rc::Rc::clone(&log);
+        // A FAKE PAIR OF GATES: each point waits one second longer than the last, so a dropped,
+        // duplicated or reordered record shows up as a wrong number rather than a wrong count.
+        let point = Cell::new(0u64);
+        let gate = move |phase: &str| -> bench_runner::Result<()> {
+            let n = point.get();
+            point.set(n + 1);
+            log_for_gate.record(
+                phase,
+                &crate::quiescegate::QuiesceRecord {
+                    state: crate::quiescegate::QuiesceState::Waited,
+                    waited_seconds: n,
+                    load: Some(0.5),
+                    gpu_util: Some(0.02),
+                    skip_reason: None,
+                },
+                &crate::coolgate::CoolGateRecord {
+                    state: crate::coolgate::GateState::Fired,
+                    waited_seconds: 0,
+                    gpu_temp_c: Some(38.5),
+                    skip_reason: None,
+                },
+            );
+            Ok(())
+        };
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            PairedWindow {
+                pairs: 2,
+                gate_log: std::rc::Rc::clone(&log),
+                ..paired_window_for_test(gate)
+            },
+        );
+
+        let quiescence = |waited: u64| QuiescenceReading {
+            state: "passed".to_string(),
+            waited_seconds: waited,
+            load: Some(0.5),
+            gpu_util: Some(0.02),
+            skip_reason: None,
+        };
+        let cool = || CoolReading {
+            state: "passed".to_string(),
+            waited_seconds: 0,
+            gpu_temp_c: Some(38.5),
+            skip_reason: None,
+        };
+        let expected: Vec<crate::quiescegate::GateRecord> = [
+            (1, "control", "prefill"),
+            (1, "control", "decode"),
+            (1, "candidate", "prefill"),
+            (1, "candidate", "decode"),
+            (2, "control", "prefill"),
+            (2, "control", "decode"),
+            (2, "candidate", "prefill"),
+            (2, "candidate", "decode"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (pair, leg, phase))| crate::quiescegate::GateRecord {
+            pair: Some(*pair),
+            pass: None,
+            leg: Some(leg.to_string()),
+            phase: phase.to_string(),
+            quiescence: quiescence(i as u64),
+            cool: cool(),
+        })
+        .collect();
+        assert_eq!(
+            payload.metrics.gates, expected,
+            "eight gate points, each naming its pair, leg and phase, with both gates' readings"
+        );
     }
 
     /// TWO ROOTS, ONE BOX, IN ORDER. The paired run spawns leg 1's worker from the REFERENCE root
@@ -4677,7 +4788,7 @@ mod tests {
     /// candidate, engine up and down around each leg — and the enforced denominator / numerator
     /// are the per-role MEANS over the pairs, with both pairs sealed as measured.
     #[test]
-    fn two_pairs_run_both_legs_twice_and_score_on_the_per_role_means() {
+    fn two_pairs_run_both_legs_twice_and_score_the_lower_median_pair() {
         use std::rc::Rc;
         let golden = official_golden(None);
         let calibration = wide_calibration();
@@ -4772,13 +4883,26 @@ mod tests {
                     && r.candidate_decode_seconds_per_token > 0.0
             );
         }
-        let mean = |f: fn(&PairedLegRecord) -> f64| {
-            m.paired_legs.iter().map(f).sum::<f64>() / m.paired_legs.len() as f64
-        };
         let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0);
-        // The ENFORCED denominator is the mean of the control legs, on both names that carry it.
-        let control_prefill = mean(|r| r.control_prefill_seconds_per_token);
-        let control_decode = mean(|r| r.control_decode_seconds_per_token);
+        // PAIRS ARE NEVER AVERAGED: the enforced figures are ONE pair's, the lower median of the
+        // per-pair composites — on two pairs, the lower composite.
+        let composite = |r: &PairedLegRecord| {
+            bench_core::score::score_weighted(
+                r.candidate_decode_seconds_per_token,
+                r.candidate_prefill_seconds_per_token,
+                r.control_decode_seconds_per_token,
+                r.control_prefill_seconds_per_token,
+                ScoringWeights::DEFAULT,
+            )
+        };
+        let scored = if composite(&m.paired_legs[1]) < composite(&m.paired_legs[0]) {
+            &m.paired_legs[1]
+        } else {
+            &m.paired_legs[0]
+        };
+        // The ENFORCED denominator is the scored pair's control leg, on both names that carry it.
+        let control_prefill = scored.control_prefill_seconds_per_token;
+        let control_decode = scored.control_decode_seconds_per_token;
         assert!(close(
             m.baseline_leg_prefill_seconds_per_token.unwrap(),
             control_prefill
@@ -4789,17 +4913,68 @@ mod tests {
         ));
         assert!(close(m.baseline_prefill_seconds_per_token, control_prefill));
         assert!(close(m.baseline_decode_seconds_per_token, control_decode));
-        // The ENFORCED numerator is the mean of the candidate legs.
+        // The ENFORCED numerator is the scored pair's candidate leg.
         assert!(close(
             m.prefill_seconds_per_token,
-            mean(|r| r.candidate_prefill_seconds_per_token)
+            scored.candidate_prefill_seconds_per_token
         ));
         assert!(close(
             m.decode_seconds_per_token,
-            mean(|r| r.candidate_decode_seconds_per_token)
+            scored.candidate_decode_seconds_per_token
         ));
         assert_eq!(m.baseline_band_passed, Some(true));
         assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+    }
+
+    fn pair_with_composite(pair: i64, decode_gain: f64) -> PairedLegRecord {
+        PairedLegRecord {
+            pair,
+            control_prefill_seconds_per_token: 1.0,
+            control_decode_seconds_per_token: 1.0,
+            candidate_prefill_seconds_per_token: 1.0,
+            candidate_decode_seconds_per_token: 1.0 / decode_gain,
+            control_seed_prefill_window_seconds_per_token: None,
+            control_decode_window_seconds_per_token: None,
+            candidate_seed_prefill_window_seconds_per_token: None,
+            candidate_decode_window_seconds_per_token: None,
+        }
+    }
+
+    /// THE SCORED PAIR IS THE LOWER MEDIAN, NEVER A MEAN: on an odd count the middle pair, on an
+    /// even count the lower of the two central pairs, on one pair that pair. The mean of these
+    /// gains is a number no pair measured; the rule never returns it.
+    #[test]
+    fn the_scored_pair_is_the_lower_median_of_the_per_pair_composites() {
+        let w = ScoringWeights::DEFAULT;
+        let one = [pair_with_composite(1, 1.30)];
+        assert_eq!(scored_pair_index(&one, w), 0);
+        let three = [
+            pair_with_composite(1, 1.30),
+            pair_with_composite(2, 1.10),
+            pair_with_composite(3, 1.20),
+        ];
+        assert_eq!(
+            scored_pair_index(&three, w),
+            2,
+            "the middle composite is pair 3"
+        );
+        let four = [
+            pair_with_composite(1, 1.40),
+            pair_with_composite(2, 1.10),
+            pair_with_composite(3, 1.30),
+            pair_with_composite(4, 1.20),
+        ];
+        assert_eq!(
+            scored_pair_index(&four, w),
+            3,
+            "the lower of the two central composites (1.20, 1.30) is pair 4"
+        );
+        let tied = [pair_with_composite(1, 1.20), pair_with_composite(2, 1.20)];
+        assert_eq!(
+            scored_pair_index(&tied, w),
+            0,
+            "ties keep measurement order"
+        );
     }
 
     /// A FAULT IN PAIR 2 ends the run by name, seals no score, and keeps pair 1's measurement in

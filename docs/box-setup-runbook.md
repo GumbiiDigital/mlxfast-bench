@@ -29,7 +29,8 @@ Both Qwen 3.8 125B-A6B tracks measure their own denominator. A ranked run
 measures the pairs the track fixture declares in `official_pairs` — 2 on both
 platforms — on this box, in the same job. Every pair is a SERIAL-CONTROL leg on
 the organizer-staged reference tree and then a CANDIDATE leg on the submission
-tree, and the score is the live ratio of the summed per-token times. No
+tree. Each pair scores on its own control leg, and the run scores the pair whose
+composite is the lower median over the pairs. Pairs are never averaged. No
 denominator is pinned anywhere.
 
 What the box needs is its own HEALTH BAND for that control leg. Write it once
@@ -74,6 +75,7 @@ stored-pair capture the earlier tracks still use.
 | worker lifecycle (local unscored run) | the measure script's own `tools/serve-up.sh` wrap; one attached worker per window | the measure script's own `tools/resident-up.sh` wrap |
 | goldens | organizer material in R2; staged on the box by pin | organizer material in R2; staged on the box by pin |
 | cool gate | 50 C | 40 C |
+| quiescence gate | load < 2.0, GPU util < 0.10 | load < 2.0, GPU util < 0.10 |
 | runner supervisor | systemd | LaunchDaemon |
 | pair platform | `linux-aarch64` | darwin |
 

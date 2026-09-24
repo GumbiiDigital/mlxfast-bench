@@ -354,10 +354,24 @@ pub struct ScoreMetrics {
     pub candidate_leg_seed_prefill_window_seconds_per_token: Option<f64>,
     /// PAIRED PATH audit trail (David 2026-09-09, `official_pairs` in the track fixture): every
     /// pair this run measured, in order, both legs' per-token times as measured. The enforced
-    /// `baseline_leg_*` / `candidate_leg_*` fields above are the per-role means over these rows.
+    /// `baseline_leg_*` / `candidate_leg_*` fields above are ONE of these rows — the pair whose
+    /// composite is the lower median over the pairs (David 2026-09-17: pairs are never averaged).
     /// OMITTED when empty so the single-leg and local payloads keep their key set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paired_legs: Vec<PairedLegRecord>,
+    /// GATE LOG (David 2026-09-17): every GATE POINT of the run, in run order, each naming where
+    /// it applied and what BOTH gates read. A paired run of two pairs seals eight points — two
+    /// pairs x two legs (`control`, `candidate`) x two phases (`prefill`, `decode`) — so a reader
+    /// can see that EVERY timed window opened on an idle, cool box, not just one of them. A gate
+    /// that REFUSED never reaches a seal: the run stops instead, so only `passed` and `skipped`
+    /// appear here. Calibration files carry the same records per PASS
+    /// (`crate::baseline::BaselineCalibration::gates`).
+    ///
+    /// ENVIRONMENTAL: the waits depend on how hot and how busy the box was, so two honest runs
+    /// never agree on them. `parity-diff` waives the key for that reason.
+    /// OMITTED when empty, so the single-leg and local payloads keep their key set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<crate::quiescegate::GateRecord>,
 }
 
 /// One measured pair of the paired official run: the serial-control leg and the candidate leg on
@@ -568,6 +582,9 @@ impl ScoreMetrics {
             candidate_leg_seed_prefill_window_seconds_per_token: self
                 .candidate_leg_seed_prefill_window_seconds_per_token,
             paired_legs: self.paired_legs.clone(),
+            // The GATE LOG is carried VERBATIM: a wait in seconds and a temperature the gate
+            // actually read are facts about the run, not diagnostics to round.
+            gates: self.gates.clone(),
         }
     }
 }
@@ -1210,6 +1227,30 @@ mod sealed_key_pin_tests {
         }
     }
 
+    /// ONE fully populated GATE POINT: both gates, every reading present. The skip side of the
+    /// shape (`skip_reason`, no readings) is pinned by the gate log's own tests.
+    fn fully_populated_gate_record() -> crate::quiescegate::GateRecord {
+        crate::quiescegate::GateRecord {
+            pair: Some(1),
+            pass: Some(2),
+            leg: Some("control".to_string()),
+            phase: "decode".to_string(),
+            quiescence: crate::quiescegate::QuiescenceReading {
+                state: "passed".to_string(),
+                waited_seconds: 45,
+                load: Some(1.25),
+                gpu_util: Some(0.03),
+                skip_reason: Some("v137".to_string()),
+            },
+            cool: crate::quiescegate::CoolReading {
+                state: "passed".to_string(),
+                waited_seconds: 30,
+                gpu_temp_c: Some(39.5),
+                skip_reason: Some("v139".to_string()),
+            },
+        }
+    }
+
     fn fully_populated_per_prompt() -> ScorePerPrompt {
         ScorePerPrompt {
             prompt_sha256: "v125".to_string(),
@@ -1319,6 +1360,7 @@ mod sealed_key_pin_tests {
                 candidate_leg_prefill_seconds_per_token: Some(122.5),
                 candidate_leg_decode_seconds_per_token: Some(124.5),
                 paired_legs: vec![fully_populated_paired_leg()],
+                gates: vec![fully_populated_gate_record()],
                 baseline_leg_decode_window_seconds_per_token: None,
                 candidate_leg_decode_window_seconds_per_token: None,
                 baseline_leg_seed_prefill_window_seconds_per_token: None,
@@ -1406,6 +1448,27 @@ mod sealed_key_pin_tests {
     "first_failing_case": "v43",
     "first_failing_layer": 41,
     "first_failing_step": 45,
+    "gates": [
+      {
+        "cool": {
+          "gpu_temp_c": 39.5,
+          "skip_reason": "v139",
+          "state": "passed",
+          "waited_seconds": 30
+        },
+        "leg": "control",
+        "pair": 1,
+        "pass": 2,
+        "phase": "decode",
+        "quiescence": {
+          "gpu_util": 0.03,
+          "load": 1.25,
+          "skip_reason": "v137",
+          "state": "passed",
+          "waited_seconds": 45
+        }
+      }
+    ],
     "golden_hash": "v51",
     "gpqa_ttft_case_count": 19,
     "gpqa_ttft_max_seconds": 22.0,

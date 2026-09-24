@@ -344,17 +344,26 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
             .ok()
             .as_deref(),
     )?;
-    let cool_gate_on = args.cool_gate;
-    let mut cool_gate = move |phase: &str| -> Result<(), RunnerError> {
-        if !cool_gate_on {
+    // EVERY calibration pass runs behind BOTH gates, quiescence first then cool (David
+    // 2026-09-17). The one `--cool-gate` switch turns both on or both off: a pass measured on a
+    // busy box describes the box, not the reference tree.
+    let gates_on = args.cool_gate;
+    // THE GATE LOG of this calibration (David 2026-09-17): every gate point of every pass, named
+    // by the pass it belongs to, sealed into the calibration file below.
+    let gate_log = std::rc::Rc::new(crate::quiescegate::GateLog::new());
+    let log_for_gates = std::rc::Rc::clone(&gate_log);
+    let mut phase_gates = move |phase: &str| -> Result<(), RunnerError> {
+        if !gates_on {
             return Ok(());
         }
-        crate::coolgate::cool_gate(phase, platform)
+        crate::quiescegate::timed_phase_gates_logged(phase, platform, &log_for_gates)
     };
 
     let mut prefill_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
     let mut decode_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
     for pass in 1..=args.passes {
+        // NAME THE GATE POINTS this pass is about to make.
+        gate_log.enter_pass(pass);
         // ALWAYS SERIAL: a control leg is the serial denominator, so the resident boots serial.
         let serve =
             crate::legserve::boot_leg(&args.baseline_workspace, None, "serial-control", platform)?;
@@ -381,7 +390,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
             )
         };
         let measured =
-            crate::official::run_serial_control_leg(&golden, &window, spawn, &mut cool_gate);
+            crate::official::run_serial_control_leg(&golden, &window, spawn, &mut phase_gates);
         // The pass's resident goes down before the next pass's comes up, on success and failure
         // alike — one resident at a time, exactly as the ranked run holds one leg at a time.
         drop(serve);
@@ -406,6 +415,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         },
         &prefill_legs,
         &decode_legs,
+        gate_log.records(),
     )?;
     let sha256 = baseline::write_calibration(&args.out, &calibration)?;
     eprintln!(
