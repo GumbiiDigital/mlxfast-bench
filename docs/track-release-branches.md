@@ -48,6 +48,7 @@ goldens.
 |---|---|---|
 | qwen 3.8 125B-A6B MLX | `qwen3.8-125b-a6b-mlx-v1` | `qwen3.8-125b-a6b-v1` |
 | qwen 3.8 125B-A6B CUDA | `qwen3.8-125b-a6b-cuda-v1` | `qwen3.8-125b-a6b-v1` |
+| nemotron 3.5 Lightning 30B-A3B CUDA | `nemotron3.5-lightning-30b-a3b-cuda-v1` | `main` (pinned commit) |
 | qwen 3.8 27B MLX | `qwen3.8-27b-mtp-v1` | `main` |
 | gemma 4 26B A4B MLX | `gemma4-26b-a4b-mlx-v1` | `gemma4-26b-a4b-mlx-v1` |
 
@@ -124,7 +125,7 @@ A track scores against a baseline in ONE of two ways. The two never mix.
 
 | kind | where the denominator comes from | tracks |
 |---|---|---|
-| **live control leg** | the run MEASURES it: a serial-control leg on the reference tree, on the ranked box, in the same job | `qwen3.8-125b-a6b-mlx-v1`, `qwen3.8-125b-a6b-cuda-v1` |
+| **live control leg** | the run MEASURES it: a serial-control leg on the reference tree, on the ranked box, in the same job | `qwen3.8-125b-a6b-mlx-v1`, `qwen3.8-125b-a6b-cuda-v1`, `nemotron3.5-lightning-30b-a3b-cuda-v1` |
 | **stored pair** | a captured pair declared in the track fixture | `qwen3.8-27b-mtp-v1`, `gemma4-26b-a4b-mlx-v1` |
 
 ### Live-control-leg tracks

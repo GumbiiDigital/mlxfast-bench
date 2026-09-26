@@ -1757,6 +1757,11 @@ mod round_trip_oracle_tests {
     ///   disabled); the window constants, whose warm-up count was the one PER-PLATFORM value — 1 on
     ///   MLX, 0 on CUDA, because the CUDA adapter's resident engine is already warm.
     ///
+    /// * `nemotron3.5-lightning-30b-a3b-cuda-v1` — the first track declared contract-first from
+    ///   the start: the 125B CUDA regime (live control leg, the same bands, weights and window,
+    ///   no warm-up) over the Nemotron checkpoint's own shape (`nemotron_h`, vocabulary 131072,
+    ///   52 decoder layers, a 1024-token seed). No table ever held it.
+    ///
     /// `gemma4-26b-a4b-mlx-v1` is DELIBERATELY ABSENT. It does not migrate: it runs its own channel
     /// benchd, and this tree carries none of its values any more (David 2026-09-15, "gemma branch
     /// is untouched"). Its reference fixture was deleted with the tables.
@@ -1793,6 +1798,17 @@ mod round_trip_oracle_tests {
             weights: (0.75, 0.25),
             window: Some((64, 128, 1023, 0)),
             model: ("qwen4_exp_text", 248_320, 48, 1_024),
+        },
+        Expected {
+            track_id: "nemotron3.5-lightning-30b-a3b-cuda-v1",
+            regime: None,
+            live_control_leg: true,
+            paired_flow_retired: true,
+            baseline: None,
+            bands: (0.05, 0.05, 0.02, 0.05, false, false),
+            weights: (0.75, 0.25),
+            window: Some((64, 128, 1023, 0)),
+            model: ("nemotron_h", 131_072, 52, 1_024),
         },
     ];
 
