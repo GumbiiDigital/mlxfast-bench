@@ -1983,6 +1983,7 @@ pub(crate) fn test_window() -> bench_core::constants::WindowShape {
         benchmark_decode_steps: 128,
         local_submit_benchmark_decode_steps: 1023,
         official_prefill_warmup_runs: 1,
+        official_prefill_timed_runs: 1,
     }
 }
 

@@ -14,6 +14,7 @@
   "benchmark_decode_steps": 128,
   "local_submit_benchmark_decode_steps": 1023,
   "official_prefill_warmup_runs": 1,
+  "official_prefill_timed_runs": 5,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
   "seed_tokens": 4096,

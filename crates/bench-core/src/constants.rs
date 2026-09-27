@@ -684,6 +684,16 @@ pub struct WindowShape {
     /// `prefill` opener without a `phase_diagnostics` barrier between them — a warm-up pass there
     /// is a protocol error, not a warmer number.
     pub official_prefill_warmup_runs: usize,
+    /// The fixture's `official_prefill_timed_runs`: how many MEASURED prefill passes the official
+    /// timed session runs after its warm-up passes. The phase's prefill time is their MEDIAN.
+    /// Optional in the fixture: absent means [`BENCHMARK_PREFILL_TIMED_RUNS`] (1), which is every
+    /// track but the Nemotron one, and with one run the median is that run.
+    ///
+    /// WHY (GumbiiDigital fork, 2026-09-27): on the Nemotron 3.5 Lightning track, with a 4096-token
+    /// seed, one warm-up pass and a 60 C gate, ONE timed prefill per calibration pass still varied
+    /// 1.0-2.7% pass to pass on half the GB10 boxes, against the fixed 1% calibration maximum. The
+    /// median of several passes damps the per-sample noise and drops a single slow pass.
+    pub official_prefill_timed_runs: usize,
 }
 
 #[cfg(test)]

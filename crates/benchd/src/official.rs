@@ -388,6 +388,7 @@ pub fn official_timed_params(
     crate::iterate::benchmark_window_params(benchmark, Mode::Official.decode_steps(window))
         .with_spec(spec)
         .with_prefill_warmup_runs(window.official_prefill_warmup_runs)
+        .with_prefill_timed_runs(window.official_prefill_timed_runs)
 }
 
 /// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
@@ -3003,6 +3004,16 @@ mod tests {
         let cuda = official_timed_params(golden.benchmark.as_ref().unwrap(), None, &cuda_window);
         assert_eq!(cuda.prefill_warmup_runs, 0);
         assert_eq!(cuda.prefill_timed_runs, 1);
+        // Nemotron: one warm-up pass, then the MEDIAN of five timed passes.
+        let nemotron_window = WindowShape {
+            official_prefill_warmup_runs: 1,
+            official_prefill_timed_runs: 5,
+            ..crate::iterate::test_window()
+        };
+        let nemotron =
+            official_timed_params(golden.benchmark.as_ref().unwrap(), None, &nemotron_window);
+        assert_eq!(nemotron.prefill_warmup_runs, 1);
+        assert_eq!(nemotron.prefill_timed_runs, 5);
         // The local modes are untouched: their default is still the reference's zero.
         let local = TimingParams::new(vec![1], 1, vec![1], 1, vec![1, 2], 1);
         assert_eq!(
