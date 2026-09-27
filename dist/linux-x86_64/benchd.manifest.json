@@ -1,0 +1,12 @@
+{
+  "version": "0.0.0",
+  "branch": "gumbii/nemotron35-own",
+  "source_commit": "0f66aa26a712e2720d13605ee73366eab3578163",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "sha256": "3b092934638841be49b0938d93b66b9438d3d4c30dc30d3057c22431789b8915",
+  "bytes": 3920680,
+  "binaries": {
+    "benchd": {"sha256": "3b092934638841be49b0938d93b66b9438d3d4c30dc30d3057c22431789b8915", "bytes": 3920680},
+    "record-correctness-golden": {"sha256": "695921480b15577cc3ccfdba58515bc4e8ecd03d698d0d8c4b109dfcfa165889", "bytes": 1664600}
+  }
+}
