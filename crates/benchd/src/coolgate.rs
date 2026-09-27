@@ -6,7 +6,7 @@
 //!
 //! Semantics match benchmark.sh exactly, except the gate temperature (see below):
 //! - gate temp: the run platform's cool-gate temperature
-//!   ([`bench_core::constants::Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 50 C.
+//!   ([`bench_core::constants::Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 60 C.
 //!   Finding R21 originally froze this at a single non-parameterizable 40 C constant; David
 //!   2026-08-30 ("no adversarial hardening") ruled that rigidity out of scope, because the GB10
 //!   GPU idles at 40–43 C and a 40 C gate would refuse forever. The threshold is now a trusted
@@ -108,7 +108,7 @@ where
 /// logical counter incremented by the poll interval, exactly as the shell tracks it).
 ///
 /// `gate_temp` is the run platform's trusted per-platform threshold
-/// ([`Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 50 C. Finding R21 froze this at a
+/// ([`Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 60 C. Finding R21 froze this at a
 /// non-parameterizable 40 C; David 2026-08-30 ("no adversarial hardening") lifted that rigidity so
 /// the GB10 idle (40–43 C) does not refuse forever against a 40 C gate. It is a per-platform
 /// value, NOT a contract/candidate input: the loop still ABORTS a genuinely hot GPU above
@@ -590,7 +590,7 @@ impl CoolGateRecord {
 /// enforcing, and it is recorded as `SkippedNoReader` rather than silently "passed".
 ///
 /// `platform` keys the gate temperature ([`Platform::cool_gate_temp_c`]): Mac/MLX 40 C,
-/// GB10/CUDA 50 C (R21 lift, David 2026-08-30). It is the run's resolved platform, never a
+/// GB10/CUDA 60 C (R21 lift, David 2026-08-30). It is the run's resolved platform, never a
 /// contract/candidate value.
 pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<CoolGateRecord, RunnerError> {
     let gate_temp = platform.cool_gate_temp_c();
@@ -680,7 +680,7 @@ mod tests {
         Platform::Mlx.cool_gate_temp_c() // 40 C
     }
     fn cuda() -> f64 {
-        Platform::Cuda.cool_gate_temp_c() // 50 C
+        Platform::Cuda.cool_gate_temp_c() // 60 C
     }
 
     #[test]
@@ -916,14 +916,14 @@ mod tests {
     // Finding R21 previously FROZE the gate at a single, non-parameterizable 40 C constant and a
     // test asserted "no contract/env override can raise it". David ruled that rigidity out of
     // scope: on GB10 the GPU IDLES at 40–43 C (throttle T.Limit 55 C), so a 40 C gate refuses
-    // forever. The threshold is now a trusted PER-PLATFORM value (Mac/MLX 40 C, GB10/CUDA 50 C).
-    // The tests below prove the change only RE-SITES the threshold (40→50 for GB10) — it does NOT
+    // forever. The threshold is now a trusted PER-PLATFORM value (Mac/MLX 40 C, GB10/CUDA 60 C).
+    // The tests below prove the change only RE-SITES the threshold (40→60 for GB10) — it does NOT
     // defang the gate: a genuinely hot box above the platform gate still aborts, and an unreadable
     // reader still fails closed (never a silent pass).
 
     #[test]
-    fn gate_temp_is_per_platform_mac_40_gb10_50_r21_lift() {
-        // 41 C: HOT for Mac (40 gate) → aborts; COOL for GB10 (50 gate) → passes immediately.
+    fn gate_temp_is_per_platform_mac_40_gb10_60_r21_lift() {
+        // 41 C: HOT for Mac (40 gate) → aborts; COOL for GB10 (60 gate) → passes immediately.
         // This is exactly the case R21's frozen 40 C gate made unusable on GB10.
         assert_eq!(
             cool_gate_loop(mlx(), seq(vec![Some(41.0)]), |_| {}),
@@ -936,7 +936,7 @@ mod tests {
                 waited: 0,
                 temp_c: 41.0
             }),
-            "41C is below the 50C GB10 gate → passes (the R21 lift: GB10 idle no longer refuses)"
+            "41C is below the 60C GB10 gate → passes (the R21 lift: GB10 idle no longer refuses)"
         );
         // Boundary: each platform passes AT its own gate temperature (inclusive).
         assert_eq!(
@@ -947,31 +947,31 @@ mod tests {
             })
         );
         assert_eq!(
-            cool_gate_loop(cuda(), seq(vec![Some(50.0)]), |_| {}),
+            cool_gate_loop(cuda(), seq(vec![Some(60.0)]), |_| {}),
             Ok(CoolGateOutcome::Passed {
                 waited: 0,
-                temp_c: 50.0
+                temp_c: 60.0
             })
         );
     }
 
     #[test]
     fn gb10_gate_still_refuses_a_genuinely_hot_box_negative_control() {
-        // NEGATIVE CONTROL: raising the GB10 gate to 50 must NOT let a truly hot box time. At a
-        // steady 52–54 C (above the 50 gate, near the 55 throttle limit) the gate stays hot and
-        // aborts — the re-sited gate is not a disabled gate.
-        for hot in [Some(52.0), Some(53.5), Some(54.0)] {
+        // NEGATIVE CONTROL: raising the GB10 gate to 60 must NOT let a truly hot box time. At a
+        // steady 62–64 C (above the 60 gate) the gate stays hot and aborts — the re-sited gate
+        // is not a disabled gate.
+        for hot in [Some(62.0), Some(63.5), Some(64.0)] {
             let r = cool_gate_loop(cuda(), seq(vec![hot]), |_| {});
             assert!(
                 matches!(r, Err(ref m) if m.contains("not cooling down")),
-                "GB10 at {hot:?}C (>50) must refuse, got {r:?}"
+                "GB10 at {hot:?}C (>60) must refuse, got {r:?}"
             );
         }
     }
 
     #[test]
     fn gb10_gate_passes_a_cool_box_positive_control() {
-        // POSITIVE CONTROL: below the 50 C GB10 gate (e.g. 45 C) the gate passes.
+        // POSITIVE CONTROL: below the 60 C GB10 gate (e.g. 45 C) the gate passes.
         assert_eq!(
             cool_gate_loop(cuda(), seq(vec![Some(45.0)]), |_| {}),
             Ok(CoolGateOutcome::Passed {

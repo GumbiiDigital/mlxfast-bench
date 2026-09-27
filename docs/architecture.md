@@ -286,7 +286,7 @@ The fixture also holds the `target` block with the reference-model pin and the g
 regime. Each device measures its own reference: the run measures the serial-control leg on
 that box in the same job as the scored leg, and the reference stays on that device. benchd
 does not upload it and does not store it centrally. Those tracks declare the window shape
-instead; `official_prefill_warmup_runs` is 1 on the Mac track and 0 on the CUDA track. The 27B
+instead; `official_prefill_warmup_runs` is 1 on the Mac track and 0 on the Qwen CUDA track (1 on the Nemotron CUDA track, whose adapter accepts a repeated `prefill` inside one prefill phase). The 27B
 track declares the pair and the regime and no window shape. Every track declares the bands,
 the weights and the model shape. `crates/benchd/tests/fixtures/contract-full/` holds one full
 fixture for each track, and a test proves each resolves to the expected values beside it.

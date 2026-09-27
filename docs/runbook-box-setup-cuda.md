@@ -359,7 +359,7 @@ The wrapper form stays correct for a single-leg run, which is what the
 correctness check of section 11a is.
 
 The local checks have a pre-timing gate. The gate waits for the GPU to idle
-and to cool to 50 C. The ranked path has no local gate.
+and to cool to 60 C. The ranked path has no local gate.
 
 ## 11. Local checks
 
@@ -500,7 +500,7 @@ To refresh the benchmarker pair, use `BENCHD_REFRESH=1` (section 7).
 | the score check refuses a preset `SERVE_UP_SPECULATIVE` | the two serve values were exported in the shell | set them on the correctness check only (section 11a) |
 | the score check refuses an inherited `DS4_RESIDENT_SOCKET` | the measure script was wrapped in `tools/serve-up.sh` | call it directly (section 11b) |
 | a local check fails with `spec mode "mtp" is not runnable on this engine` | the resident was booted serial against a tree that declares a depth | derive the two values from `tools/spec-declaration.sh` (section 11) |
-| correctness check: `gate rejected (prefill): GPU is hot and not cooling down` with nothing else on the GPU | the loaded resident holds the die above the 50 C local gate on this box | `MLXFAST_LOCAL_COOL_GATE=0` for that local check only (section 11a); never in the container environment |
+| correctness check: `gate rejected (prefill): GPU is hot and not cooling down` with nothing else on the GPU | the loaded resident holds the die above the 60 C local gate on this box | `MLXFAST_LOCAL_COOL_GATE=0` for that local check only (section 11a); never in the container environment |
 | `git clone` of the bundle: `fatal: early EOF` or `index-pack died` | the bundle was truncated in transit; `scp` over a relayed link can return 0 on a partial file | compare sha256 on both ends; copy again with `rsync --partial` or in chunks |
 | `git ls-remote` of the engine repository fails on the box | the box has no GitHub credential | expected; the operator checkout comes from a bundle; the ranked job uses the Actions token |
 | `fetch-benchd.sh`: "manifest sha256 is not 64 lowercase hex characters" | a hand-made `benchd.manifest.json` with a `binaries` entry split over lines | one entry per line, the channel's layout |

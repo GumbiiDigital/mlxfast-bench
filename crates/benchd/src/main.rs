@@ -5264,7 +5264,7 @@ fn official_cool_gate(
 /// a bare local run on a Mac. The SCORED measure-job path never uses this: it passes the platform
 /// it already resolved from the contract≡env track id. Only the local dev helpers
 /// (`--local-cool-gate-only`, `--mode local-iterate`) fall back to this env resolution, where a GB10
-/// operator sets the track id env to key the 50 C GB10 gate. The gate temperature is per-platform
+/// operator sets the track id env to key the 60 C GB10 gate. The gate temperature is per-platform
 /// (`Platform::cool_gate_temp_c`), never a contract/candidate value.
 fn cool_gate_platform_from_env() -> bench_core::constants::Platform {
     std::env::var("MLXFAST_QWEN_MTP_TRACK_ID")

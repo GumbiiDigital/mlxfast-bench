@@ -13,9 +13,9 @@
   "correctness_steps": 64,
   "benchmark_decode_steps": 128,
   "local_submit_benchmark_decode_steps": 1023,
-  "official_prefill_warmup_runs": 0,
+  "official_prefill_warmup_runs": 1,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
-  "seed_tokens": 1024,
+  "seed_tokens": 4096,
   "golden_model_type": "nemotron_h"
 }

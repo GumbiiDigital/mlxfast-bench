@@ -1758,9 +1758,12 @@ mod round_trip_oracle_tests {
     ///   MLX, 0 on CUDA, because the CUDA adapter's resident engine is already warm.
     ///
     /// * `nemotron3.5-lightning-30b-a3b-cuda-v1` — the first track declared contract-first from
-    ///   the start: the 125B CUDA regime (live control leg, the same bands, weights and window,
-    ///   no warm-up) over the Nemotron checkpoint's own shape (`nemotron_h`, vocabulary 131072,
-    ///   52 decoder layers, a 1024-token seed). No table ever held it.
+    ///   the start: the 125B CUDA regime (live control leg, the same bands and weights) over the
+    ///   Nemotron checkpoint's own shape (`nemotron_h`, vocabulary 131072, 52 decoder layers). Its
+    ///   window differs on purpose: a 4096-token seed and ONE unmeasured prefill warm-up pass,
+    ///   because a single post-cool-gate 1024-token prefill on this 3B-active model is
+    ///   bandwidth-bound and varied 3–8% pass to pass (above the 1% calibration maximum). No
+    ///   table ever held it.
     ///
     /// `gemma4-26b-a4b-mlx-v1` is DELIBERATELY ABSENT. It does not migrate: it runs its own channel
     /// benchd, and this tree carries none of its values any more (David 2026-09-15, "gemma branch
@@ -1807,8 +1810,8 @@ mod round_trip_oracle_tests {
             baseline: None,
             bands: (0.05, 0.05, 0.02, 0.05, false, false),
             weights: (0.75, 0.25),
-            window: Some((64, 128, 1023, 0)),
-            model: ("nemotron_h", 131_072, 52, 1_024),
+            window: Some((64, 128, 1023, 1)),
+            model: ("nemotron_h", 131_072, 52, 4_096),
         },
     ];
 

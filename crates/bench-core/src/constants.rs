@@ -147,12 +147,20 @@ pub const PLATFORM_KEY_CUDA: &str = "cuda";
 /// The MLX (Mac) track's local pre-timing cool-gate temperature (C). A Mac idles well below
 /// this, so the gate blocks only a genuinely warm GPU.
 pub const COOL_GATE_TEMP_C_MLX: f64 = 40.0;
-/// The CUDA (GB10) track's local pre-timing cool-gate temperature (C). David 2026-08-30 ("our
-/// engine, our benchmark — no adversarial hardening"): the GB10 GPU IDLES at 40–43 C (throttle
-/// T.Limit 55 C), so the MLX 40 C gate would refuse forever. The trusted per-platform gate is
-/// 50 C — above idle so it re-sites the threshold, below the throttle limit so a genuinely hot
-/// GB10 still waits/refuses.
-pub const COOL_GATE_TEMP_C_CUDA: f64 = 50.0;
+/// The CUDA (GB10) track's local pre-timing cool-gate temperature (C). GumbiiDigital fork,
+/// 2026-09-26 (Nemotron 3.5 Lightning track): 60 C, raised from upstream's 50 C.
+///
+/// WHY. On driver 580.159.03 ANY CUDA context holds the GB10 in P0 (~10.7 W, 2.4 GHz at zero
+/// utilization), so a leg's loaded resident plateaus at 49–52 C on a quiet box. A 50 C gate
+/// therefore sat on the plateau: every measured pass was admitted at exactly 50.0 C after
+/// 70–390 s of idle, and 4 of 7 boxes were refused ("not cooling down") stuck at 51.0 C.
+///
+/// THE THROTTLE LIMIT IS NOT 55 C. `nvidia-smi -q` reports `GPU T.Limit Temp` as the MARGIN below
+/// the maximum operating temperature (53 C of headroom at 43 C, so the limit is ~96 C), and the
+/// box's `SW/HW Thermal Slowdown` counters stayed at 0 us across runs that reached 64 C; the only
+/// active limiter was the SW power cap. 60 C keeps a 30+ C margin below any thermal slowdown and
+/// still refuses a box that stays genuinely hot.
+pub const COOL_GATE_TEMP_C_CUDA: f64 = 60.0;
 
 impl Platform {
     /// Every platform, for tests and mirrors that must cover the whole table.
@@ -732,17 +740,18 @@ mod tests {
     }
 
     #[test]
-    fn cool_gate_temp_is_per_platform_mac_40_gb10_50() {
+    fn cool_gate_temp_is_per_platform_mac_40_gb10_60() {
         // R21 lift (David 2026-08-30): the gate temperature is a trusted per-platform value, not a
-        // frozen 40 C constant. Mac/MLX idles cool → 40 C; GB10/CUDA idles at 40–43 C, so its gate
-        // is re-sited to 50 C (below the 55 C throttle limit — it re-sites, it does not defang).
+        // frozen 40 C constant. Mac/MLX idles cool → 40 C. GB10/CUDA: a loaded resident holds the
+        // die at 49–52 C in P0, so this fork re-sites the gate to 60 C (see the constant).
         assert_eq!(Platform::Mlx.cool_gate_temp_c(), 40.0);
-        assert_eq!(Platform::Cuda.cool_gate_temp_c(), 50.0);
+        assert_eq!(Platform::Cuda.cool_gate_temp_c(), 60.0);
         assert!(
             Platform::Cuda.cool_gate_temp_c() > Platform::Mlx.cool_gate_temp_c(),
             "the GB10 gate is raised above the Mac gate, keyed by platform"
         );
-        // Still below the GB10 throttle limit (55 C): a genuinely hot GB10 stays above the gate.
-        assert!(Platform::Cuda.cool_gate_temp_c() < 55.0);
+        // At least 30 C below the GB10 maximum operating temperature (~96 C: `GPU T.Limit Temp` is a
+        // margin, 53 C at 43 C), so the gate never admits a box near thermal slowdown.
+        assert!(Platform::Cuda.cool_gate_temp_c() <= 96.0 - 30.0);
     }
 }

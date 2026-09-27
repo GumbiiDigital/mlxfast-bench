@@ -70,7 +70,7 @@ Every timed phase of both legs runs behind two gates, in one order: the **quiesc
 then the **cool gate**. The quiescence gate waits until the box is idle, a 1-minute load average
 below 2.0 and a GPU utilization below 0.10, and refuses with `QUIESCENCE-TIMEOUT` after 900
 seconds. The cool gate then waits until the GPU is at or below the platform temperature, 40 C on a
-Mac and 50 C on a Spark. The same two gates guard every pass of `calibrate-baseline` and the local
+Mac and 60 C on a Spark. The same two gates guard every pass of `calibrate-baseline` and the local
 modes when the gates are on, and one switch, `MLXFAST_LOCAL_COOL_GATE=0`, turns both off. A ranked
 run refuses when a gate finds no reader, so keep `macmon` (Mac) or `nvidia-smi` (Spark) installed
 on the box. The score seals every gate point it ran behind, in run order, as `metrics.gates`: one

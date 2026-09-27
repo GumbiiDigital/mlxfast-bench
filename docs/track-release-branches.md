@@ -48,7 +48,7 @@ goldens.
 |---|---|---|
 | qwen 3.8 125B-A6B MLX | `qwen3.8-125b-a6b-mlx-v1` | `qwen3.8-125b-a6b-v1` |
 | qwen 3.8 125B-A6B CUDA | `qwen3.8-125b-a6b-cuda-v1` | `qwen3.8-125b-a6b-v1` |
-| nemotron 3.5 Lightning 30B-A3B CUDA | `nemotron3.5-lightning-30b-a3b-cuda-v1` | `main` (pinned commit) |
+| nemotron 3.5 Lightning 30B-A3B CUDA | `nemotron3.5-lightning-30b-a3b-cuda-v1` | GumbiiDigital fork `gumbii/nemotron35-own` (pinned commit; 60 C GB10 cool gate) |
 | qwen 3.8 27B MLX | `qwen3.8-27b-mtp-v1` | `main` |
 | gemma 4 26B A4B MLX | `gemma4-26b-a4b-mlx-v1` | `gemma4-26b-a4b-mlx-v1` |
 

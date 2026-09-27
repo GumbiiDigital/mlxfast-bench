@@ -74,7 +74,7 @@ stored-pair capture the earlier tracks still use.
 | worker lifecycle (paired ranked run) | benchd boots one resident per leg from that leg's tree; each phase spawns a thin adapter that attaches to it | benchd boots one resident per leg from that leg's tree; each phase spawns a sandboxed `bench-worker` that attaches to it |
 | worker lifecycle (local unscored run) | the measure script's own `tools/serve-up.sh` wrap; one attached worker per window | the measure script's own `tools/resident-up.sh` wrap |
 | goldens | organizer material in R2; staged on the box by pin | organizer material in R2; staged on the box by pin |
-| cool gate | 50 C | 40 C |
+| cool gate | 60 C | 40 C |
 | quiescence gate | load < 2.0, GPU util < 0.10 | load < 2.0, GPU util < 0.10 |
 | runner supervisor | systemd | LaunchDaemon |
 | pair platform | `linux-aarch64` | darwin |
