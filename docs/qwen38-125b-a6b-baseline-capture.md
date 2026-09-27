@@ -137,8 +137,8 @@ per axis and no flag can relax it.
   "decode_cv": 0.002,
   "prefill_band_low": 0.95,
   "prefill_band_high": 1.05,
-  "decode_band_low": 0.98,
-  "decode_band_high": 1.02,
+  "decode_band_low": 0.97,
+  "decode_band_high": 1.03,
   "captured_at": "2026-09-08T00:00:00Z",
   "benchd_source_commit": "<40 hex>"
 }
@@ -148,8 +148,9 @@ per axis and no flag can relax it.
 equal the name of the golden the ranked run measures (the file name minus
 `.golden.json`). A band describes the leg it was measured from, so a file
 captured on another box or another prompt is refused. benchd reads the band from
-the file; the values above are the defaults the calibrator writes. The CV fields
-are fractions: `0.004` is 0.4 %.
+the file; the values above are the defaults the calibrator writes. Previously
+captured files retain their stored bands, including the old 0.98/1.02 decode
+band. The CV fields are fractions: `0.004` is 0.4 %.
 
 The re-rooting that finds the reference tree's engine and weights refuses a
 candidate path that walks out of the workspace root with `..`, and refuses a

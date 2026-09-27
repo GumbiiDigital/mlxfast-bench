@@ -89,9 +89,9 @@ pub const DEFAULT_PREFILL_BAND_LOW: f64 = 0.95;
 /// See [`DEFAULT_PREFILL_BAND_LOW`].
 pub const DEFAULT_PREFILL_BAND_HIGH: f64 = 1.05;
 /// See [`DEFAULT_PREFILL_BAND_LOW`].
-pub const DEFAULT_DECODE_BAND_LOW: f64 = 0.98;
+pub const DEFAULT_DECODE_BAND_LOW: f64 = 0.97;
 /// See [`DEFAULT_PREFILL_BAND_LOW`].
-pub const DEFAULT_DECODE_BAND_HIGH: f64 = 1.02;
+pub const DEFAULT_DECODE_BAND_HIGH: f64 = 1.03;
 
 /// One box's calibration file: VALUES ONLY, and every value is a HEALTH fact about the box.
 ///
@@ -805,8 +805,8 @@ mod tests {
             "decode_cv": 0.002,
             "prefill_band_low": 0.95,
             "prefill_band_high": 1.05,
-            "decode_band_low": 0.98,
-            "decode_band_high": 1.02,
+            "decode_band_low": 0.97,
+            "decode_band_high": 1.03,
             "captured_at": "2026-09-08T00:00:00Z",
             "benchd_source_commit": "b".repeat(40),
         })
@@ -827,11 +827,38 @@ mod tests {
         assert_eq!(cal.prefill_seconds_per_token_mean, 0.0006282488193359375);
         assert_eq!(cal.decode_seconds_per_token_mean, 0.0329116748046875);
         assert_eq!(cal.prefill_band_low, 0.95);
-        assert_eq!(cal.decode_band_high, 1.02);
+        assert_eq!(cal.decode_band_low, 0.97);
+        assert_eq!(cal.decode_band_high, 1.03);
         // Round-trip: what this benchd writes is what it reads.
         let round_tripped =
             BaselineCalibration::parse(serde_json::to_string(&cal).unwrap().as_bytes()).unwrap();
         assert_eq!(round_tripped, cal);
+    }
+
+    #[test]
+    fn an_old_calibration_loads_and_keeps_its_stored_decode_band() {
+        let mut doc = valid_document();
+        doc["decode_band_low"] = json!(0.98);
+        doc["decode_band_high"] = json!(1.02);
+        let dir = std::env::temp_dir().join(format!(
+            "benchd-old-calibration-test.{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let cal = load_calibration(Some(&path), None).unwrap().calibration;
+        assert_eq!(cal.decode_band_low, 0.98);
+        assert_eq!(cal.decode_band_high, 1.02);
+        let (p, d) = (
+            cal.prefill_seconds_per_token_mean,
+            cal.decode_seconds_per_token_mean,
+        );
+        assert!(cal.check_band(p, d * 1.02).is_ok());
+        let err = cal.check_band(p, d * 1.025).unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -981,10 +1008,12 @@ mod tests {
         );
         // Dead centre and the ceiling of each band are INSIDE.
         assert!(cal.check_band(p, d).is_ok());
-        assert!(cal.check_band(p * 1.05, d * 1.02).is_ok());
+        assert!(cal.check_band(p * 1.05, d * 1.03).is_ok());
+        // A +2.5% control leg fits the new default ceiling.
+        assert!(cal.check_band(p, d * 1.025).is_ok());
         // A FASTER leg is a well box: below `*_band_low`, and far below it, both pass. The
         // low bound is recorded, never read.
-        assert!(cal.check_band(p * 0.95, d * 0.98).is_ok());
+        assert!(cal.check_band(p * 0.95, d * 0.97).is_ok());
         assert!(cal.check_band(p * 0.9, d).is_ok());
         assert!(cal.check_band(p, d * 0.9).is_ok());
         assert!(cal.check_band(p * 0.5, d * 0.5).is_ok());
@@ -993,7 +1022,8 @@ mod tests {
         for (label, prefill, decode) in [
             ("prefill high", p * 1.1, d),
             ("decode high", p, d * 1.1),
-            ("decode just over", p, d * 1.0201),
+            ("decode just over", p, d * 1.0301),
+            ("decode +3.5%", p, d * 1.035),
         ] {
             let err = cal.check_band(prefill, decode).unwrap_err();
             assert!(
@@ -1201,6 +1231,7 @@ mod tests {
         assert_eq!(cal.decode_seconds_per_token_mean, 0.030);
         assert_eq!(cal.prefill_cv, 0.0);
         assert_eq!(cal.prefill_band_low, DEFAULT_PREFILL_BAND_LOW);
+        assert_eq!(cal.decode_band_low, DEFAULT_DECODE_BAND_LOW);
         assert_eq!(cal.decode_band_high, DEFAULT_DECODE_BAND_HIGH);
 
         // A decode axis that varies by ~4.7% is well past the fixed 1% maximum.
