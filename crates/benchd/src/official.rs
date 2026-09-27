@@ -151,8 +151,15 @@ pub fn seal_engine_identity(
         .runner
         .as_ref()
         .map(|r| seal("runner.build", &r.build));
-    metrics.resident_pid = hello.resident.as_ref().map(|r| r.pid);
-    metrics.resident_load_epoch = hello.resident.as_ref().map(|r| r.load_epoch);
+    // The resident pid/load_epoch are engine-chosen numbers: logged, never sealed (the keys stay
+    // absent). The weights-load-once check reads them off the in-memory hello
+    // ([`retain_timed_hello`]), never back out of the record.
+    if let Some(r) = &hello.resident {
+        eprintln!(
+            "benchd: engine resident pid {} load_epoch {}",
+            r.pid, r.load_epoch
+        );
+    }
     for entry in &mut metrics.per_prompt {
         entry
             .head_provenance_sha256
@@ -4872,8 +4879,9 @@ mod tests {
         assert_eq!(metrics.runner_model_type, Some(sealed_text("qwen4_exp")));
         assert_eq!(metrics.runner_manifest_sha256.as_deref(), Some("valid"));
         assert_eq!(metrics.runner_build, Some(sealed_text("c4089870")));
-        assert_eq!(metrics.resident_pid, Some(4242));
-        assert_eq!(metrics.resident_load_epoch, Some(1_756_944_000));
+        // Engine-chosen resident numbers are logged, never sealed.
+        assert_eq!(metrics.resident_pid, None);
+        assert_eq!(metrics.resident_load_epoch, None);
 
         // ROUND TRIP through the sealed bytes: Yukon reads score.json as {score, metrics}, so the
         // keys must survive serialization under their sealed names and read back identically.
@@ -4890,8 +4898,8 @@ mod tests {
         assert_eq!(obj["runner_model_type"], sealed_text("qwen4_exp"));
         assert_eq!(obj["runner_manifest_sha256"], "valid");
         assert_eq!(obj["runner_build"], sealed_text("c4089870"));
-        assert_eq!(obj["resident_pid"], 4242);
-        assert_eq!(obj["resident_load_epoch"], 1_756_944_000u64);
+        assert!(!obj.contains_key("resident_pid"));
+        assert!(!obj.contains_key("resident_load_epoch"));
         let back: ScorePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.metrics, metrics);
     }

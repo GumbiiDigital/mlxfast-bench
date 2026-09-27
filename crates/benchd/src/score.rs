@@ -293,15 +293,16 @@ pub struct ScoreMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_build: Option<String>,
     /// ADDITIVE — the process id of the RESIDENT process the timed worker ATTACHED to
-    /// (`hello.resident.pid`). Absent for a worker that loaded the weights itself. IDENTITY, never
-    /// an input to the score.
+    /// (`hello.resident.pid`). NO LONGER SEALED: it is an engine-chosen number, so benchd logs it
+    /// to stderr and leaves this key absent. Kept in the schema so older records still parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident_pid: Option<u32>,
     /// ADDITIVE — the resident process's load stamp (`hello.resident.load_epoch`), taken when its
     /// load ended and constant for the life of that process. Every phase of one window seals the
     /// SAME value; the official path REFUSES a window whose phases report different resident
-    /// identities, because that is a reload inside the window (weights-load-once). IDENTITY, never
-    /// an input to the score.
+    /// identities, because that is a reload inside the window (weights-load-once). NO LONGER
+    /// SEALED, like `resident_pid`: logged to stderr, key absent, the check runs on the in-memory
+    /// hello. Kept in the schema so older records still parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident_load_epoch: Option<u64>,
     /// ADDITIVE — THE PAIRED-BASELINE SEAL (David 2026-09-08). WHERE the denominator came from:
