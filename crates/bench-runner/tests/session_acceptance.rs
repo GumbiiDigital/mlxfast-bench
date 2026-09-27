@@ -105,7 +105,10 @@ fn hello_rejects_nonzero_id() {
 fn hello_rejects_not_ok() {
     let engine = MockEngine::new().with_hello(0, false, Some(MOCK_NONCE));
     let result = Session::connect(engine);
-    assert!(matches!(result, Err(RunnerError::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(RunnerError::ProtocolEngineText { .. })
+    ));
 }
 
 #[test]

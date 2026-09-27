@@ -16,7 +16,18 @@ pub enum RunnerError {
     Json(serde_json::Error),
     /// Protocol-level violation that is not an engine-signalled error:
     /// malformed hello, unexpected EOF, response id mismatch, unparseable line at EOF, etc.
+    ///
+    /// The message is benchd's OWN text: it must never carry engine-controlled text (that goes in
+    /// [`RunnerError::ProtocolEngineText`]), because `Display` of this variant reaches sealed
+    /// records verbatim.
     Protocol(String),
+    /// A protocol violation whose diagnosis includes ENGINE-CONTROLLED text — the engine's own
+    /// `error` string on a refused hello, or the worker's retained stderr tail after it died.
+    /// `detail` is benchd's own text; `engine_text` is the engine's. `Display` (what every seal
+    /// site sees) carries only `detail` plus a digest of `engine_text`
+    /// ([`crate::scrub::seal_engine_text`]); [`RunnerError::diagnostic`] carries the scrubbed text
+    /// for the box-local log.
+    ProtocolEngineText { detail: String, engine_text: String },
     /// The response nonce did not equal the session nonce established at hello.
     NonceMismatch {
         expected: String,
@@ -122,21 +133,57 @@ pub enum RunnerError {
     GateRejected { phase: String, reason: String },
 }
 
-impl fmt::Display for RunnerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl RunnerError {
+    /// The FULL diagnosis for benchd's own log: engine-controlled text included (scrubbed), capped
+    /// at [`crate::scrub::SEALED_REASON_BYTE_LIMIT`]. NEVER put this in a sealed record — that is
+    /// what `Display` is for.
+    pub fn diagnostic(&self) -> String {
+        crate::scrub::scrub_reason_for_seal(&Revealed(self).to_string())
+    }
+
+    /// Whether this error carries engine-controlled text that `Display` replaces with a digest.
+    pub fn carries_engine_text(&self) -> bool {
+        matches!(
+            self,
+            RunnerError::ProtocolEngineText { .. }
+                | RunnerError::NonceMismatch { got: Some(_), .. }
+                | RunnerError::Engine { .. }
+                | RunnerError::SpecEchoDivergence {
+                    effective: Some(_),
+                    ..
+                }
+                | RunnerError::SpecModeNotRunnable { .. }
+        )
+    }
+
+    /// Render the error. `reveal == false` is the SEALED form (`Display`): every engine-controlled
+    /// string is replaced by [`crate::scrub::seal_engine_text`]. `reveal == true` is the log form.
+    fn fmt_with(&self, f: &mut fmt::Formatter<'_>, reveal: bool) -> fmt::Result {
+        let engine = |text: &str| -> String {
+            if reveal {
+                crate::scrub::scrub_engine_text(text)
+            } else {
+                crate::scrub::seal_engine_text(text)
+            }
+        };
         match self {
             RunnerError::Io(e) => write!(f, "transport io error: {e}"),
-            RunnerError::Json(e) => write!(f, "protocol json error: {e}"),
+            RunnerError::Json(e) => write!(f, "protocol json error: {}", serde_error_summary(e)),
             RunnerError::Protocol(msg) => write!(f, "protocol violation: {msg}"),
+            RunnerError::ProtocolEngineText {
+                detail,
+                engine_text,
+            } => write!(f, "protocol violation: {detail} ({})", engine(engine_text)),
             RunnerError::NonceMismatch { expected, got } => match got {
                 Some(got) => write!(
                     f,
-                    "nonce mismatch: expected {expected:?}, got {got:?}"
+                    "nonce mismatch: expected {expected:?}, got {}",
+                    if reveal { format!("{got:?}") } else { engine(got) }
                 ),
                 None => write!(f, "nonce mismatch: expected {expected:?}, got none"),
             },
             RunnerError::Engine { kind, message } => {
-                write!(f, "engine reported failure on {kind:?}: {message}")
+                write!(f, "engine reported failure on {kind:?}: {}", engine(message))
             }
             RunnerError::CompletedWorkMismatch { issued, reported } => match reported {
                 Some(reported) => write!(
@@ -180,8 +227,9 @@ impl fmt::Display for RunnerError {
             } => match effective {
                 Some(effective) => write!(
                     f,
-                    "spec echo divergence: requested {requested} but the engine echoed {effective} \
-                     (spec-never-ignored, fail-closed — session discarded)"
+                    "spec echo divergence: requested {requested} but the engine echoed {} \
+                     (spec-never-ignored, fail-closed — session discarded)",
+                    engine(effective)
                 ),
                 None => write!(
                     f,
@@ -216,8 +264,9 @@ impl fmt::Display for RunnerError {
             RunnerError::SpecModeNotRunnable { mode, advertised } => write!(
                 f,
                 "engine did not advertise speculative mode {mode:?} as runnable (hello.spec_modes = \
-                 {advertised:?}); refusing the spec'd decode before any timed work (fail-closed — \
-                 session discarded)"
+                 {}); refusing the spec'd decode before any timed work (fail-closed — \
+                 session discarded)",
+                engine(&format!("{advertised:?}"))
             ),
             RunnerError::RunTimeout {
                 phase,
@@ -235,6 +284,40 @@ impl fmt::Display for RunnerError {
             ),
         }
     }
+}
+
+impl fmt::Display for RunnerError {
+    /// The SEALED form: safe to put in a record the participant reads back. Engine-controlled text
+    /// appears only as a digest; see [`RunnerError::diagnostic`] for the full text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_with(f, false)
+    }
+}
+
+/// The log rendering of a [`RunnerError`] (engine text revealed, scrubbed).
+struct Revealed<'a>(&'a RunnerError);
+
+impl fmt::Display for Revealed<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_with(f, true)
+    }
+}
+
+/// A serde_json error described by CATEGORY and POSITION only. serde's own `Display` quotes the
+/// offending value (`invalid type: string "…"`, ``unknown variant `…` ``), and on engine output
+/// that value is engine-chosen text, so it must never reach a record.
+pub fn serde_error_summary(e: &serde_json::Error) -> String {
+    let category = match e.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "{category} error at line {} column {}",
+        e.line(),
+        e.column()
+    )
 }
 
 impl std::error::Error for RunnerError {
@@ -261,3 +344,64 @@ impl From<serde_json::Error> for RunnerError {
 
 /// Convenience alias used throughout the runner.
 pub type Result<T> = std::result::Result<T, RunnerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// serde's own Display quotes the offending value; the summary must not, whatever the error.
+    #[test]
+    fn serde_error_summary_never_quotes_the_input() {
+        const MARKER: &str = "HIDDENPROMPTqzx7Kv9w";
+        for line in [
+            format!(r#"{{"id":0,"ok":true,"protocol_version":"{MARKER}"}}"#),
+            format!(r#"{{"id":0,"ok":true,"{MARKER}":1}}"#),
+        ] {
+            let e = serde_json::from_str::<bench_protocol::WorkerResponse>(&line).unwrap_err();
+            assert!(
+                e.to_string().contains(MARKER),
+                "premise: serde quotes it: {e}"
+            );
+            let summary = serde_error_summary(&e);
+            assert!(!summary.contains(MARKER), "{summary}");
+            assert!(!summary.contains("HIDDEN"), "{summary}");
+            assert!(!RunnerError::Json(e).to_string().contains("HIDDEN"));
+        }
+    }
+
+    /// Every variant that carries engine text seals it as a digest in `Display` and reveals it
+    /// (scrubbed) in `diagnostic()` for the log.
+    #[test]
+    fn engine_text_variants_seal_in_display_and_reveal_in_diagnostic() {
+        const MARKER: &str = "HIDDENPROMPTqzx7Kv9w";
+        let errors = [
+            RunnerError::Engine {
+                kind: "prefill".to_string(),
+                message: MARKER.to_string(),
+            },
+            RunnerError::ProtocolEngineText {
+                detail: "hello was not ok".to_string(),
+                engine_text: MARKER.to_string(),
+            },
+            RunnerError::NonceMismatch {
+                expected: "n".to_string(),
+                got: Some(MARKER.to_string()),
+            },
+            RunnerError::SpecEchoDivergence {
+                requested: "{}".to_string(),
+                effective: Some(MARKER.to_string()),
+            },
+            RunnerError::SpecModeNotRunnable {
+                mode: "mtp".to_string(),
+                advertised: vec![MARKER.to_string()],
+            },
+        ];
+        for e in errors {
+            assert!(e.carries_engine_text());
+            let sealed = e.to_string();
+            assert!(!sealed.contains("HIDDEN"), "{sealed}");
+            assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+            assert!(e.diagnostic().contains(MARKER), "{}", e.diagnostic());
+        }
+    }
+}

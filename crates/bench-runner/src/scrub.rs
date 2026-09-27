@@ -519,6 +519,22 @@ pub fn scrub_reason_for_seal(reason: &str) -> String {
     clip_to_bytes(&scrub_engine_text(reason), SEALED_REASON_BYTE_LIMIT)
 }
 
+/// The SEALED stand-in for engine-controlled text: `engine-text-sha256=<hex> engine-text-bytes=<n>`
+/// of the SCRUBBED text, and none of the text itself.
+///
+/// The engine sees the hidden prompts and the sealed record is returned to the participant, so any
+/// engine-chosen bytes that reached the record would be a channel for reading a hidden prompt back
+/// (fail on purpose with the prompt in the reason). The digest lets an operator match a record to
+/// the full text in the box-local log without the record carrying it.
+pub fn seal_engine_text(text: &str) -> String {
+    let scrubbed = scrub_engine_text(text);
+    format!(
+        "engine-text-sha256={} engine-text-bytes={}",
+        bench_core::hash::sha256_hex(scrubbed.as_bytes()),
+        scrubbed.len()
+    )
+}
+
 /// Clip `text` to at most `cap` BYTES, keeping a head and a tail around a marker, never splitting
 /// a UTF-8 character. Both ends are kept because the head names the failure and the tail is where
 /// a worker's last words are.

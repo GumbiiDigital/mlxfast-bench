@@ -70,7 +70,8 @@ pub fn verify_captured_engine_wire(
         let resp = serde_json::from_str::<WorkerResponse>(line).map_err(|e| {
             format!(
                 "captured engine-wire line rejected by benchd WorkerResponse \
-                 (deny_unknown_fields): {e}"
+                 (deny_unknown_fields): {}",
+                crate::error::serde_error_summary(&e)
             )
         })?;
         parsed.push(resp);

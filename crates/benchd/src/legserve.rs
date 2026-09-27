@@ -196,10 +196,19 @@ pub fn boot_leg(
             )
         })?;
     if !out.status.success() {
+        // The boot script's stderr is the participant tree's own text, and a later pair's boot
+        // runs after that tree's engine has seen the hidden prompt: the full (scrubbed) text goes
+        // to the box-local log, the error — which a sealed record carries — gets only its digest.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        eprintln!(
+            "benchd: the {label} leg's resident boot stderr: {}",
+            bench_runner::scrub_reason_for_seal(stderr)
+        );
         return Err(format!(
             "{LEG_SERVE_BOOT_FAILED}: the {label} leg's resident did not boot ({}): {}",
             out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            bench_runner::seal_engine_text(stderr)
         ));
     }
     let socket = std::fs::read_to_string(&socket_out)

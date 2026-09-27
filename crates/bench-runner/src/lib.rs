@@ -20,13 +20,15 @@ pub mod timing;
 pub mod transport;
 pub mod wire_crosscheck;
 
-pub use error::{Result, RunnerError};
+pub use error::{serde_error_summary, Result, RunnerError};
 pub use sandbox::{
     build_seatbelt_profile, resolve_official_sandbox, sandbox_exec_command, seatbelt_escaped,
     validate_resident_socket, OfficialSandboxError, OfficialSandboxInputs, OfficialSandboxPlan,
     SandboxProfile, SANDBOX_EXEC_PATH,
 };
-pub use scrub::{scrub_engine_text, scrub_reason_for_seal, SEALED_REASON_BYTE_LIMIT};
+pub use scrub::{
+    scrub_engine_text, scrub_reason_for_seal, seal_engine_text, SEALED_REASON_BYTE_LIMIT,
+};
 pub use session::{Hello, Session};
 pub use timing::{
     run_batched_free_run_decode_phase_fresh, run_decode_phase_fresh,

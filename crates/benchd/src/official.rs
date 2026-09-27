@@ -2268,6 +2268,120 @@ mod tests {
         );
     }
 
+    const PROMPT_MARKER: &str = "HIDDENPROMPTqzx7Kv9w";
+
+    /// Every run of `marker` at least 4 bytes long that `text` contains.
+    fn marker_runs_in(text: &str, marker: &str) -> Vec<String> {
+        let mut hits = Vec::new();
+        for i in 0..marker.len() {
+            for j in (i + 4)..=marker.len() {
+                if text.contains(&marker[i..j]) {
+                    hits.push(marker[i..j].to_string());
+                }
+            }
+        }
+        hits
+    }
+
+    /// The hidden-prompt read-back channel: an engine that fails ON PURPOSE with prompt text in its
+    /// `error` reason or in the stderr tail benchd retains when it dies. The SEALED official
+    /// payload — every field, not just `metrics.error` — carries not one run of that text, and
+    /// does carry its digest and byte count.
+    #[test]
+    fn official_sealed_record_carries_no_engine_text_only_its_digest() {
+        let reason = format!("the prompt was {PROMPT_MARKER}");
+        let tail = format!("worker exited with status 3; {reason}");
+        let golden = official_golden(None);
+        let run = |fail_on_spawn: usize, stderr: bool| {
+            let spawn_n = Cell::new(0usize);
+            official_core_windowed(
+                test_run(
+                    &golden,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                ),
+                TEST_BASELINE.bands,
+                || {
+                    let n = spawn_n.get();
+                    spawn_n.set(n + 1);
+                    if n != fail_on_spawn {
+                        Session::connect(conformant_engine()).map(|(s, _)| s)
+                    } else if stderr {
+                        // A worker that died before hello, with the prompt in its stderr tail.
+                        Err(RunnerError::ProtocolEngineText {
+                            detail: "engine closed the stream before returning a response"
+                                .to_string(),
+                            engine_text: tail.clone(),
+                        })
+                    } else {
+                        Session::connect(conformant_engine().error_on("free_decode_run", &reason))
+                            .map(|(s, _)| s)
+                    }
+                },
+                |_phase: &str| Ok(()),
+            )
+        };
+        for (label, payload, engine_text) in [
+            ("engine error reason", run(0, false), &reason),
+            ("worker stderr tail", run(0, true), &tail),
+        ] {
+            assert!(!payload.passed, "{label}");
+            let sealed = serde_json::to_string(&payload).unwrap();
+            assert_eq!(
+                marker_runs_in(&sealed, PROMPT_MARKER),
+                Vec::<String>::new(),
+                "{label}: engine text sealed: {}",
+                payload.metrics.error
+            );
+            assert!(
+                payload
+                    .metrics
+                    .error
+                    .contains(&bench_runner::seal_engine_text(engine_text)),
+                "{label}: digest missing: {}",
+                payload.metrics.error
+            );
+            assert!(
+                payload.metrics.error.contains("engine-text-bytes="),
+                "{label}: {}",
+                payload.metrics.error
+            );
+        }
+    }
+
+    /// benchd's OWN refusals reach the sealed record byte-for-byte: they carry benchd's comparison
+    /// against the golden (speedups, one token id, positions), never engine text.
+    #[test]
+    fn benchd_generated_refusals_seal_unchanged() {
+        for own in [
+            "performance floor failed: decode_speedup=0.900000 floor=0.950000 \
+             prefill_speedup=1.000000 floor=0.950000"
+                .to_string(),
+            "TIMED-REPLAY-REJECTED: pair 1: timed decode position 17 (0 = the seed token): token \
+             1046 is 2.0900 logits below the reference's top logit, above the declared 2 maximum"
+                .to_string(),
+            format!(
+                "{}: serial-control leg outside this box's band: the decode leg measured 0.02 \
+                 seconds per token, and box \"spark-1\" is calibrated at 0.01 with a ceiling of \
+                 0.0103 (1.03 of the mean); the box is slower than when it was calibrated; \
+                 refusing to seal a score",
+                crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND
+            ),
+        ] {
+            let payload = official_failed(
+                &official_golden(None),
+                RunDigests::for_test(&DirDigest::empty()),
+                "commit",
+                own.clone(),
+                ScoringInputs::local(
+                    TEST_BASELINE.prefill_seconds_per_token,
+                    TEST_BASELINE.decode_seconds_per_token,
+                ),
+            );
+            assert_eq!(payload.metrics.error, own);
+        }
+    }
+
     /// A stub engine conformant on BOTH the timed oracle and the teacher-forced base case.
     fn conformant_engine() -> MockEngine {
         MockEngine::new()

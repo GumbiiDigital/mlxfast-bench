@@ -23,6 +23,28 @@ fn write_script(dir: &std::path::Path, body: &str) -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Spawn the fake worker. Retries `ExecutableFileBusy`: a sibling test's fork can briefly hold the
+/// write fd of a script this test just wrote (ETXTBSY), a parallel-test race, not a product fault.
+fn spawn_fake_worker(engine: &str, forward: bool) -> ChildStdioTransport {
+    let mut attempts = 0;
+    loop {
+        match ChildStdioTransport::spawn_with_parent_env_forwarding(
+            engine,
+            "/weights",
+            &[],
+            Vec::<(String, String)>::new(),
+            forward,
+        ) {
+            Ok(t) => return t,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawn fake worker: {e}"),
+        }
+    }
+}
+
 /// Spawn `body` as the engine, attempt the hello handshake, and return the failure message.
 /// Panics if the handshake unexpectedly SUCCEEDS — every worker here is supposed to die.
 fn handshake_failure(tag: &str, body: &str) -> String {
@@ -34,21 +56,108 @@ fn handshake_failure(tag: &str, body: &str) -> String {
 fn handshake_failure_forwarding(tag: &str, body: &str, forward: bool) -> String {
     let dir = std::env::temp_dir().join(format!("bench134-{tag}-{}", std::process::id()));
     let engine = write_script(&dir, body);
-    let transport = ChildStdioTransport::spawn_with_parent_env_forwarding(
-        &engine,
-        "/weights",
-        &[],
-        Vec::<(String, String)>::new(),
-        forward,
-    )
-    .expect("spawn fake worker");
-    let message = match Session::connect(transport) {
-        Ok(_) => panic!("{tag}: expected the handshake to fail"),
-        Err(RunnerError::Protocol(msg)) => msg,
-        Err(other) => panic!("{tag}: expected a Protocol error, got {other}"),
+    let transport = spawn_fake_worker(&engine, forward);
+    let message = match handshake_error(&dir, transport, tag) {
+        // The post-mortem is engine-controlled, so it rides beside benchd's own text; the log
+        // form (what these tests read) is the two joined, exactly as the message used to read.
+        RunnerError::ProtocolEngineText {
+            detail,
+            engine_text,
+        } => format!("{detail} ({engine_text})"),
+        other => panic!("{tag}: expected a ProtocolEngineText error, got {other}"),
     };
-    std::fs::remove_dir_all(&dir).ok();
     message
+}
+
+fn handshake_error(
+    dir: &std::path::Path,
+    transport: ChildStdioTransport,
+    tag: &str,
+) -> RunnerError {
+    let err = match Session::connect(transport) {
+        Ok(_) => panic!("{tag}: expected the handshake to fail"),
+        Err(e) => e,
+    };
+    std::fs::remove_dir_all(dir).ok();
+    err
+}
+
+/// Spawn `body` and return the handshake error itself.
+fn handshake_failure_error(tag: &str, body: &str) -> RunnerError {
+    let dir = std::env::temp_dir().join(format!("bench134-{tag}-{}", std::process::id()));
+    let engine = write_script(&dir, body);
+    let transport = spawn_fake_worker(&engine, false);
+    handshake_error(&dir, transport, tag)
+}
+
+/// Every non-empty substring of `marker` at least 4 bytes long that `text` contains — a sealed
+/// text may share a letter or two with the marker by chance, never a run.
+fn marker_runs_in(text: &str, marker: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for i in 0..marker.len() {
+        for j in (i + 4)..=marker.len() {
+            if text.contains(&marker[i..j]) {
+                hits.push(marker[i..j].to_string());
+            }
+        }
+    }
+    hits
+}
+
+const PROMPT_MARKER: &str = "HIDDENPROMPTqzx7Kv9w";
+
+/// The SEALED form (`Display`) of a dying worker's error carries benchd's own signature and the
+/// digest of the post-mortem, and not one run of the engine's text; the log form carries it all.
+#[test]
+fn sealed_display_of_a_dead_worker_carries_a_digest_not_its_stderr() {
+    let err = handshake_failure_error(
+        "seal-stderr",
+        &format!("#!/bin/sh\nprintf 'prompt was {PROMPT_MARKER}\\n' 1>&2\nexit 3\n"),
+    );
+    let sealed = err.to_string();
+    assert!(
+        sealed.starts_with(
+            "protocol violation: engine closed the stream before returning a response"
+        ),
+        "{sealed}"
+    );
+    assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+    assert!(sealed.contains("engine-text-bytes="), "{sealed}");
+    assert_eq!(
+        marker_runs_in(&sealed, PROMPT_MARKER),
+        Vec::<String>::new(),
+        "{sealed}"
+    );
+    assert!(
+        err.diagnostic().contains(PROMPT_MARKER),
+        "{}",
+        err.diagnostic()
+    );
+}
+
+/// A JSON-shaped line that fails to decode quotes nothing of itself: serde's own Display would
+/// say `invalid type: string "<marker>"`, the sealed error names only the category and position.
+#[test]
+fn a_decode_error_does_not_quote_the_engine_line() {
+    let err = handshake_failure_error(
+        "seal-decode",
+        &format!(
+            "#!/bin/sh\n\
+             printf '{{\"id\":0,\"ok\":true,\"nonce\":\"n1\",\"protocol_version\":\"{PROMPT_MARKER}\"}}\\n'\n\
+             exit 0\n"
+        ),
+    );
+    for text in [err.to_string(), err.diagnostic()] {
+        assert!(
+            text.contains("engine response line could not be decoded: data error at line 1 column"),
+            "{text}"
+        );
+        assert_eq!(
+            marker_runs_in(&text, PROMPT_MARKER),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
 }
 
 /// The signature `measure_job` seals into `rejected_pairs[].reason` must stay recognisable: the

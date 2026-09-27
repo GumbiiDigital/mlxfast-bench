@@ -1580,9 +1580,12 @@ pub(crate) fn failed_metrics(
 /// correctness-derived fields — and `commit`, `Some` on the OFFICIAL paths, which stamp
 /// `metrics.commit`, and `None` on the local ones, which do not.
 ///
-/// The SEAL BOUNDARY (#134) lives here and nowhere else: `failure.error` is engine-controlled text
-/// (a `RunnerError` Display, which since #134 carries the worker's own stderr tail), scrubbed and
-/// capped at the one point where it stops being a log line and becomes a persisted artifact.
+/// The SEAL BOUNDARY (#134) lives here and nowhere else: `failure.error` is usually a `RunnerError`
+/// Display, scrubbed and capped at the one point where it stops being a log line and becomes a
+/// persisted artifact. That Display already carries engine-controlled text (worker stderr tail,
+/// the engine's `error` reasons) only as `engine-text-sha256=… engine-text-bytes=…`, so a
+/// participant cannot read a hidden prompt back through a deliberate failure; the text itself goes
+/// to benchd's stderr (`RunnerError::diagnostic`).
 /// Official is the most exposed sink — its score.json travels and worker stderr is never forwarded
 /// — so this scrub is the only thing between engine bytes and the artifact.
 pub(crate) fn failed_score(
@@ -4761,7 +4764,12 @@ mod tests {
             }),
         );
         assert!(
-            payload.metrics.error.contains("engine exploded"),
+            // The engine's own error text is sealed as its digest, never verbatim.
+            payload
+                .metrics
+                .error
+                .contains(&bench_runner::seal_engine_text("engine exploded"))
+                && !payload.metrics.error.contains("engine exploded"),
             "site :431 signature — reached a different exit: {:?}",
             payload.metrics.error
         );
@@ -5173,7 +5181,12 @@ mod tests {
             "site :619 signature — the timed phase produced nothing"
         );
         assert!(
-            payload.metrics.error.contains("timed free-run failed"),
+            // The engine's own error text is sealed as its digest, never verbatim.
+            payload
+                .metrics
+                .error
+                .contains(&bench_runner::seal_engine_text("timed free-run failed"))
+                && !payload.metrics.error.contains("timed free-run failed"),
             "site :619 signature — reached a different exit: {:?}",
             payload.metrics.error
         );

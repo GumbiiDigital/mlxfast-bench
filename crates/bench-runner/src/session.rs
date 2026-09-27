@@ -161,7 +161,11 @@ impl<T: LineTransport> Session<T> {
     /// Reads lines, skipping any that do not look like a JSON response object (Swift
     /// `readResponseLine` behavior), decodes the first that does as the `hello`, and
     /// requires `id == 0`, `ok == true`, and a non-empty `nonce`.
-    pub fn connect(mut transport: T) -> Result<(Self, Hello)> {
+    pub fn connect(transport: T) -> Result<(Self, Hello)> {
+        Self::connect_inner(transport).inspect_err(log_engine_text)
+    }
+
+    fn connect_inner(mut transport: T) -> Result<(Self, Hello)> {
         // The hello handshake is untimed (no RunTimeout deadline armed yet).
         let resp = read_response_line(&mut transport, None, "hello")?;
         if resp.id != 0 {
@@ -171,10 +175,10 @@ impl<T: LineTransport> Session<T> {
             )));
         }
         if !resp.ok {
-            return Err(RunnerError::Protocol(format!(
-                "hello was not ok: {}",
-                resp.error.as_deref().unwrap_or("unknown error")
-            )));
+            return Err(RunnerError::ProtocolEngineText {
+                detail: "hello was not ok".to_string(),
+                engine_text: resp.error.unwrap_or_else(|| "unknown error".to_string()),
+            });
         }
         let nonce = match resp.nonce {
             Some(ref n) if !n.is_empty() => n.clone(),
@@ -270,8 +274,9 @@ impl<T: LineTransport> Session<T> {
 
         // From here on, any failure taints the session.
         let result = self.send_inner(&req, id);
-        if result.is_err() {
+        if let Err(e) = &result {
             self.discarded = true;
+            log_engine_text(e);
         }
         result
     }
@@ -384,10 +389,12 @@ impl<T: LineTransport> Session<T> {
             return Ok(());
         }
         self.discarded = true;
-        Err(RunnerError::SpecModeNotRunnable {
+        let e = RunnerError::SpecModeNotRunnable {
             mode: spec.mode.clone(),
             advertised: self.spec_modes.clone(),
-        })
+        };
+        log_engine_text(&e);
+        Err(e)
     }
 
     /// Spec-never-ignored enforcement (§6): when `requested` is `Some`, the engine's echoed
@@ -413,13 +420,15 @@ impl<T: LineTransport> Session<T> {
             return Ok(());
         }
         self.discarded = true;
-        Err(RunnerError::SpecEchoDivergence {
+        let e = RunnerError::SpecEchoDivergence {
             requested: serde_json::to_string(requested).unwrap_or_default(),
             effective: resp
                 .effective_spec
                 .as_ref()
                 .map(|e| serde_json::to_string(e).unwrap_or_default()),
-        })
+        };
+        log_engine_text(&e);
+        Err(e)
     }
 
     /// `decode_step` — one timed decode step (§3).
@@ -876,12 +885,9 @@ fn read_response_line<T: LineTransport>(
                 // stderr tail) and APPEND it, so the engine's own last words travel with the
                 // error into whatever record seals it. The leading clause is unchanged, so
                 // anything keying on this signature still matches.
-                let base = "engine closed the stream before returning a response".to_string();
-                return Err(RunnerError::Protocol(
-                    match transport.failure_diagnostic() {
-                        Some(diagnostic) => format!("{base} ({diagnostic})"),
-                        None => base,
-                    },
+                return Err(with_failure_diagnostic(
+                    transport,
+                    "engine closed the stream before returning a response".to_string(),
                 ));
             }
             ReadOutcome::Line(line) => {
@@ -897,18 +903,41 @@ fn read_response_line<T: LineTransport>(
                 // reject class is unchanged.
                 match serde_json::from_str::<WorkerResponse>(&line) {
                     Ok(resp) => return Ok(resp),
+                    // serde's Display quotes the offending value, which is engine-chosen text:
+                    // only its category and position are benchd's own.
                     Err(e) => {
-                        let base = format!("engine response line could not be decoded: {e}");
-                        return Err(RunnerError::Protocol(
-                            match transport.failure_diagnostic() {
-                                Some(diagnostic) => format!("{base} ({diagnostic})"),
-                                None => base,
-                            },
+                        return Err(with_failure_diagnostic(
+                            transport,
+                            format!(
+                                "engine response line could not be decoded: {}",
+                                crate::error::serde_error_summary(&e)
+                            ),
                         ));
                     }
                 }
             }
         }
+    }
+}
+
+/// Attach the transport's post-mortem (child wait status + retained worker stderr tail) to a
+/// benchd-authored `detail`. The post-mortem is engine-controlled, so it rides as
+/// [`RunnerError::ProtocolEngineText`]: sealed records get its digest, the log gets the text.
+fn with_failure_diagnostic<T: LineTransport>(transport: &mut T, detail: String) -> RunnerError {
+    match transport.failure_diagnostic() {
+        Some(engine_text) => RunnerError::ProtocolEngineText {
+            detail,
+            engine_text,
+        },
+        None => RunnerError::Protocol(detail),
+    }
+}
+
+/// Put an error's engine-controlled text on benchd's own stderr (the box-local log) before it is
+/// reduced to a digest on its way into a sealed record.
+fn log_engine_text(e: &RunnerError) {
+    if e.carries_engine_text() {
+        eprintln!("bench-runner: engine diagnostic: {}", e.diagnostic());
     }
 }
 
