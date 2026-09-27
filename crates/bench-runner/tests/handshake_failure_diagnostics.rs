@@ -466,13 +466,7 @@ fn healthy_worker_still_completes_the_handshake() {
          printf '{\"id\":0,\"ok\":true,\"nonce\":\"n1\",\"protocol_version\":1}\\n'\n\
          cat > /dev/null\n",
     );
-    let transport = ChildStdioTransport::spawn_with_parent_env(
-        &engine,
-        "/weights",
-        &[],
-        Vec::<(String, String)>::new(),
-    )
-    .expect("spawn healthy worker");
+    let transport = spawn_fake_worker(&engine, true);
     let (session, hello) = Session::connect(transport).expect("handshake should succeed");
     assert_eq!(hello.nonce, "n1");
     assert_eq!(hello.protocol_version, Some(1));

@@ -1840,11 +1840,18 @@ pub(crate) fn seal_timing_surface_facts(
         // OPTIONAL on the wire, so OPTIONAL here: the verify path the engine reports (rectangular
         // window vs serial oracle) — the fact behind the decode number, never a scoring input.
         if let Some(v) = audit.verification() {
-            metrics.spec_verification_mode = Some(v.mode.clone());
+            metrics.spec_verification_mode =
+                Some(seal_hello_text("spec_verification_mode", &v.mode));
             metrics.spec_rectangular_verification_rounds = v.rectangular_rounds;
             metrics.spec_serial_verification_rounds = v.serial_rounds;
         }
-        metrics.acceptance_lengths = audit.acceptance_lengths().to_vec();
+        // The raw vector is engine-chosen: the log gets it, the record gets its summary.
+        eprintln!(
+            "benchd: timed acceptance_lengths {:?}",
+            audit.acceptance_lengths()
+        );
+        metrics.acceptance_lengths =
+            crate::score::AcceptanceLengthsSummary::of(audit.acceptance_lengths());
     }
 
     metrics.per_prompt = vec![ScorePerPrompt {
@@ -1858,6 +1865,19 @@ pub(crate) fn seal_timing_surface_facts(
         // the payload is built; absent here until then.
         head_provenance_sha256: metrics.head_provenance_sha256.clone(),
     }];
+}
+
+/// The SEALED form of an engine-supplied identity string (a `hello` field, the self-reported verify
+/// mode): `sha256=<hex> bytes=<n>` of the text, never the text. A later pair's engine has already
+/// seen the hidden prompts and the record goes back to the participant, so free text here would be
+/// a read-back channel. The plain text goes to benchd's stderr under `field`.
+pub(crate) fn seal_hello_text(field: &str, text: &str) -> String {
+    eprintln!("benchd: engine {field}: {text:?}");
+    format!(
+        "sha256={} bytes={}",
+        bench_core::hash::sha256_hex(text.as_bytes()),
+        text.len()
+    )
 }
 
 /// The DEPTH a sealed `effective_spec` reports: `0` for `serial` (no drafter, so zero is its true

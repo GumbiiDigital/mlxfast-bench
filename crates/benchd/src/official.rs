@@ -120,14 +120,22 @@ fn seal_official_per_prompt(
 /// nothing", which is a different claim from "the worker said zero". They are IDENTITY, recorded in
 /// the score.json metrics and NEVER scored — nothing reads them back as an input to a number.
 pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
-    metrics.engine_backend = hello.backend.clone();
-    metrics.engine_device = hello.device.clone();
+    use crate::iterate::seal_hello_text as seal;
+    // Free-text hello fields are engine-chosen: sealed as digests, logged in full.
+    metrics.engine_backend = hello.backend.as_deref().map(|t| seal("backend", t));
+    metrics.engine_device = hello.device.as_deref().map(|t| seal("device", t));
     metrics.engine_protocol_version = hello.protocol_version;
     metrics.head_provenance_sha256 = hello.head_provenance.as_ref().map(|p| p.sha256.clone());
-    metrics.runner_id = hello.runner.as_ref().map(|r| r.id.clone());
-    metrics.runner_model_type = hello.runner.as_ref().map(|r| r.model_type.clone());
+    metrics.runner_id = hello.runner.as_ref().map(|r| seal("runner.id", &r.id));
+    metrics.runner_model_type = hello
+        .runner
+        .as_ref()
+        .map(|r| seal("runner.model_type", &r.model_type));
     metrics.runner_manifest_sha256 = hello.runner.as_ref().map(|r| r.manifest_sha256.clone());
-    metrics.runner_build = hello.runner.as_ref().map(|r| r.build.clone());
+    metrics.runner_build = hello
+        .runner
+        .as_ref()
+        .map(|r| seal("runner.build", &r.build));
     metrics.resident_pid = hello.resident.as_ref().map(|r| r.pid);
     metrics.resident_load_epoch = hello.resident.as_ref().map(|r| r.load_epoch);
     for entry in &mut metrics.per_prompt {
@@ -2270,6 +2278,15 @@ mod tests {
 
     const PROMPT_MARKER: &str = "HIDDENPROMPTqzx7Kv9w";
 
+    /// What an engine-supplied identity string seals as.
+    fn sealed_text(text: &str) -> String {
+        format!(
+            "sha256={} bytes={}",
+            bench_core::hash::sha256_hex(text.as_bytes()),
+            text.len()
+        )
+    }
+
     /// Every run of `marker` at least 4 bytes long that `text` contains.
     fn marker_runs_in(text: &str, marker: &str) -> Vec<String> {
         let mut hits = Vec::new();
@@ -2347,6 +2364,108 @@ mod tests {
                 payload.metrics.error
             );
         }
+    }
+
+    /// A PASSING sealed record carries no engine free text and no raw per-round vector: every
+    /// hello string and the self-reported verify mode seal as digests, and `acceptance_lengths`
+    /// seals as `{count, mean}`.
+    #[test]
+    fn a_passing_sealed_record_carries_no_hello_text_and_no_raw_acceptance_vector() {
+        let golden = official_golden(None);
+        let hist: Vec<u32> = (0..32).map(|i| if i % 2 == 0 { 1 } else { 3 }).collect();
+        let rounds = hist.len();
+        let n: u32 = hist.iter().sum();
+        let mode = format!("rect-{PROMPT_MARKER}");
+        let audit = bench_core::free_run::verify_consistency(
+            &bench_core::free_run::FreeRunResponse {
+                tokens_len: n as usize,
+                acceptance_lengths: hist,
+                drafted_total: 2 * rounds as u64,
+                accepted_total: u64::from(n) - rounds as u64,
+                committed_total: u64::from(n),
+                verify_replay_disagreements: None,
+                verification: Some(bench_core::free_run::VerificationReport {
+                    mode: mode.clone(),
+                    rectangular_rounds: Some(rounds as u64),
+                    serial_rounds: Some(0),
+                }),
+            },
+            n,
+            rounds as i64 + 1,
+        )
+        .unwrap();
+        let timing = TimingResult {
+            effective_spec: Some(SpecConfig::mtp(2)),
+            free_run_audit: Some(audit),
+            ..in_band_timing()
+        };
+        let mut payload = finish_official(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        let text = |field: &str| format!("{field}-{PROMPT_MARKER}");
+        seal_engine_identity(
+            &mut payload.metrics,
+            &bench_runner::Hello {
+                nonce: "n".to_string(),
+                protocol_version: Some(1),
+                backend: Some(text("backend")),
+                device: Some(text("device")),
+                capabilities: Vec::new(),
+                spec_modes: Vec::new(),
+                head_provenance: None,
+                max_batch_size: None,
+                runner: Some(bench_protocol::RunnerIdentity {
+                    id: text("id"),
+                    model_type: text("model"),
+                    manifest_sha256: "ab".repeat(32),
+                    build: text("build"),
+                }),
+                resident: None,
+            },
+        );
+        let json = payload.to_sealed_json().unwrap();
+        assert_eq!(
+            marker_runs_in(&json, PROMPT_MARKER),
+            Vec::<String>::new(),
+            "engine text sealed"
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let m = &v["metrics"];
+        for (key, raw) in [
+            ("engine_backend", text("backend")),
+            ("engine_device", text("device")),
+            ("runner_id", text("id")),
+            ("runner_model_type", text("model")),
+            ("runner_build", text("build")),
+            ("spec_verification_mode", mode.clone()),
+        ] {
+            assert_eq!(m[key], sealed_text(&raw), "{key}");
+        }
+        assert_eq!(
+            m["acceptance_lengths"],
+            serde_json::json!({"count": rounds, "mean": 2.0})
+        );
+        // No array anywhere in the record is the per-round vector (or any array that long).
+        fn longest_array(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::Array(a) => {
+                    a.iter().map(longest_array).max().unwrap_or(0).max(a.len())
+                }
+                serde_json::Value::Object(o) => o.values().map(longest_array).max().unwrap_or(0),
+                _ => 0,
+            }
+        }
+        assert!(longest_array(&v) < rounds, "a per-round vector was sealed");
     }
 
     /// benchd's OWN refusals reach the sealed record byte-for-byte: they carry benchd's comparison
@@ -4233,8 +4352,11 @@ mod tests {
         assert_eq!(d1.metrics.spec_acceptance_rate, Some(0.5));
         assert_eq!(
             d1.metrics.acceptance_lengths,
-            even_histogram(2),
-            "the per-round histogram is persisted VERBATIM (RULED OQ4)"
+            Some(crate::score::AcceptanceLengthsSummary {
+                count: 64,
+                mean: 2.0
+            }),
+            "the per-round histogram is sealed as its summary, never verbatim"
         );
 
         // Depth 2: 32 rounds of 4, a different drafted/accepted pair. The DEPTH differs from the
@@ -4250,7 +4372,7 @@ mod tests {
         assert_eq!(d2.metrics.spec_drafted_total, Some(96));
         assert_eq!(d2.metrics.spec_accepted_total, Some(72));
         assert_eq!(d2.metrics.spec_acceptance_rate, Some(0.75));
-        assert_eq!(d2.metrics.acceptance_lengths.len(), 32);
+        assert_eq!(d2.metrics.acceptance_lengths.map(|a| a.count), Some(32));
 
         // The per-prompt entry mirrors the same counters the board reads per prompt.
         let pp = &d2.metrics.per_prompt[0];
@@ -4295,7 +4417,7 @@ mod tests {
         assert_eq!(payload.metrics.spec_drafted_total, None);
         assert_eq!(payload.metrics.spec_accepted_total, None);
         assert_eq!(payload.metrics.spec_acceptance_rate, None);
-        assert!(payload.metrics.acceptance_lengths.is_empty());
+        assert!(payload.metrics.acceptance_lengths.is_none());
         // ...and none of them reach the sealed bytes.
         let json = payload.to_sealed_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4413,9 +4535,11 @@ mod tests {
             || Session::connect(engine()).map(|(s, _)| s),
             |_phase: &str| Ok(()),
         );
+        let rectangular = sealed_text("rectangular");
         assert_eq!(
             payload.metrics.spec_verification_mode.as_deref(),
-            Some("rectangular")
+            Some(rectangular.as_str()),
+            "the engine's self-reported verify path seals as its digest"
         );
         assert_eq!(
             payload.metrics.spec_rectangular_verification_rounds,
@@ -4424,7 +4548,7 @@ mod tests {
         assert_eq!(payload.metrics.spec_serial_verification_rounds, Some(0));
         let v: serde_json::Value =
             serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
-        assert_eq!(v["metrics"]["spec_verification_mode"], "rectangular");
+        assert_eq!(v["metrics"]["spec_verification_mode"], rectangular);
         assert_eq!(v["metrics"]["spec_rectangular_verification_rounds"], 64);
         assert_eq!(v["metrics"]["spec_serial_verification_rounds"], 0);
         let silent =
@@ -4524,10 +4648,12 @@ mod tests {
         };
         seal_engine_identity(&mut metrics, &hello);
         assert_eq!(
-            metrics.engine_backend.as_deref(),
-            Some("ds4-dfm-rs@abc123 overlay=def nvcc=12.8 driver=580")
+            metrics.engine_backend,
+            Some(sealed_text(
+                "ds4-dfm-rs@abc123 overlay=def nvcc=12.8 driver=580"
+            ))
         );
-        assert_eq!(metrics.engine_device.as_deref(), Some("cuda sm_121"));
+        assert_eq!(metrics.engine_device, Some(sealed_text("cuda sm_121")));
         assert_eq!(metrics.engine_protocol_version, Some(1));
         assert_eq!(metrics.head_provenance_sha256, Some("ab".repeat(32)));
         assert_eq!(
@@ -4607,10 +4733,13 @@ mod tests {
                 }),
             },
         );
-        assert_eq!(metrics.runner_id.as_deref(), Some("layr/qwen4exp-125b-a6b"));
-        assert_eq!(metrics.runner_model_type.as_deref(), Some("qwen4_exp"));
+        assert_eq!(
+            metrics.runner_id,
+            Some(sealed_text("layr/qwen4exp-125b-a6b"))
+        );
+        assert_eq!(metrics.runner_model_type, Some(sealed_text("qwen4_exp")));
         assert_eq!(metrics.runner_manifest_sha256, Some("ab".repeat(32)));
-        assert_eq!(metrics.runner_build.as_deref(), Some("c4089870"));
+        assert_eq!(metrics.runner_build, Some(sealed_text("c4089870")));
         assert_eq!(metrics.resident_pid, Some(4242));
         assert_eq!(metrics.resident_load_epoch, Some(1_756_944_000));
 
@@ -4625,10 +4754,10 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = v["metrics"].as_object().unwrap();
-        assert_eq!(obj["runner_id"], "layr/qwen4exp-125b-a6b");
-        assert_eq!(obj["runner_model_type"], "qwen4_exp");
+        assert_eq!(obj["runner_id"], sealed_text("layr/qwen4exp-125b-a6b"));
+        assert_eq!(obj["runner_model_type"], sealed_text("qwen4_exp"));
         assert_eq!(obj["runner_manifest_sha256"], "ab".repeat(32));
-        assert_eq!(obj["runner_build"], "c4089870");
+        assert_eq!(obj["runner_build"], sealed_text("c4089870"));
         assert_eq!(obj["resident_pid"], 4242);
         assert_eq!(obj["resident_load_epoch"], 1_756_944_000u64);
         let back: ScorePayload = serde_json::from_str(&json).unwrap();

@@ -242,15 +242,18 @@ pub struct ScoreMetrics {
     /// ADDITIVE — verify rounds that fell back to the serial oracle (self-reported). AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_serial_verification_rounds: Option<u64>,
-    /// ADDITIVE — the VERBATIM per-round `acceptance_lengths[]` histogram of the timed window
-    /// (RULED OQ4: the raw array, not just the aggregates). One entry per verify round, so a
-    /// 128-token window seals at most 128 entries — no cap is needed. EMPTY (and therefore omitted)
-    /// on a leg with no free-run audit. AUDIT-only, never scored.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub acceptance_lengths: Vec<u32>,
+    /// ADDITIVE — the per-round `acceptance_lengths[]` histogram of the timed window, SUMMARISED
+    /// as `{count, mean}`. The raw vector is engine-chosen (one value per round, after the engine
+    /// has seen the hidden prompt) and this record goes back to the participant, so sealing it
+    /// verbatim would be a channel of several hundred bytes; the full vector goes to benchd's
+    /// stderr instead. Absent on a leg with no free-run audit. AUDIT-only, never scored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance_lengths: Option<AcceptanceLengthsSummary>,
     /// ADDITIVE — THE ENGINE IDENTITY SEAL, taken from the TIMED worker's `hello` (the worker whose
-    /// leg is scored). `hello.backend` VERBATIM: the engine's own self-description, e.g. a ds4
-    /// build string carrying its pin, overlay, nvcc and driver. Absent when no timed worker ran or
+    /// leg is scored). `hello.backend` as `sha256=<hex> bytes=<n>` of the text, never the text: a
+    /// later pair's engine has seen the hidden prompts, so hello free text would be a read-back
+    /// channel. The same holds for `engine_device`, `runner_id`, `runner_model_type`,
+    /// `runner_build` and `spec_verification_mode`; the plain text goes to benchd's stderr. Absent when no timed worker ran or
     /// the engine sent none. AUDIT-only, never scored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_backend: Option<String>,
@@ -446,6 +449,29 @@ pub struct ScorePerPrompt {
     pub head_provenance_sha256: Option<String>,
 }
 
+/// The sealed stand-in for a timed window's `acceptance_lengths[]`: how many verify rounds, and
+/// their mean committed length rounded to 3 decimals.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AcceptanceLengthsSummary {
+    pub count: u64,
+    pub mean: f64,
+}
+
+impl AcceptanceLengthsSummary {
+    /// `None` for an empty histogram (nothing to summarise, so no key is sealed).
+    pub fn of(lengths: &[u32]) -> Option<Self> {
+        if lengths.is_empty() {
+            return None;
+        }
+        let sum: u64 = lengths.iter().map(|&x| u64::from(x)).sum();
+        let mean = sum as f64 / lengths.len() as f64;
+        Some(AcceptanceLengthsSummary {
+            count: lengths.len() as u64,
+            mean: (mean * 1000.0).round() / 1000.0,
+        })
+    }
+}
+
 /// Port of Swift `roundedToSignificantFigures`: monotone sig-fig rounding via a
 /// formatted round-trip so the result is the clean nearest double to the N-sig-fig
 /// decimal. Non-finite / zero / non-positive `figures` pass through unchanged.
@@ -549,7 +575,7 @@ impl ScoreMetrics {
             spec_verification_mode: self.spec_verification_mode.clone(),
             spec_rectangular_verification_rounds: self.spec_rectangular_verification_rounds,
             spec_serial_verification_rounds: self.spec_serial_verification_rounds,
-            acceptance_lengths: self.acceptance_lengths.clone(),
+            acceptance_lengths: self.acceptance_lengths,
             engine_backend: self.engine_backend.clone(),
             engine_device: self.engine_device.clone(),
             engine_protocol_version: self.engine_protocol_version,
@@ -878,7 +904,7 @@ mod tests {
             spec_verification_mode: Some("rectangular".to_string()),
             spec_rectangular_verification_rounds: Some(7),
             spec_serial_verification_rounds: Some(0),
-            acceptance_lengths: vec![2; 64],
+            acceptance_lengths: AcceptanceLengthsSummary::of(&[2; 64]),
             engine_backend: Some("ds4-dfm-rs@abc".to_string()),
             engine_device: Some("cuda sm_121".to_string()),
             engine_protocol_version: Some(1),
@@ -1338,7 +1364,7 @@ mod sealed_key_pin_tests {
                 spec_verification_mode: Some("v79".to_string()),
                 spec_rectangular_verification_rounds: Some(81),
                 spec_serial_verification_rounds: Some(83),
-                acceptance_lengths: vec![1, 2, 3],
+                acceptance_lengths: AcceptanceLengthsSummary::of(&[1, 2, 3]),
                 engine_backend: Some("v86".to_string()),
                 engine_device: Some("v88".to_string()),
                 engine_protocol_version: Some(90),
@@ -1392,11 +1418,10 @@ mod sealed_key_pin_tests {
     /// as it stood before the no-op renames were deleted.
     const SEALED_BYTES: &str = r#"{
   "metrics": {
-    "acceptance_lengths": [
-      1,
-      2,
-      3
-    ],
+    "acceptance_lengths": {
+      "count": 3,
+      "mean": 2.0
+    },
     "actual_token": 49,
     "bandwidth_gb_per_token": 2.5,
     "bandwidth_source": "v54",

@@ -656,7 +656,7 @@ mod tests {
             spec_verification_mode: Some("rectangular".to_string()),
             spec_rectangular_verification_rounds: Some(1),
             spec_serial_verification_rounds: Some(0),
-            acceptance_lengths: vec![1],
+            acceptance_lengths: crate::score::AcceptanceLengthsSummary::of(&[1]),
             engine_backend: Some("b".to_string()),
             engine_device: Some("d".to_string()),
             engine_protocol_version: Some(1),
