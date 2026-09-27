@@ -694,6 +694,11 @@ pub struct WindowShape {
     /// 1.0-2.7% pass to pass on half the GB10 boxes, against the fixed 1% calibration maximum. The
     /// median of several passes damps the per-sample noise and drops a single slow pass.
     pub official_prefill_timed_runs: usize,
+    /// Whether a CANDIDATE's timed divergence from the golden is deferred to a reference replay
+    /// instead of failing on the spot: true exactly when the fixture declares a
+    /// [`crate::timed_replay::TimedReplayPolicy`]. Control legs and calibration never defer; the
+    /// reference must reproduce its own golden exactly.
+    pub timed_divergence_replay: bool,
 }
 
 #[cfg(test)]

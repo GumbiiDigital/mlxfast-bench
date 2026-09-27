@@ -15,6 +15,8 @@
   "local_submit_benchmark_decode_steps": 1023,
   "official_prefill_warmup_runs": 1,
   "official_prefill_timed_runs": 5,
+  "timed_replay_max_logit_gap": 2.0,
+  "timed_replay_off_argmax_per_thousand": 100,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
   "seed_tokens": 4096,

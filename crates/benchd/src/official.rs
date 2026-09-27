@@ -389,6 +389,9 @@ pub fn official_timed_params(
         .with_spec(spec)
         .with_prefill_warmup_runs(window.official_prefill_warmup_runs)
         .with_prefill_timed_runs(window.official_prefill_timed_runs)
+        // A CANDIDATE's timed divergence is deferred to the reference replay when the fixture
+        // declares a replay policy (`bench_core::timed_replay`). The control leg overrides this.
+        .with_divergence_deferred(window.timed_divergence_replay)
 }
 
 /// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
@@ -650,6 +653,19 @@ where
         Ok(measured) => measured,
         Err(payload) => return *payload,
     };
+    // The single-leg path has no reference tree in reach, so a deferred divergence cannot be
+    // replayed: it fails closed, named, exactly as the exact match would have.
+    if measured.deferred_divergence.is_some() {
+        return official_failed(
+            golden,
+            digests,
+            commit,
+            "the timed window diverged from the golden and the divergence was deferred to a \
+             reference replay, but the single-leg official path has no reference to replay against"
+                .to_string(),
+            scoring,
+        );
+    }
 
     // Correctness on the SAME resident worker: the timed decode phase closed its barrier (allocator
     // drained), leaving the session healthy, and `correctness_begin` fires the worker's
@@ -715,8 +731,9 @@ where
              prompt for the control leg to measure"
         )
     })?;
-    // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire.
-    let params = official_timed_params(benchmark, None, window);
+    // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire. NO
+    // DEFERRAL: the reference must reproduce its own golden exactly, replay policy or not.
+    let params = official_timed_params(benchmark, None, window).with_divergence_deferred(false);
     let warmup_params = official_warmup_params(benchmark, None, window);
     let measured = run_timed_window(
         &params,
@@ -876,6 +893,11 @@ pub struct PairedWindow<G> {
     /// migration, David 2026-09-15), falling back to the 0.75/0.25 constants while no fixture
     /// declares them.
     pub weights: ScoringWeights,
+    /// The fixture's TIMED-DIVERGENCE REPLAY policy (`bench_core::timed_replay`), or `None` for
+    /// the exact-match timed window. When set, a candidate leg's deferred divergence is replayed
+    /// through the REFERENCE tree's engine after the pairs, and the run fails by name if the
+    /// reference would not have nearly chosen the committed tokens.
+    pub replay: Option<bench_core::timed_replay::TimedReplayPolicy>,
 }
 
 /// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
@@ -966,6 +988,7 @@ where
         pairs,
         floors,
         weights,
+        replay,
     } = window;
     if pairs == 0 {
         return paired_refusal(
@@ -1150,6 +1173,13 @@ where
     // pair is scored on its own control leg, and the run scores ONE measured pair — the one whose
     // composite is the lower median over the pairs. Every other pair stays in `paired_legs` as
     // measured. With ONE pair this is that pair.
+    // THE DEFERRED DIVERGENCES, per pair, taken before the timings are consumed. Each is UNVERIFIED
+    // until the reference replay below judges it.
+    let deferred: Vec<(usize, bench_runner::timing::DeferredDivergence)> = candidate_timings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.deferred_divergence.clone().map(|d| (i + 1, d)))
+        .collect();
     let scored = scored_pair_index(&records, weights);
     let scored_record = records[scored].clone();
     let candidate = candidate_timings
@@ -1187,6 +1217,37 @@ where
         },
     );
     drop(held_candidate_leg);
+    // THE REFERENCE REPLAY. The candidate's residency is gone (dropped above), so the reference
+    // engine comes up alone, exactly as a control leg does. A run that already failed is not
+    // replayed: nothing it could decide would change the verdict.
+    if !deferred.is_empty() && payload.passed {
+        let verdict = match replay {
+            Some(policy) => replay_deferred_divergences(
+                &mut open_baseline_leg,
+                &mut spawn_baseline,
+                benchmark,
+                &deferred,
+                &policy,
+            ),
+            None => Err("a timed divergence was deferred without a replay policy".to_string()),
+        };
+        match verdict {
+            Ok(summary) => eprintln!("benchd official: {summary}"),
+            Err(e) => {
+                let mut failed = paired_refusal(
+                    golden,
+                    digests,
+                    commit,
+                    format!("TIMED-REPLAY-REJECTED: {e}"),
+                    seal,
+                    Some((control_prefill, control_decode)),
+                    ScoringInputs::no_denominator(floors, weights),
+                );
+                failed.metrics.paired_legs = records;
+                return failed;
+            }
+        }
+    }
     let mut seal = seal;
     seal.band_passed = true;
     seal.leg = Some((control_prefill, control_decode));
@@ -1194,6 +1255,104 @@ where
     seal_window_split(&mut payload.metrics, &scored_record);
     payload.metrics.paired_legs = records;
     payload
+}
+
+/// REPLAY every deferred divergence through the REFERENCE tree's engine (`bench_core::timed_replay`).
+///
+/// One reference residency serves every pair: the leg guard boots it, one worker session attaches,
+/// and each divergence is teacher-forced through `correctness_begin` / `correctness_step`, which
+/// return the reference's raw top-8 logits at every position. A divergent PREFILL token is judged
+/// at the prefill prompt's frontier. A divergent free-run STREAM is judged from its first divergent
+/// position on (the positions before it matched the golden exactly), and its off-argmax count must
+/// fit the budget over the whole window. Returns a one-line audit summary, or the first reason the
+/// reference would not have nearly chosen what the candidate committed.
+fn replay_deferred_divergences<T, L, LB, FB>(
+    open_baseline_leg: &mut LB,
+    spawn_baseline: &mut FB,
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    deferred: &[(usize, bench_runner::timing::DeferredDivergence)],
+    policy: &bench_core::timed_replay::TimedReplayPolicy,
+) -> Result<String, String>
+where
+    T: LineTransport,
+    LB: FnMut() -> Result<L, String>,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+{
+    use bench_core::timed_replay::judge_position;
+    fn top_of(resp: &bench_protocol::WorkerResponse) -> Result<Vec<(i64, f64)>, String> {
+        resp.top_logits
+            .as_ref()
+            .map(|v| v.iter().map(|l| (l.token, l.logit)).collect())
+            .ok_or_else(|| "the reference returned no top_logits".to_string())
+    }
+    let guard = open_baseline_leg()
+        .map_err(|e| format!("the reference engine for the replay did not come up: {e}"))?;
+    let mut session = spawn_baseline()
+        .map_err(|e| format!("the reference worker for the replay did not start: {e}"))?;
+    let mut summary = Vec::new();
+    for (pair, d) in deferred {
+        if let Some(token) = d.prefill_token {
+            session.begin_phase();
+            let resp = session
+                .correctness_begin(&benchmark.prefill_prompt_tokens)
+                .map_err(|e| format!("pair {pair}: prefill replay: {e}"))?;
+            let j = judge_position(&top_of(&resp)?, token, policy)
+                .map_err(|e| format!("pair {pair}: the timed prefill token: {e}"))?;
+            if j.off_argmax {
+                return Err(format!(
+                    "pair {pair}: the timed prefill token {token} is off-argmax for the reference"
+                ));
+            }
+            session
+                .close_phase()
+                .map_err(|e| format!("pair {pair}: prefill replay barrier: {e}"))?;
+            summary.push(format!("pair {pair} prefill token {token} accepted"));
+        }
+        if let Some((first, stream)) = &d.stream {
+            session.begin_phase();
+            let mut resp = session
+                .correctness_begin(&benchmark.decode_seed_tokens)
+                .map_err(|e| format!("pair {pair}: decode replay: {e}"))?;
+            let mut off_argmax = 0usize;
+            let mut worst_gap = 0.0f64;
+            for (p, &token) in stream.iter().enumerate() {
+                if p > 0 {
+                    resp = session
+                        .correctness_step(stream[p - 1])
+                        .map_err(|e| format!("pair {pair}: decode replay at position {p}: {e}"))?;
+                }
+                if p < *first {
+                    continue;
+                }
+                let j = judge_position(&top_of(&resp)?, token, policy).map_err(|e| {
+                    format!("pair {pair}: timed decode position {p} (0 = the seed token): {e}")
+                })?;
+                if j.off_argmax {
+                    off_argmax += 1;
+                }
+                worst_gap = worst_gap.max(j.gap.unwrap_or(0.0));
+            }
+            session
+                .close_phase()
+                .map_err(|e| format!("pair {pair}: decode replay barrier: {e}"))?;
+            let budget = policy.off_argmax_budget(stream.len());
+            if off_argmax > budget {
+                return Err(format!(
+                    "pair {pair}: {off_argmax} of the timed window's {} positions are off-argmax \
+                     for the reference, above the budget of {budget}",
+                    stream.len()
+                ));
+            }
+            summary.push(format!(
+                "pair {pair} decode diverged at position {first}, replayed {} positions, \
+                 {off_argmax} off-argmax (budget {budget}), worst in-top gap {worst_gap:.4}",
+                stream.len() - first
+            ));
+        }
+    }
+    drop(session);
+    drop(guard);
+    Ok(format!("timed replay accepted: {}", summary.join("; ")))
 }
 
 /// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
@@ -2186,6 +2345,7 @@ mod tests {
             effective_spec: None,
             // mean(4, 4, 4, 5) == 4.25 == IN_BAND_MEAN_DRAFT_LEN.
             free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
+            deferred_divergence: None,
             phase_window: None,
         }
     }
@@ -3518,6 +3678,7 @@ mod tests {
             peak_ram_gb: 20.25,
             effective_spec: None,
             free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
+            deferred_divergence: None,
             phase_window: None,
         };
         finish_official(
@@ -4567,6 +4728,7 @@ mod tests {
             // The tests drive the ruled floors; the per-project arms set their own.
             floors: SpeedupFloors::DEFAULT,
             weights: ScoringWeights::DEFAULT,
+            replay: None,
         }
     }
 
@@ -5479,5 +5641,98 @@ mod tests {
         .unwrap_err();
         assert!(err.contains(SERIAL_CONTROL_LEG_FAILED), "{err}");
         assert!(err.contains("benchmark oracle"), "{err}");
+    }
+
+    /// THE REFERENCE REPLAY judges a deferred divergence from the reference's own top-8 logits:
+    /// the mock reference answers every teacher-forced step with top-1 = its sequence token (logit
+    /// 10) and the next seven ids one logit apart, so `t` is the argmax, `t + 1` is off-argmax at a
+    /// 1.0 gap and `t + 3` is beyond a 2.0 gap.
+    mod timed_replay {
+        use super::*;
+        use bench_core::timed_replay::TimedReplayPolicy;
+        use bench_runner::timing::DeferredDivergence;
+
+        const POLICY: TimedReplayPolicy = TimedReplayPolicy {
+            max_logit_gap: 2.0,
+            off_argmax_per_thousand: 200,
+        };
+
+        fn reference() -> Vec<i64> {
+            (0..20).map(|i| 100 + 10 * i).collect()
+        }
+
+        fn benchmark() -> bench_core::golden::BenchmarkGolden {
+            let r = reference();
+            bench_core::golden::BenchmarkGolden {
+                prefill_prompt_tokens: vec![1, 2, 3],
+                expected_prefill_token: r[0],
+                decode_seed_tokens: vec![1, 2, 3],
+                expected_decode_seed_token: r[0],
+                expected_decode_tokens: r[1..].to_vec(),
+                baseline_prefill_seconds_per_token: None,
+                baseline_decode_seconds_per_token: None,
+            }
+        }
+
+        fn replay(stream: Vec<i64>, first: usize) -> Result<String, String> {
+            let mut open = || -> Result<(), String> { Ok(()) };
+            let mut spawn = || {
+                Session::connect(
+                    MockEngine::new()
+                        .free_run_capable()
+                        .teacher_forced_sequences(vec![reference()]),
+                )
+                .map(|(s, _)| s)
+            };
+            replay_deferred_divergences(
+                &mut open,
+                &mut spawn,
+                &benchmark(),
+                &[(
+                    1,
+                    DeferredDivergence {
+                        prefill_token: None,
+                        stream: Some((first, stream)),
+                    },
+                )],
+                &POLICY,
+            )
+        }
+
+        #[test]
+        fn a_near_argmax_continuation_is_accepted() {
+            let mut s = reference();
+            s[3] += 1; // one off-argmax position, within the 2.0 gap and the budget of 4
+            let summary = replay(s, 3).expect("accepted");
+            assert!(summary.contains("1 off-argmax (budget 4)"), "{summary}");
+        }
+
+        #[test]
+        fn a_token_beyond_the_gap_is_rejected_by_position() {
+            let mut s = reference();
+            s[5] += 3;
+            let e = replay(s, 5).unwrap_err();
+            assert!(e.contains("timed decode position 5"), "{e}");
+            assert!(e.contains("above the declared 2 maximum"), "{e}");
+        }
+
+        #[test]
+        fn too_many_off_argmax_positions_exceed_the_budget() {
+            let mut s = reference();
+            for p in [2, 4, 6, 8, 10] {
+                s[p] += 1;
+            }
+            let e = replay(s, 2).unwrap_err();
+            assert!(e.contains("5 of the timed window's 20 positions"), "{e}");
+            assert!(e.contains("budget of 4"), "{e}");
+        }
+
+        #[test]
+        fn positions_before_the_divergence_are_not_judged() {
+            let mut s = reference();
+            s[1] += 5; // before `first`: matched the golden exactly, so the replay skips it
+            s[7] += 1;
+            assert!(replay(s, 7).is_ok());
+        }
     }
 }

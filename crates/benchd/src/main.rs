@@ -4867,6 +4867,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 pairs,
                 floors,
                 weights,
+                replay: contract::timed_replay_policy(declared_contract),
             },
         );
         if let Some(hello) = timed_hello.borrow().as_ref() {
@@ -7332,6 +7333,7 @@ mod tests {
             peak_ram_gb: 20.0,
             effective_spec: None,
             free_run_audit: None,
+            deferred_divergence: None,
             phase_window: None,
         };
         let mut payload = iterate::local_iterate_score(

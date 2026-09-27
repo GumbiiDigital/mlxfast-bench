@@ -1984,6 +1984,7 @@ pub(crate) fn test_window() -> bench_core::constants::WindowShape {
         local_submit_benchmark_decode_steps: 1023,
         official_prefill_warmup_runs: 1,
         official_prefill_timed_runs: 1,
+        timed_divergence_replay: false,
     }
 }
 
@@ -3053,6 +3054,7 @@ mod tests {
             peak_ram_gb: 20.25,
             effective_spec: None,
             free_run_audit: None,
+            deferred_divergence: None,
             phase_window: None,
         };
 
@@ -3102,6 +3104,7 @@ mod tests {
             peak_ram_gb: 0.0,
             effective_spec: None,
             free_run_audit: None,
+            deferred_divergence: None,
             phase_window: None,
         };
         let payload = local_iterate_score(
@@ -3153,6 +3156,7 @@ mod tests {
                 peak_ram_gb: 20.25,
                 effective_spec: None,
                 free_run_audit: None,
+                deferred_divergence: None,
                 phase_window: None,
             };
             let payload = local_iterate_score(

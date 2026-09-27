@@ -84,6 +84,23 @@ pub struct TimingParams {
     /// `effective_spec` must equal it, else the session is discarded fail-closed). The echoed spec is
     /// surfaced on the result ([`TimingResult::effective_spec`]) for benchd to seal.
     pub spec: Option<SpecConfig>,
+    /// Defer a timed divergence from the golden to a REFERENCE REPLAY instead of failing on the
+    /// spot (`bench_core::timed_replay`). Only a CANDIDATE leg under a fixture that declares a
+    /// replay policy sets it; the default, and every control leg, keeps the exact match. Under
+    /// `Verify` a divergent prefill token or free-run token is then RECORDED on the result
+    /// ([`TimingResult::deferred_divergence`]) and judged by the caller's replay.
+    pub defer_divergence_to_replay: bool,
+}
+
+/// A timed divergence the run deferred to a reference replay. The caller MUST replay it (or fail
+/// the run); a result that carries one has not been verified.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredDivergence {
+    /// The prefill phase's token when it differed from the golden's `expected_prefill_token`.
+    pub prefill_token: Option<i64>,
+    /// The free-run window's first divergent position (0 = the seed token) and the WHOLE
+    /// committed stream (the seed token, then the committed decode tokens), when it diverged.
+    pub stream: Option<(usize, Vec<i64>)>,
 }
 
 /// Whether a timed phase VERIFIES each engine token against the golden oracle (and aborts
@@ -127,6 +144,7 @@ impl TimingParams {
             prefill_timed_runs: bench_core::constants::BENCHMARK_PREFILL_TIMED_RUNS,
             run_timeout: None,
             spec: None,
+            defer_divergence_to_replay: false,
         }
     }
 
@@ -156,6 +174,7 @@ impl TimingParams {
             prefill_timed_runs: bench_core::constants::BENCHMARK_PREFILL_TIMED_RUNS,
             run_timeout: None,
             spec: None,
+            defer_divergence_to_replay: false,
         }
     }
 
@@ -169,6 +188,12 @@ impl TimingParams {
     /// Unmeasured prefill passes before the timed one(s), in the same session and phase.
     pub fn with_prefill_warmup_runs(mut self, runs: usize) -> Self {
         self.prefill_warmup_runs = runs;
+        self
+    }
+
+    /// Defer a candidate's timed divergence to a reference replay (see the field).
+    pub fn with_divergence_deferred(mut self, defer: bool) -> Self {
+        self.defer_divergence_to_replay = defer;
         self
     }
 
@@ -232,6 +257,10 @@ pub struct TimingResult {
     /// ([`run_timed_benchmark`]) collects no acceptance histogram. It is NEVER a stand-in for a
     /// measured zero: a free-run leg that observed no drafting still carries a real histogram.
     pub free_run_audit: Option<FreeRunAudit>,
+    /// A divergence from the golden this run DEFERRED to a reference replay
+    /// ([`TimingParams::defer_divergence_to_replay`]). `None` means the timed window matched the
+    /// golden exactly (or the run did not defer). `Some` is UNVERIFIED until the caller replays it.
+    pub deferred_divergence: Option<DeferredDivergence>,
 }
 
 impl TimingResult {
@@ -296,7 +325,7 @@ pub fn run_timed_benchmark<T: LineTransport>(
 
     let mut peak_ram_gb = 0.0_f64;
 
-    let (prefill_seconds_per_token, prefill_elapsed_seconds) =
+    let (prefill_seconds_per_token, prefill_elapsed_seconds, deferred_prefill) =
         measure_prefill(session, params, VerifyMode::Verify, &mut peak_ram_gb)?;
 
     let (decode_seconds_per_token, decode_elapsed_seconds, effective_spec) =
@@ -315,6 +344,10 @@ pub fn run_timed_benchmark<T: LineTransport>(
         // The teacher-forced v1 decode path collects no acceptance histogram, so there is no
         // free-run audit to carry (absent, never a fabricated zero).
         free_run_audit: None,
+        deferred_divergence: deferred_prefill.map(|t| DeferredDivergence {
+            prefill_token: Some(t),
+            stream: None,
+        }),
     })
 }
 
@@ -380,10 +413,18 @@ pub fn run_free_run_timed_benchmark<T: LineTransport>(
 
     let mut peak_ram_gb = 0.0_f64;
 
-    let (prefill_seconds_per_token, prefill_elapsed_seconds) =
+    let (prefill_seconds_per_token, prefill_elapsed_seconds, deferred_prefill) =
         measure_prefill(session, params, VerifyMode::Verify, &mut peak_ram_gb)?;
 
     let free_run = measure_free_run_decode(session, params, VerifyMode::Verify, &mut peak_ram_gb)?;
+    // This path has no reference to replay against, so a deferred divergence is refused here
+    // rather than returned unverified.
+    if deferred_prefill.is_some() || free_run.deferred_stream.is_some() {
+        return Err(RunnerError::Protocol(
+            "a timed divergence was deferred to a reference replay, but this timing path has no reference to replay against"
+                .to_string(),
+        ));
+    }
 
     Ok(FreeRunTimingResult {
         prefill_seconds_per_token,
@@ -432,8 +473,16 @@ where
     let mut session = spawn()?;
     cool_gate("prefill")?;
     let mut peak_ram_gb = 0.0_f64;
-    let (seconds_per_token, elapsed_seconds) =
+    let (seconds_per_token, elapsed_seconds, deferred_prefill) =
         measure_prefill(&mut session, params, VerifyMode::Verify, &mut peak_ram_gb)?;
+    // The phase-granular path has no reference to replay against.
+    if deferred_prefill.is_some() {
+        return Err(RunnerError::Protocol(
+            "a prefill divergence was deferred to a reference replay, but the phase-granular \
+             path has no reference to replay against"
+                .to_string(),
+        ));
+    }
     Ok(PhaseTiming {
         seconds_per_token,
         elapsed_seconds,
@@ -941,7 +990,7 @@ where
     // worker's `beginMeasuredPhase` reset fires on the `prefill` verb, so this phase starts on a
     // clean allocator exactly as a fresh worker would.
     cool_gate("prefill")?;
-    let (prefill_seconds_per_token, prefill_elapsed_seconds) =
+    let (prefill_seconds_per_token, prefill_elapsed_seconds, deferred_prefill) =
         measure_prefill(session, params, verify, &mut peak_ram_gb)?;
 
     // DECODE phase on the SAME resident worker (load-once). §2.1 CAPABILITY REFUSAL first: the
@@ -974,6 +1023,12 @@ where
         effective_spec: m.effective_spec,
         // Carry the WHOLE audit out of the narrowing (it used to die with `m.audit` here).
         free_run_audit: Some(m.audit),
+        deferred_divergence: (deferred_prefill.is_some() || m.deferred_stream.is_some()).then_some(
+            DeferredDivergence {
+                prefill_token: deferred_prefill,
+                stream: m.deferred_stream,
+            },
+        ),
     })
 }
 
@@ -985,7 +1040,7 @@ fn measure_prefill<T: LineTransport>(
     params: &TimingParams,
     verify: VerifyMode,
     peak_ram_gb: &mut f64,
-) -> Result<(f64, f64)> {
+) -> Result<(f64, f64, Option<i64>)> {
     let prompt_count = params.prefill_prompt_tokens.len();
     let total_runs = params.prefill_warmup_runs + params.prefill_timed_runs;
     if params.prefill_timed_runs == 0 {
@@ -1010,6 +1065,7 @@ fn measure_prefill<T: LineTransport>(
     session.begin_phase();
 
     let mut timed_elapsed: Vec<f64> = Vec::with_capacity(params.prefill_timed_runs);
+    let mut deferred_prefill: Option<i64> = None;
     for run_index in 0..total_runs {
         // The worker holds submitted model code, so its reported prefill duration
         // is not trusted: the parent measures the full request/response wall time.
@@ -1024,10 +1080,34 @@ fn measure_prefill<T: LineTransport>(
         // garbage is rejected here instead of being credited with a prefill speedup.
         // TimeOnly tolerates the mismatch (correctness is judged separately upstream).
         if verify == VerifyMode::Verify && token != expected_prefill_token {
+            // DEFERRED (a candidate under a replay policy): record the token for the caller's
+            // reference replay. Every pass must agree on it: an engine whose prefill token moves
+            // between passes of the same prompt is not resolving a tie, it is faulty.
+            match deferred_prefill {
+                _ if !params.defer_divergence_to_replay => {
+                    return Err(RunnerError::TokenMismatch {
+                        label: "benchmark prefill token".to_string(),
+                        step: run_index,
+                        expected: expected_prefill_token,
+                        actual: token,
+                    });
+                }
+                Some(prev) if prev != token => {
+                    return Err(RunnerError::TokenMismatch {
+                        label: "benchmark prefill token".to_string(),
+                        step: run_index,
+                        expected: prev,
+                        actual: token,
+                    });
+                }
+                _ => deferred_prefill = Some(token),
+            }
+        } else if deferred_prefill.is_some() {
+            // An earlier pass diverged and this one matches: the passes disagree.
             return Err(RunnerError::TokenMismatch {
                 label: "benchmark prefill token".to_string(),
                 step: run_index,
-                expected: expected_prefill_token,
+                expected: deferred_prefill.unwrap_or(expected_prefill_token),
                 actual: token,
             });
         }
@@ -1046,7 +1126,7 @@ fn measure_prefill<T: LineTransport>(
 
     let median_elapsed = median_seconds(&timed_elapsed);
     let seconds_per_token = median_elapsed / prompt_count as f64;
-    Ok((seconds_per_token, median_elapsed))
+    Ok((seconds_per_token, median_elapsed, deferred_prefill))
 }
 
 /// The MEDIAN of the timed prefill passes (the mean of the middle two for an even count). One pass
@@ -1218,13 +1298,19 @@ fn measure_free_run_decode<T: LineTransport>(
     // free-run TimeOnly path would blank the timing on a step-0 divergence where the teacher-forced
     // TimeOnly path retained it — a silent regression of the "retain real timing on a correctness
     // failure" ruling.
+    // DEFERRED (a candidate under a replay policy): the first divergent position of the stream,
+    // judged after the leg by the reference replay. Position 0 is the seed token.
+    let mut first_divergence: Option<usize> = None;
     if seed_token != params.expected_decode_seed_token && verify == VerifyMode::Verify {
-        return Err(RunnerError::TokenMismatch {
-            label: "benchmark free-run decode seed token".to_string(),
-            step: 0,
-            expected: params.expected_decode_seed_token,
-            actual: seed_token,
-        });
+        if !params.defer_divergence_to_replay {
+            return Err(RunnerError::TokenMismatch {
+                label: "benchmark free-run decode seed token".to_string(),
+                step: 0,
+                expected: params.expected_decode_seed_token,
+                actual: seed_token,
+            });
+        }
+        first_divergence = Some(0);
     }
     // The SPLIT (`docs/scored-regime-and-prefill-window.md`): ONE reading of benchd's own clock
     // serves as both the close of the prefill window and the open of the decode window, so the two
@@ -1288,15 +1374,26 @@ fn measure_free_run_decode<T: LineTransport>(
                 tokens.len()
             ))
         })?;
-        if actual != expected && verify == VerifyMode::Verify {
-            return Err(RunnerError::TokenMismatch {
-                label: "benchmark free-run decode token".to_string(),
-                step,
-                expected,
-                actual,
-            });
+        if first_divergence.is_none() && actual != expected && verify == VerifyMode::Verify {
+            if !params.defer_divergence_to_replay {
+                return Err(RunnerError::TokenMismatch {
+                    label: "benchmark free-run decode token".to_string(),
+                    step,
+                    expected,
+                    actual,
+                });
+            }
+            // Past a divergence the golden no longer describes the stream: the rest is the
+            // engine's own continuation, and only the reference replay can judge it.
+            first_divergence = Some(step + 1);
         }
     }
+    let deferred_stream = first_divergence.map(|p| {
+        let mut stream = Vec::with_capacity(n_usize + 1);
+        stream.push(seed_token);
+        stream.extend(tokens.iter().take(n_usize).copied());
+        (p, stream)
+    });
 
     // Assemble the AUDIT counters for the §2.6 triple; a missing counter is a protocol fault.
     let acceptance_lengths = run.acceptance_lengths.clone().ok_or_else(|| {
@@ -1348,6 +1445,7 @@ fn measure_free_run_decode<T: LineTransport>(
         },
         audit,
         effective_spec,
+        deferred_stream,
     })
 }
 
@@ -1368,6 +1466,9 @@ struct FreeRunDecodeMeasurement {
     phase_window: PhaseWindow,
     audit: FreeRunAudit,
     effective_spec: Option<SpecConfig>,
+    /// The first divergent position and the whole committed stream, when the run deferred a
+    /// divergence to a reference replay.
+    deferred_stream: Option<(usize, Vec<i64>)>,
 }
 
 /// v1.2 BATCHED free-run decode phase — [`measure_free_run_decode`] generalized to the cohort.
@@ -1930,7 +2031,7 @@ mod tests {
         let (mut session, _hello) = Session::connect(engine).unwrap();
         // Drive the phases directly on one session to exercise the tolerant comparisons.
         let mut peak = 0.0;
-        let (p_spt, _p) = measure_prefill(
+        let (p_spt, _p, _) = measure_prefill(
             &mut session,
             &params(decode_steps),
             VerifyMode::TimeOnly,
@@ -2175,6 +2276,88 @@ mod tests {
             }
             other => panic!("expected TokenMismatch, got {other:?}"),
         }
+    }
+
+    /// TIMED-DIVERGENCE REPLAY: with deferral on, a divergence is RECORDED (first position and
+    /// the whole committed stream, seed first) instead of failing; with it off, the exact match
+    /// still hard-fails; and a path with no reference to replay against refuses by name.
+    #[test]
+    fn deferral_records_the_divergence_instead_of_failing() {
+        let mut no_gate = |_: &str| -> Result<()> { Ok(()) };
+        let mut engine_tokens = oracle_decode_tokens(8);
+        engine_tokens[5] = 999_999;
+        let engine =
+            MockEngine::new().oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, engine_tokens.clone());
+        let (mut session, _hello) = Session::connect(engine.free_run_capable()).unwrap();
+        let deferred = params(8).with_divergence_deferred(true);
+        let t = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut no_gate,
+            &deferred,
+            VerifyMode::Verify,
+        )
+        .unwrap();
+        let d = t.deferred_divergence.expect("the divergence is deferred");
+        assert_eq!(d.prefill_token, None);
+        let (first, stream) = d.stream.expect("the stream diverged");
+        assert_eq!(
+            first, 6,
+            "position 0 is the seed token, so step 5 is position 6"
+        );
+        assert_eq!(stream.len(), 9);
+        assert_eq!(stream[0], SEED_TOKEN);
+        assert_eq!(&stream[1..], &engine_tokens[..8]);
+
+        // Off: the same engine hard-fails exactly as before.
+        let engine = MockEngine::new().oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, engine_tokens);
+        let (mut session, _hello) = Session::connect(engine.free_run_capable()).unwrap();
+        let err = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut no_gate,
+            &params(8),
+            VerifyMode::Verify,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunnerError::TokenMismatch { step: 5, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn deferral_covers_the_seed_and_the_prefill_token() {
+        let mut no_gate = |_: &str| -> Result<()> { Ok(()) };
+        let engine = MockEngine::new().oracle_tokens(
+            PREFILL_TOKEN + 1,
+            SEED_TOKEN + 1,
+            oracle_decode_tokens(8),
+        );
+        let (mut session, _hello) = Session::connect(engine.free_run_capable()).unwrap();
+        let t = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut no_gate,
+            &params(8).with_divergence_deferred(true),
+            VerifyMode::Verify,
+        )
+        .unwrap();
+        let d = t.deferred_divergence.unwrap();
+        assert_eq!(d.prefill_token, Some(PREFILL_TOKEN + 1));
+        assert_eq!(d.stream.unwrap().0, 0);
+    }
+
+    #[test]
+    fn a_path_with_no_reference_refuses_a_deferred_divergence() {
+        let mut engine_tokens = oracle_decode_tokens(8);
+        engine_tokens[2] = 999_999;
+        let engine = MockEngine::new().oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, engine_tokens);
+        let (mut session, _hello) = Session::connect(engine.free_run_capable()).unwrap();
+        let err =
+            run_free_run_timed_benchmark(&mut session, &params(8).with_divergence_deferred(true))
+                .unwrap_err();
+        assert!(
+            matches!(&err, RunnerError::Protocol(m) if m.contains("no reference to replay against")),
+            "{err:?}"
+        );
     }
 
     #[test]

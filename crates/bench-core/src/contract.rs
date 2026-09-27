@@ -232,6 +232,15 @@ pub struct Contract {
     /// fixture that predates the field already describes. `0` is refused.
     #[serde(default)]
     pub official_prefill_timed_runs: Option<u32>,
+    /// The timed-divergence REPLAY policy ([`crate::timed_replay::TimedReplayPolicy`]): the largest
+    /// gap, in raw logits, below the reference's top logit that a replayed committed token may sit.
+    /// Declared together with [`Self::timed_replay_off_argmax_per_thousand`] or not at all; absent
+    /// keeps the exact-match timed window.
+    #[serde(default)]
+    pub timed_replay_max_logit_gap: Option<f64>,
+    /// The off-argmax budget of the replay policy, per thousand replayed positions.
+    #[serde(default)]
+    pub timed_replay_off_argmax_per_thousand: Option<u32>,
     /// The track checkpoint's VOCABULARY BOUND ([`TrackModelIdentity::vocab_size`]): the range
     /// `0..vocab_size` every token id in a golden or a tape must fall in, and the bound the
     /// conformance path judges worker top-logit distributions against.
@@ -303,6 +312,8 @@ impl Contract {
         local_submit_benchmark_decode_steps: None,
         official_prefill_warmup_runs: None,
         official_prefill_timed_runs: None,
+        timed_replay_max_logit_gap: None,
+        timed_replay_off_argmax_per_thousand: None,
         vocab_size: None,
         num_hidden_layers: None,
         seed_tokens: None,
@@ -737,7 +748,39 @@ fn declared_window_shape(contract: &Contract) -> Option<WindowShape> {
             .map_or(crate::constants::BENCHMARK_PREFILL_TIMED_RUNS, |n| {
                 n as usize
             }),
+        timed_divergence_replay: timed_replay_policy(contract).is_some(),
     })
+}
+
+/// The fixture's TIMED-DIVERGENCE REPLAY policy, or `None` when it declares none (the exact-match
+/// timed window). A half-declared or out-of-range policy never reaches here:
+/// [`certify_timed_replay_policy`] refuses it at the parse.
+pub fn timed_replay_policy(contract: &Contract) -> Option<crate::timed_replay::TimedReplayPolicy> {
+    Some(crate::timed_replay::TimedReplayPolicy {
+        max_logit_gap: contract.timed_replay_max_logit_gap?,
+        off_argmax_per_thousand: contract.timed_replay_off_argmax_per_thousand?,
+    })
+}
+
+/// The replay policy is ONE declaration: both values or neither, and in range.
+fn certify_timed_replay_policy(contract: &Contract, track_id: &str) -> Result<(), String> {
+    match (
+        contract.timed_replay_max_logit_gap,
+        contract.timed_replay_off_argmax_per_thousand,
+    ) {
+        (None, None) => Ok(()),
+        (Some(gap), Some(budget)) => crate::timed_replay::TimedReplayPolicy {
+            max_logit_gap: gap,
+            off_argmax_per_thousand: budget,
+        }
+        .validate()
+        .map_err(|e| format!("the --contract track fixture for {track_id:?}: {e}")),
+        _ => Err(format!(
+            "the --contract track fixture for {track_id:?} declares half a timed replay policy; \
+             timed_replay_max_logit_gap and timed_replay_off_argmax_per_thousand are declared \
+             together"
+        )),
+    }
 }
 
 /// THE WINDOW IS ONE SHAPE: all four values or none, and each STEP COUNT strictly positive — a
@@ -1217,6 +1260,7 @@ impl Contract {
         certify_acceptance_bands(self, track_id)?;
         certify_scoring_weights(self, track_id)?;
         certify_window_shape(self, track_id)?;
+        certify_timed_replay_policy(self, track_id)?;
         certify_model_shape(self, track_id)?;
         Ok(())
     }
@@ -1755,6 +1799,9 @@ mod round_trip_oracle_tests {
         window: Option<(usize, usize, usize, usize, usize)>,
         /// `(golden_model_type, vocab_size, num_hidden_layers, seed_tokens)`.
         model: (&'static str, usize, i64, usize),
+        /// `(timed_replay_max_logit_gap, timed_replay_off_argmax_per_thousand)`, or `None` for the
+        /// exact-match timed window.
+        replay: Option<(f64, u32)>,
     }
 
     /// THE EXPECTATIONS, one per checked-in full fixture.
@@ -1799,6 +1846,7 @@ mod round_trip_oracle_tests {
             weights: (0.75, 0.25),
             window: None,
             model: ("qwen3_5_text", 248_320, 64, 512),
+            replay: None,
         },
         Expected {
             track_id: "qwen3.8-125b-a6b-mlx-v1",
@@ -1810,6 +1858,7 @@ mod round_trip_oracle_tests {
             weights: (0.75, 0.25),
             window: Some((64, 128, 1023, 1, 1)),
             model: ("qwen4_exp_text", 248_320, 48, 1_024),
+            replay: None,
         },
         Expected {
             track_id: "qwen3.8-125b-a6b-cuda-v1",
@@ -1821,6 +1870,7 @@ mod round_trip_oracle_tests {
             weights: (0.75, 0.25),
             window: Some((64, 128, 1023, 0, 1)),
             model: ("qwen4_exp_text", 248_320, 48, 1_024),
+            replay: None,
         },
         Expected {
             track_id: "nemotron3.5-lightning-30b-a3b-cuda-v1",
@@ -1832,6 +1882,7 @@ mod round_trip_oracle_tests {
             weights: (0.75, 0.25),
             window: Some((64, 128, 1023, 1, 5)),
             model: ("nemotron_h", 131_072, 52, 4_096),
+            replay: Some((2.0, 100)),
         },
     ];
 
@@ -1960,6 +2011,13 @@ mod round_trip_oracle_tests {
                 "{track_id}: composite weights"
             );
             assert_eq!(weights.source, ContractSource::Contract);
+
+            // 5b. THE TIMED REPLAY POLICY.
+            assert_eq!(
+                timed_replay_policy(&full).map(|p| (p.max_logit_gap, p.off_argmax_per_thousand)),
+                want.replay,
+                "{track_id}: timed replay policy"
+            );
 
             // 6. THE MEASUREMENT WINDOW.
             match want.window {
@@ -2429,6 +2487,7 @@ mod window_shape_tests {
                 local_submit_benchmark_decode_steps: 2047,
                 official_prefill_warmup_runs: 3,
                 official_prefill_timed_runs: 1,
+                timed_divergence_replay: false,
             }
         );
         // The SAME fixture resolves the SAME window under a track naming the other platform: the
@@ -2475,6 +2534,51 @@ mod window_shape_tests {
         );
         let err = Contract::parse(&with(r#","official_prefill_timed_runs":0}"#)).unwrap_err();
         assert!(err.contains("zero timed runs measures nothing"), "{err}");
+    }
+
+    /// THE TIMED REPLAY POLICY: absent keeps the exact match; declared resolves and turns the
+    /// window's deferral on; half-declared or out of range is refused at the parse.
+    #[test]
+    fn the_timed_replay_policy_is_one_declaration() {
+        let window = br#"{"track_id":"t","correctness_steps":64,"benchmark_decode_steps":128,
+                  "local_submit_benchmark_decode_steps":1023,"official_prefill_warmup_runs":1"#;
+        let with = |tail: &str| {
+            let mut body = window.to_vec();
+            body.extend_from_slice(tail.as_bytes());
+            body
+        };
+        let absent = Contract::parse(&with("}")).unwrap();
+        assert_eq!(timed_replay_policy(&absent), None);
+        assert!(
+            !window_shape(&absent, "t")
+                .unwrap()
+                .value
+                .timed_divergence_replay
+        );
+        let declared = Contract::parse(&with(
+            r#","timed_replay_max_logit_gap":2.0,"timed_replay_off_argmax_per_thousand":100}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            timed_replay_policy(&declared),
+            Some(crate::timed_replay::TimedReplayPolicy {
+                max_logit_gap: 2.0,
+                off_argmax_per_thousand: 100
+            })
+        );
+        assert!(
+            window_shape(&declared, "t")
+                .unwrap()
+                .value
+                .timed_divergence_replay
+        );
+        let half = Contract::parse(&with(r#","timed_replay_max_logit_gap":2.0}"#)).unwrap_err();
+        assert!(half.contains("half a timed replay policy"), "{half}");
+        let loose = Contract::parse(&with(
+            r#","timed_replay_max_logit_gap":9.0,"timed_replay_off_argmax_per_thousand":100}"#,
+        ))
+        .unwrap_err();
+        assert!(loose.contains("at most"), "{loose}");
     }
 
     /// THE WINDOW IS ONE SHAPE, refused AT THE PARSE when it is half-declared, and a step count of

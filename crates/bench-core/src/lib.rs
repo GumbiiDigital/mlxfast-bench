@@ -25,6 +25,7 @@ pub mod runner_manifest;
 pub mod score;
 pub mod stats;
 pub mod tape;
+pub mod timed_replay;
 
 use std::fmt;
 
