@@ -1880,6 +1880,23 @@ pub(crate) fn seal_hello_text(field: &str, text: &str) -> String {
     )
 }
 
+/// The SEALED form of an engine-supplied digest (`head_provenance.sha256`,
+/// `runner.manifest_sha256`): the value itself when it is exactly 64 lowercase hex, else the
+/// literal `invalid`, so the field cannot carry free text. The raw value of a refused one goes to
+/// benchd's stderr under `field`.
+pub(crate) fn seal_hex_digest(field: &str, value: &str) -> String {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        value.to_string()
+    } else {
+        eprintln!("benchd: engine {field} is not a sha256 digest: {value:?}");
+        "invalid".to_string()
+    }
+}
+
 /// The DEPTH a sealed `effective_spec` reports: `0` for `serial` (no drafter, so zero is its true
 /// depth), else the module's own resolved depth — `mtp.depth`, or the `dflash` block's `depth`
 /// lever. An `mtp` echo always carries a resolved depth (`spec_echo_honors_request` refuses one that

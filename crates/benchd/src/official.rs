@@ -125,13 +125,20 @@ pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::He
     metrics.engine_backend = hello.backend.as_deref().map(|t| seal("backend", t));
     metrics.engine_device = hello.device.as_deref().map(|t| seal("device", t));
     metrics.engine_protocol_version = hello.protocol_version;
-    metrics.head_provenance_sha256 = hello.head_provenance.as_ref().map(|p| p.sha256.clone());
+    use crate::iterate::seal_hex_digest;
+    metrics.head_provenance_sha256 = hello
+        .head_provenance
+        .as_ref()
+        .map(|p| seal_hex_digest("head_provenance.sha256", &p.sha256));
     metrics.runner_id = hello.runner.as_ref().map(|r| seal("runner.id", &r.id));
     metrics.runner_model_type = hello
         .runner
         .as_ref()
         .map(|r| seal("runner.model_type", &r.model_type));
-    metrics.runner_manifest_sha256 = hello.runner.as_ref().map(|r| r.manifest_sha256.clone());
+    metrics.runner_manifest_sha256 = hello
+        .runner
+        .as_ref()
+        .map(|r| seal_hex_digest("runner.manifest_sha256", &r.manifest_sha256));
     metrics.runner_build = hello
         .runner
         .as_ref()
@@ -2422,12 +2429,16 @@ mod tests {
                 device: Some(text("device")),
                 capabilities: Vec::new(),
                 spec_modes: Vec::new(),
-                head_provenance: None,
+                head_provenance: Some(bench_protocol::HeadProvenance {
+                    sha256: text("head"),
+                    bytes: 1,
+                    file_count: 1,
+                }),
                 max_batch_size: None,
                 runner: Some(bench_protocol::RunnerIdentity {
                     id: text("id"),
                     model_type: text("model"),
-                    manifest_sha256: "ab".repeat(32),
+                    manifest_sha256: text("manifest"),
                     build: text("build"),
                 }),
                 resident: None,
@@ -2451,6 +2462,10 @@ mod tests {
         ] {
             assert_eq!(m[key], sealed_text(&raw), "{key}");
         }
+        // Engine "digests" that are not 64 lowercase hex seal as `invalid`, mirror included.
+        assert_eq!(m["head_provenance_sha256"], "invalid");
+        assert_eq!(m["per_prompt"][0]["head_provenance_sha256"], "invalid");
+        assert_eq!(m["runner_manifest_sha256"], "invalid");
         assert_eq!(
             m["acceptance_lengths"],
             serde_json::json!({"count": rounds, "mean": 2.0})
@@ -2466,6 +2481,23 @@ mod tests {
             }
         }
         assert!(longest_array(&v) < rounds, "a per-round vector was sealed");
+    }
+
+    /// Only exactly-64-lowercase-hex engine digests seal as themselves.
+    #[test]
+    fn engine_digests_seal_only_when_they_are_sha256_hex() {
+        use crate::iterate::seal_hex_digest;
+        let good = "0123456789abcdef".repeat(4);
+        assert_eq!(seal_hex_digest("f", &good), good);
+        for bad in [
+            good.to_uppercase(),
+            good[..63].to_string(),
+            format!("{good}0"),
+            format!("{}{PROMPT_MARKER}", &good[..44]),
+            String::new(),
+        ] {
+            assert_eq!(seal_hex_digest("f", &bad), "invalid", "{bad:?}");
+        }
     }
 
     /// benchd's OWN refusals reach the sealed record byte-for-byte: they carry benchd's comparison
