@@ -149,7 +149,7 @@ fn a_decode_error_does_not_quote_the_engine_line() {
     );
     for text in [err.to_string(), err.diagnostic()] {
         assert!(
-            text.contains("engine response line could not be decoded: data error at line 1 column"),
+            text.contains("engine response line could not be decoded: data error at line 1"),
             "{text}"
         );
         assert_eq!(

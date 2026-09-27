@@ -162,17 +162,16 @@ impl<T: LineTransport> Session<T> {
     /// `readResponseLine` behavior), decodes the first that does as the `hello`, and
     /// requires `id == 0`, `ok == true`, and a non-empty `nonce`.
     pub fn connect(transport: T) -> Result<(Self, Hello)> {
-        Self::connect_inner(transport).inspect_err(log_engine_text)
+        Self::connect_inner(transport).inspect_err(crate::error::log_engine_data)
     }
 
     fn connect_inner(mut transport: T) -> Result<(Self, Hello)> {
         // The hello handshake is untimed (no RunTimeout deadline armed yet).
         let resp = read_response_line(&mut transport, None, "hello")?;
         if resp.id != 0 {
-            return Err(RunnerError::Protocol(format!(
-                "hello had id {}, expected 0",
-                resp.id
-            )));
+            // The id is engine-chosen: the log gets it, the sealed text does not.
+            eprintln!("bench-runner: engine hello id {}", resp.id);
+            return Err(RunnerError::Protocol("hello had a non-zero id".to_string()));
         }
         if !resp.ok {
             return Err(RunnerError::ProtocolEngineText {
@@ -192,9 +191,12 @@ impl<T: LineTransport> Session<T> {
         // The hello is the only place the version is meaningful; refuse to drive an
         // engine we cannot guarantee wire-compatibility with.
         if resp.protocol_version != Some(PROTOCOL_VERSION) {
+            eprintln!(
+                "bench-runner: engine hello protocol_version {:?}",
+                resp.protocol_version
+            );
             return Err(RunnerError::Protocol(format!(
-                "hello protocol_version {:?} does not match supported {}",
-                resp.protocol_version, PROTOCOL_VERSION
+                "hello protocol_version does not match supported {PROTOCOL_VERSION}"
             )));
         }
         let capabilities = resp.capabilities.unwrap_or_default();
@@ -276,7 +278,7 @@ impl<T: LineTransport> Session<T> {
         let result = self.send_inner(&req, id);
         if let Err(e) = &result {
             self.discarded = true;
-            log_engine_text(e);
+            crate::error::log_engine_data(e);
         }
         result
     }
@@ -311,9 +313,9 @@ impl<T: LineTransport> Session<T> {
         }
         // 2. id echo
         if resp.id != id {
+            eprintln!("bench-runner: engine response id {}", resp.id);
             return Err(RunnerError::Protocol(format!(
-                "response id {} did not match request id {id}",
-                resp.id
+                "response id did not match request id {id}"
             )));
         }
         // 3. ok
@@ -393,7 +395,7 @@ impl<T: LineTransport> Session<T> {
             mode: spec.mode.clone(),
             advertised: self.spec_modes.clone(),
         };
-        log_engine_text(&e);
+        crate::error::log_engine_data(&e);
         Err(e)
     }
 
@@ -427,7 +429,7 @@ impl<T: LineTransport> Session<T> {
                 .as_ref()
                 .map(|e| serde_json::to_string(e).unwrap_or_default()),
         };
-        log_engine_text(&e);
+        crate::error::log_engine_data(&e);
         Err(e)
     }
 
@@ -551,7 +553,8 @@ impl<T: LineTransport> Session<T> {
         Err(RunnerError::BatchEchoDivergence {
             requested,
             effective: resp.effective_batch_size,
-        })
+        }
+        .logged())
     }
 
     /// `free_decode_begin` in its v1.2 COHORT form: B seed forwards, one per cohort slot in SLOT
@@ -606,7 +609,8 @@ impl<T: LineTransport> Session<T> {
                 return Err(RunnerError::BatchEchoDivergence {
                     requested: batch_size,
                     effective: Some(echoed),
-                });
+                }
+                .logged());
             }
         }
         Ok(resp)
@@ -745,7 +749,7 @@ impl<T: LineTransport> Session<T> {
         if let Some(reported) = resp.cache_memory {
             if reported != 0 {
                 self.discarded = true;
-                return Err(RunnerError::AllocatorCacheNotDrained { reported });
+                return Err(RunnerError::AllocatorCacheNotDrained { reported }.logged());
             }
         }
         match resp.completed_work {
@@ -763,7 +767,8 @@ impl<T: LineTransport> Session<T> {
                 Err(RunnerError::CompletedWorkMismatch {
                     issued: self.issued_steps,
                     reported: other,
-                })
+                }
+                .logged())
             }
         }
     }
@@ -781,7 +786,7 @@ impl<T: LineTransport> Session<T> {
         if let Some(reported) = diag.cache_memory {
             if reported != 0 {
                 self.discarded = true;
-                return Err(RunnerError::AllocatorCacheNotDrained { reported });
+                return Err(RunnerError::AllocatorCacheNotDrained { reported }.logged());
             }
         }
         let completed_work = match diag.completed_work {
@@ -820,7 +825,8 @@ impl<T: LineTransport> Session<T> {
                 self.discarded = true;
                 Err(RunnerError::FreeRunConsistency {
                     detail: e.to_string(),
-                })
+                }
+                .logged())
             }
         }
     }
@@ -847,7 +853,8 @@ impl<T: LineTransport> Session<T> {
                 self.discarded = true;
                 Err(RunnerError::FreeRunConsistency {
                     detail: e.to_string(),
-                })
+                }
+                .logged())
             }
         }
     }
@@ -930,14 +937,6 @@ fn with_failure_diagnostic<T: LineTransport>(transport: &mut T, detail: String) 
             engine_text,
         },
         None => RunnerError::Protocol(detail),
-    }
-}
-
-/// Put an error's engine-controlled text on benchd's own stderr (the box-local log) before it is
-/// reduced to a digest on its way into a sealed record.
-fn log_engine_text(e: &RunnerError) {
-    if e.carries_engine_text() {
-        eprintln!("bench-runner: engine diagnostic: {}", e.diagnostic());
     }
 }
 

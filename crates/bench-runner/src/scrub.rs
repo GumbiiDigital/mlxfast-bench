@@ -519,8 +519,10 @@ pub fn scrub_reason_for_seal(reason: &str) -> String {
     clip_to_bytes(&scrub_engine_text(reason), SEALED_REASON_BYTE_LIMIT)
 }
 
-/// The SEALED stand-in for engine-controlled text: `engine-text-sha256=<hex> engine-text-bytes=<n>`
-/// of the SCRUBBED text, and none of the text itself.
+/// The SEALED stand-in for engine-controlled text: `engine-text-sha256=<hex>
+/// engine-text-bytes=<bucket>` of the SCRUBBED text, and none of the text itself. The length is
+/// sealed only as its power-of-two bucket ([`seal_byte_len`]): an exact length is an engine-chosen
+/// number.
 ///
 /// The engine sees the hidden prompts and the sealed record is returned to the participant, so any
 /// engine-chosen bytes that reached the record would be a channel for reading a hidden prompt back
@@ -531,8 +533,17 @@ pub fn seal_engine_text(text: &str) -> String {
     format!(
         "engine-text-sha256={} engine-text-bytes={}",
         bench_core::hash::sha256_hex(scrubbed.as_bytes()),
-        scrubbed.len()
+        seal_byte_len(scrubbed.len())
     )
+}
+
+/// The SEALED form of an engine-chosen byte length: `<=64`, `<=128`, … `<=4096`, or `>4096`.
+pub fn seal_byte_len(len: usize) -> String {
+    if len > 4096 {
+        ">4096".to_string()
+    } else {
+        format!("<={}", len.max(64).next_power_of_two())
+    }
 }
 
 /// Clip `text` to at most `cap` BYTES, keeping a head and a tail around a marker, never splitting
@@ -577,6 +588,23 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_text_length_seals_as_a_power_of_two_bucket() {
+        for (len, bucket) in [
+            (0, "<=64"),
+            (64, "<=64"),
+            (65, "<=128"),
+            (1000, "<=1024"),
+            (4096, "<=4096"),
+            (4097, ">4096"),
+        ] {
+            assert_eq!(seal_byte_len(len), bucket, "{len}");
+        }
+        let sealed = seal_engine_text(&"x".repeat(1234));
+        assert!(sealed.ends_with("engine-text-bytes=<=2048"), "{sealed}");
+        assert!(!sealed.contains("1234"), "{sealed}");
+    }
 
     /// A1 — the shapes the reviewer's probe sealed VERBATIM before this existed. None of them
     /// contains the `expected`/`actual` keywords the Swift-ported filter looks for, which is

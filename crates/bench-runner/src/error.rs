@@ -50,11 +50,16 @@ pub enum RunnerError {
     /// `step` is the 0-based step index, and `expected`/`actual` are the oracle vs engine
     /// tokens. A fast engine returning garbage on the timed path is rejected here rather
     /// than being credited with an inflated speedup.
+    ///
+    /// `expected_from_engine` is true when `expected` is NOT the oracle but an earlier pass's
+    /// ENGINE token (deferred-prefill passes that disagree): both numbers are then engine-chosen and
+    /// the sealed form names the class only.
     TokenMismatch {
         label: String,
         step: usize,
         expected: i64,
         actual: i64,
+        expected_from_engine: bool,
     },
     /// A request was attempted after a prior error discarded the session.
     SessionDiscarded,
@@ -141,29 +146,61 @@ impl RunnerError {
         crate::scrub::scrub_reason_for_seal(&Revealed(self).to_string())
     }
 
-    /// Whether this error carries engine-controlled text that `Display` replaces with a digest.
-    pub fn carries_engine_text(&self) -> bool {
+    /// Put this error's engine-controlled data on benchd's own stderr (the box-local log) before
+    /// `Display` reduces it to a digest or drops it on its way into a sealed record; returns it.
+    pub(crate) fn logged(self) -> Self {
+        log_engine_data(&self);
+        self
+    }
+
+    /// Whether this error carries engine-controlled text or an engine-chosen number that `Display`
+    /// replaces with a digest or leaves out (so the full value must go to the log).
+    pub fn carries_engine_data(&self) -> bool {
         matches!(
             self,
             RunnerError::ProtocolEngineText { .. }
-                | RunnerError::NonceMismatch { got: Some(_), .. }
+                | RunnerError::NonceMismatch { .. }
                 | RunnerError::Engine { .. }
                 | RunnerError::SpecEchoDivergence {
                     effective: Some(_),
                     ..
                 }
                 | RunnerError::SpecModeNotRunnable { .. }
+                | RunnerError::CompletedWorkMismatch {
+                    reported: Some(_),
+                    ..
+                }
+                | RunnerError::AllocatorCacheNotDrained { .. }
+                | RunnerError::TokenMismatch {
+                    expected_from_engine: true,
+                    ..
+                }
+                | RunnerError::FreeRunConsistency { .. }
+                | RunnerError::BatchEchoDivergence {
+                    effective: Some(_),
+                    ..
+                }
+                | RunnerError::BatchWidthExceedsEngineMax { .. }
         )
     }
 
     /// Render the error. `reveal == false` is the SEALED form (`Display`): every engine-controlled
-    /// string is replaced by [`crate::scrub::seal_engine_text`]. `reveal == true` is the log form.
+    /// string is replaced by [`crate::scrub::seal_engine_text`] and every engine-chosen number is
+    /// left out. `reveal == true` is the log form.
     fn fmt_with(&self, f: &mut fmt::Formatter<'_>, reveal: bool) -> fmt::Result {
         let engine = |text: &str| -> String {
             if reveal {
                 crate::scrub::scrub_engine_text(text)
             } else {
                 crate::scrub::seal_engine_text(text)
+            }
+        };
+        // An engine-chosen number: ` <n>` in the log, nothing in the sealed form.
+        let num = |n: &dyn fmt::Display| -> String {
+            if reveal {
+                format!(" {n}")
+            } else {
+                String::new()
             }
         };
         match self {
@@ -174,21 +211,27 @@ impl RunnerError {
                 detail,
                 engine_text,
             } => write!(f, "protocol violation: {detail} ({})", engine(engine_text)),
-            RunnerError::NonceMismatch { expected, got } => match got {
-                Some(got) => write!(
-                    f,
-                    "nonce mismatch: expected {expected:?}, got {}",
-                    if reveal { format!("{got:?}") } else { engine(got) }
-                ),
-                None => write!(f, "nonce mismatch: expected {expected:?}, got none"),
-            },
+            // The session nonce is the ENGINE's own hello nonce, so both sides are engine text.
+            RunnerError::NonceMismatch { expected, got } => {
+                let text = |t: &String| if reveal { format!("{t:?}") } else { engine(t) };
+                match got {
+                    Some(got) => write!(
+                        f,
+                        "nonce mismatch: expected {}, got {}",
+                        text(expected),
+                        text(got)
+                    ),
+                    None => write!(f, "nonce mismatch: expected {}, got none", text(expected)),
+                }
+            }
             RunnerError::Engine { kind, message } => {
                 write!(f, "engine reported failure on {kind:?}: {}", engine(message))
             }
             RunnerError::CompletedWorkMismatch { issued, reported } => match reported {
                 Some(reported) => write!(
                     f,
-                    "phase-close barrier: issued {issued} timed steps but engine reported {reported} completed"
+                    "phase-close barrier: issued {issued} timed steps but engine reported a different{} completed",
+                    num(reported)
                 ),
                 None => write!(
                     f,
@@ -197,13 +240,30 @@ impl RunnerError {
             },
             RunnerError::AllocatorCacheNotDrained { reported } => write!(
                 f,
-                "runtime worker failed to clear the MLX allocator cache at phase start (cache_memory={reported} bytes, expected 0)"
+                "runtime worker failed to clear the MLX allocator cache at phase start (cache_memory non-zero{}, expected 0)",
+                num(reported)
+            ),
+            RunnerError::TokenMismatch {
+                label,
+                expected_from_engine: true,
+                ..
+            } if !reveal => write!(f, "{label} mismatch: the timed passes disagree"),
+            RunnerError::TokenMismatch {
+                label,
+                step,
+                expected,
+                actual,
+                expected_from_engine: true,
+            } => write!(
+                f,
+                "{label} mismatch at step {step}: the timed passes disagree (earlier pass {expected}, engine returned {actual})"
             ),
             RunnerError::TokenMismatch {
                 label,
                 step,
                 expected,
                 actual,
+                ..
             } => write!(
                 f,
                 "{label} mismatch at step {step}: expected oracle token {expected}, engine returned {actual}"
@@ -215,7 +275,14 @@ impl RunnerError {
                 f,
                 "engine did not advertise the {capability:?} capability; refusing the capability-gated request (fail-closed)"
             ),
+            // `detail` is benchd's template filled with engine-reported counts: the sealed form
+            // keeps the template and masks every number.
             RunnerError::FreeRunConsistency { detail } => {
+                let detail = if reveal {
+                    detail.clone()
+                } else {
+                    mask_digits(detail)
+                };
                 write!(f, "free-run decode consistency failure: {detail}")
             }
             RunnerError::GateRejected { phase, reason } => {
@@ -244,8 +311,9 @@ impl RunnerError {
                 Some(effective) => write!(
                     f,
                     "batch echo divergence: requested batch_size {requested} but the engine echoed \
-                     effective_batch_size {effective} (batch-never-ignored, fail-closed — session \
-                     discarded)"
+                     a different effective_batch_size{} (batch-never-ignored, fail-closed — session \
+                     discarded)",
+                    num(effective)
                 ),
                 None => write!(
                     f,
@@ -259,7 +327,8 @@ impl RunnerError {
             } => write!(
                 f,
                 "requested cohort batch_size {requested} exceeds the engine's advertised \
-                 max_batch_size {max_batch_size}; refusing pre-GPU (fail-closed)"
+                 max_batch_size{}; refusing pre-GPU (fail-closed)",
+                num(max_batch_size)
             ),
             RunnerError::SpecModeNotRunnable { mode, advertised } => write!(
                 f,
@@ -286,6 +355,13 @@ impl RunnerError {
     }
 }
 
+/// See [`RunnerError::logged`].
+pub(crate) fn log_engine_data(e: &RunnerError) {
+    if e.carries_engine_data() {
+        eprintln!("bench-runner: engine diagnostic: {}", e.diagnostic());
+    }
+}
+
 impl fmt::Display for RunnerError {
     /// The SEALED form: safe to put in a record the participant reads back. Engine-controlled text
     /// appears only as a digest; see [`RunnerError::diagnostic`] for the full text.
@@ -303,9 +379,23 @@ impl fmt::Display for Revealed<'_> {
     }
 }
 
-/// A serde_json error described by CATEGORY and POSITION only. serde's own `Display` quotes the
+/// Every ASCII digit run in `text` replaced by `#`.
+fn mask_digits(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if !c.is_ascii_digit() {
+            out.push(c);
+        } else if !out.ends_with('#') {
+            out.push('#');
+        }
+    }
+    out
+}
+
+/// A serde_json error described by CATEGORY and LINE only. serde's own `Display` quotes the
 /// offending value (`invalid type: string "…"`, ``unknown variant `…` ``), and on engine output
-/// that value is engine-chosen text, so it must never reach a record.
+/// that value is engine-chosen text, so it must never reach a record; the column is left out too,
+/// since on a one-line response it is an engine-chosen number.
 pub fn serde_error_summary(e: &serde_json::Error) -> String {
     let category = match e.classify() {
         serde_json::error::Category::Io => "io",
@@ -313,11 +403,7 @@ pub fn serde_error_summary(e: &serde_json::Error) -> String {
         serde_json::error::Category::Data => "data",
         serde_json::error::Category::Eof => "eof",
     };
-    format!(
-        "{category} error at line {} column {}",
-        e.line(),
-        e.column()
-    )
+    format!("{category} error at line {}", e.line())
 }
 
 impl std::error::Error for RunnerError {
@@ -397,11 +483,60 @@ mod tests {
             },
         ];
         for e in errors {
-            assert!(e.carries_engine_text());
+            assert!(e.carries_engine_data());
             let sealed = e.to_string();
             assert!(!sealed.contains("HIDDEN"), "{sealed}");
             assert!(sealed.contains("engine-text-sha256="), "{sealed}");
             assert!(e.diagnostic().contains(MARKER), "{}", e.diagnostic());
         }
+    }
+
+    /// Engine-chosen NUMBERS never reach the sealed form; the log form keeps them.
+    #[test]
+    fn engine_number_variants_drop_the_number_in_display_and_keep_it_in_diagnostic() {
+        const N: i64 = 1_234_567;
+        let errors = [
+            RunnerError::AllocatorCacheNotDrained { reported: N },
+            RunnerError::CompletedWorkMismatch {
+                issued: 3,
+                reported: Some(N),
+            },
+            RunnerError::BatchEchoDivergence {
+                requested: 8,
+                effective: Some(N as u32),
+            },
+            RunnerError::BatchWidthExceedsEngineMax {
+                requested: 8,
+                max_batch_size: N as u32,
+            },
+            RunnerError::TokenMismatch {
+                label: "benchmark prefill token".to_string(),
+                step: 1,
+                expected: N,
+                actual: N + 1,
+                expected_from_engine: true,
+            },
+            RunnerError::FreeRunConsistency {
+                detail: format!("free_decode_run committed_total {N} != N 64"),
+            },
+        ];
+        for e in errors {
+            assert!(e.carries_engine_data());
+            let sealed = e.to_string();
+            assert!(!sealed.contains("1234"), "{sealed}");
+            assert!(e.diagnostic().contains("1234567"), "{}", e.diagnostic());
+        }
+        // A plain oracle mismatch keeps benchd's expected token and the step.
+        let plain = RunnerError::TokenMismatch {
+            label: "benchmark free-run decode token".to_string(),
+            step: 5,
+            expected: 42,
+            actual: 7,
+            expected_from_engine: false,
+        };
+        assert!(!plain.carries_engine_data());
+        assert!(plain
+            .to_string()
+            .contains("step 5: expected oracle token 42"));
     }
 }

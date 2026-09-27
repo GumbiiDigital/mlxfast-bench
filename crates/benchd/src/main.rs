@@ -550,8 +550,16 @@ fn connect_retaining_hello(
     retained: &std::cell::RefCell<Option<bench_runner::Hello>>,
 ) -> bench_runner::Result<Session<ChildStdioTransport>> {
     let (session, hello) = Session::connect(transport)?;
-    official::retain_timed_hello(&mut retained.borrow_mut(), hello)
-        .map_err(|e| RunnerError::Protocol(e.to_string()))?;
+    // The resident pid/load_epoch are engine-chosen numbers: the log gets them, the sealed error
+    // gets the refusal's name only.
+    official::retain_timed_hello(&mut retained.borrow_mut(), hello).map_err(|e| {
+        eprintln!("benchd: {e}");
+        RunnerError::Protocol(format!(
+            "{}: one timed window ran against two different resident identities \
+             (weights-load-once)",
+            e.name()
+        ))
+    })?;
     Ok(session)
 }
 
@@ -3972,7 +3980,7 @@ fn run_local_iterate(
     // the gated path, where such a session exists.
     let identity_hello = timed_hello.borrow_mut().take().or(session_hello);
     if let Some(hello) = identity_hello.as_ref() {
-        official::seal_engine_identity(&mut payload.metrics, hello);
+        official::seal_engine_identity(&mut payload.metrics, hello, None);
     }
     Ok(payload)
 }
@@ -4871,7 +4879,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             },
         );
         if let Some(hello) = timed_hello.borrow().as_ref() {
-            official::seal_engine_identity(&mut payload.metrics, hello);
+            // The reference leg loads the pinned head: its digest is what the candidate's is
+            // compared against.
+            let pinned_head = baseline_hello
+                .borrow()
+                .as_ref()
+                .and_then(|h| h.head_provenance.as_ref())
+                .map(|p| p.sha256.clone());
+            official::seal_engine_identity(&mut payload.metrics, hello, pinned_head.as_deref());
         }
         // `metrics.gates` is sealed by the paired core itself, on every payload it can return.
         payload
@@ -5055,7 +5070,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                     cool_gate_fn,
                 );
                 if let Some(hello) = timed_hello.borrow().as_ref() {
-                    official::seal_engine_identity(&mut payload.metrics, hello);
+                    official::seal_engine_identity(&mut payload.metrics, hello, None);
                 }
                 payload.metrics.gates = gate_log.records();
                 payload

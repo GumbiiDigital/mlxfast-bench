@@ -27,7 +27,8 @@ pub use sandbox::{
     SandboxProfile, SANDBOX_EXEC_PATH,
 };
 pub use scrub::{
-    scrub_engine_text, scrub_reason_for_seal, seal_engine_text, SEALED_REASON_BYTE_LIMIT,
+    scrub_engine_text, scrub_reason_for_seal, seal_byte_len, seal_engine_text,
+    SEALED_REASON_BYTE_LIMIT,
 };
 pub use session::{Hello, Session};
 pub use timing::{

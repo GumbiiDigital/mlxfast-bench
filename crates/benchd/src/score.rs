@@ -82,6 +82,8 @@ pub struct ScoreMetrics {
     /// Additive local-only diagnostics. Absent on official paths and old artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_phases: Option<LocalPhases>,
+    /// The engine-reported peak RAM, rounded to the nearest 0.5 GB when it is set
+    /// ([`crate::iterate::apply_timing_metrics`]); the raw value goes to benchd's stderr.
     pub peak_ram_gb: f64,
     pub bandwidth_gb_per_token: f64,
     pub decode_seconds_per_token: f64,
@@ -250,7 +252,7 @@ pub struct ScoreMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_lengths: Option<AcceptanceLengthsSummary>,
     /// ADDITIVE — THE ENGINE IDENTITY SEAL, taken from the TIMED worker's `hello` (the worker whose
-    /// leg is scored). `hello.backend` as `sha256=<hex> bytes=<n>` of the text, never the text: a
+    /// leg is scored). `hello.backend` as `sha256=<hex> bytes=<bucket>` of the text, never the text: a
     /// later pair's engine has seen the hidden prompts, so hello free text would be a read-back
     /// channel. The same holds for `engine_device`, `runner_id`, `runner_model_type`,
     /// `runner_build` and `spec_verification_mode`; the plain text goes to benchd's stderr. Absent when no timed worker ran or
@@ -264,9 +266,12 @@ pub struct ScoreMetrics {
     /// refuses a version benchd does not speak; this records WHICH one answered. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_protocol_version: Option<u32>,
-    /// ADDITIVE — the timed worker's loaded-head digest (`hello.head_provenance.sha256`, #106).
-    /// The board's custom-head reader looks for it here and on each `per_prompt` entry. Absent for
-    /// an engine that echoes no head provenance. AUDIT-only, never scored.
+    /// ADDITIVE — the VERDICT on the timed worker's loaded-head digest
+    /// (`hello.head_provenance.sha256`, #106), never the digest itself (256 engine-chosen bits):
+    /// `match` / `mismatch` against the reference leg's head digest, `valid` when the run has no
+    /// reference leg, `invalid` when it is not 64 lowercase hex. The raw digest goes to benchd's
+    /// stderr. The board's custom-head reader looks for it here and on each `per_prompt` entry.
+    /// Absent for an engine that echoes no head provenance. AUDIT-only, never scored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_provenance_sha256: Option<String>,
     /// ADDITIVE — the timed worker's runner id (`hello.runner.id`, e.g. `"layr/qwen4exp-125b-a6b"`).
@@ -278,7 +283,8 @@ pub struct ScoreMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_model_type: Option<String>,
     /// ADDITIVE — the digest of the timed worker's CANONICAL runner manifest
-    /// (`hello.runner.manifest_sha256`, 64 lowercase hex). IDENTITY, never an input to the score;
+    /// (`hello.runner.manifest_sha256`), sealed only as `valid` (64 lowercase hex) or `invalid`;
+    /// the raw value goes to benchd's stderr. IDENTITY, never an input to the score;
     /// the conformance kit, not the scorer, is what compares it against a declared manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_manifest_sha256: Option<String>,
@@ -442,7 +448,7 @@ pub struct ScorePerPrompt {
     /// ADDITIVE — this prompt's total ACCEPTED draft tokens (self-reported). AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_accepted_total: Option<u64>,
-    /// ADDITIVE — the timed worker's loaded-head digest, MIRRORED here because the board's
+    /// ADDITIVE — the timed worker's loaded-head digest VERDICT, MIRRORED here because the board's
     /// custom-head reader reads it off the per-prompt entry. Same value as
     /// [`ScoreMetrics::head_provenance_sha256`]. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]

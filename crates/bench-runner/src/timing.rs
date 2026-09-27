@@ -919,7 +919,8 @@ where
             return Err(RunnerError::BatchWidthExceedsEngineMax {
                 requested: params.batch_size,
                 max_batch_size: max,
-            });
+            }
+            .logged());
         }
     }
     cool_gate("decode")?;
@@ -1090,15 +1091,19 @@ fn measure_prefill<T: LineTransport>(
                         step: run_index,
                         expected: expected_prefill_token,
                         actual: token,
+                        expected_from_engine: false,
                     });
                 }
+                // Both tokens are the engine's (no oracle side): sealed as the class only.
                 Some(prev) if prev != token => {
                     return Err(RunnerError::TokenMismatch {
                         label: "benchmark prefill token".to_string(),
                         step: run_index,
                         expected: prev,
                         actual: token,
-                    });
+                        expected_from_engine: true,
+                    }
+                    .logged());
                 }
                 _ => deferred_prefill = Some(token),
             }
@@ -1109,7 +1114,9 @@ fn measure_prefill<T: LineTransport>(
                 step: run_index,
                 expected: deferred_prefill.unwrap_or(expected_prefill_token),
                 actual: token,
-            });
+                expected_from_engine: true,
+            }
+            .logged());
         }
         if run_index >= params.prefill_warmup_runs {
             timed_elapsed.push(elapsed);
@@ -1198,6 +1205,7 @@ fn measure_decode<T: LineTransport>(
             step: 0,
             expected: params.expected_decode_seed_token,
             actual: seed_token,
+            expected_from_engine: false,
         });
     }
     for decoded_step in 0..params.decode_steps {
@@ -1220,6 +1228,7 @@ fn measure_decode<T: LineTransport>(
                 step: decoded_step,
                 expected,
                 actual: token,
+                expected_from_engine: false,
             });
         }
     }
@@ -1308,6 +1317,7 @@ fn measure_free_run_decode<T: LineTransport>(
                 step: 0,
                 expected: params.expected_decode_seed_token,
                 actual: seed_token,
+                expected_from_engine: false,
             });
         }
         first_divergence = Some(0);
@@ -1350,7 +1360,8 @@ fn measure_free_run_decode<T: LineTransport>(
                 got: tokens.len(),
             }
             .to_string(),
-        });
+        }
+        .logged());
     }
     // §2.2 / §2.7: exact-match every committed token against the golden continuation. A wrong
     // free-run token is a HARD failure (the same TokenMismatch class as v1 teacher-forced
@@ -1381,6 +1392,7 @@ fn measure_free_run_decode<T: LineTransport>(
                     step,
                     expected,
                     actual,
+                    expected_from_engine: false,
                 });
             }
             // Past a divergence the golden no longer describes the stream: the rest is the
@@ -1603,6 +1615,7 @@ fn measure_batched_free_run_decode<T: LineTransport>(
                 step: 0,
                 expected: stream.expected_decode_seed_token,
                 actual,
+                expected_from_engine: false,
             });
         }
     }
@@ -1640,7 +1653,8 @@ fn measure_batched_free_run_decode<T: LineTransport>(
                 got: tokens_by_stream.len(),
             }
             .to_string(),
-        });
+        }
+        .logged());
     }
     for (slot, stream_tokens) in tokens_by_stream.iter().enumerate() {
         if stream_tokens.len() != n_usize {
@@ -1651,7 +1665,8 @@ fn measure_batched_free_run_decode<T: LineTransport>(
                     got: stream_tokens.len(),
                 }
                 .to_string(),
-            });
+            }
+            .logged());
         }
     }
     // (b) admission — the inline STATIC-TAPE exact-match on the committed tokens is REMOVED here.
@@ -1913,6 +1928,7 @@ mod tests {
                 step,
                 expected,
                 actual,
+                ..
             } => {
                 assert_eq!(label, "benchmark decode seed token");
                 assert_eq!(step, 0);
@@ -1940,6 +1956,7 @@ mod tests {
                 step,
                 expected,
                 actual,
+                ..
             } => {
                 assert_eq!(label, "benchmark decode token");
                 assert_eq!(step, 3);
@@ -2374,6 +2391,7 @@ mod tests {
                 step,
                 expected,
                 actual,
+                ..
             } => {
                 assert_eq!(label, "benchmark free-run decode token");
                 assert_eq!(step, 5);
@@ -2440,6 +2458,7 @@ mod tests {
                 step,
                 expected,
                 actual,
+                ..
             } => {
                 assert_eq!(label, "benchmark free-run decode token");
                 assert_eq!(step, 0);

@@ -119,17 +119,25 @@ fn seal_official_per_prompt(
 /// lacked it, never `0` and never `""`: an absent key is the honest statement "the worker said
 /// nothing", which is a different claim from "the worker said zero". They are IDENTITY, recorded in
 /// the score.json metrics and NEVER scored — nothing reads them back as an input to a number.
-pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
+///
+/// `pinned_head_sha256` is the head digest the TRUSTED reference leg reported on this run (paired
+/// arm), or `None` when there is no reference leg; `head_provenance_sha256` seals only how the
+/// engine's digest compares to it ([`crate::iterate::seal_head_digest`]).
+pub fn seal_engine_identity(
+    metrics: &mut ScoreMetrics,
+    hello: &bench_runner::Hello,
+    pinned_head_sha256: Option<&str>,
+) {
     use crate::iterate::seal_hello_text as seal;
     // Free-text hello fields are engine-chosen: sealed as digests, logged in full.
     metrics.engine_backend = hello.backend.as_deref().map(|t| seal("backend", t));
     metrics.engine_device = hello.device.as_deref().map(|t| seal("device", t));
     metrics.engine_protocol_version = hello.protocol_version;
-    use crate::iterate::seal_hex_digest;
+    use crate::iterate::{seal_digest_validity, seal_head_digest};
     metrics.head_provenance_sha256 = hello
         .head_provenance
         .as_ref()
-        .map(|p| seal_hex_digest("head_provenance.sha256", &p.sha256));
+        .map(|p| seal_head_digest(&p.sha256, pinned_head_sha256));
     metrics.runner_id = hello.runner.as_ref().map(|r| seal("runner.id", &r.id));
     metrics.runner_model_type = hello
         .runner
@@ -138,7 +146,7 @@ pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::He
     metrics.runner_manifest_sha256 = hello
         .runner
         .as_ref()
-        .map(|r| seal_hex_digest("runner.manifest_sha256", &r.manifest_sha256));
+        .map(|r| seal_digest_validity("runner.manifest_sha256", &r.manifest_sha256));
     metrics.runner_build = hello
         .runner
         .as_ref()
@@ -1360,7 +1368,7 @@ where
             }
             summary.push(format!(
                 "pair {pair} decode diverged at position {first}, replayed {} positions, \
-                 {off_argmax} off-argmax (budget {budget}), worst in-top gap {worst_gap:.4}",
+                 {off_argmax} off-argmax (budget {budget}), worst in-top gap {worst_gap:.2}",
                 stream.len() - first
             ));
         }
@@ -2290,7 +2298,7 @@ mod tests {
         format!(
             "sha256={} bytes={}",
             bench_core::hash::sha256_hex(text.as_bytes()),
-            text.len()
+            bench_runner::seal_byte_len(text.len())
         )
     }
 
@@ -2443,6 +2451,7 @@ mod tests {
                 }),
                 resident: None,
             },
+            None,
         );
         let json = payload.to_sealed_json().unwrap();
         assert_eq!(
@@ -2483,12 +2492,17 @@ mod tests {
         assert!(longest_array(&v) < rounds, "a per-round vector was sealed");
     }
 
-    /// Only exactly-64-lowercase-hex engine digests seal as themselves.
+    /// Engine digests never seal as themselves: `valid`/`invalid` for the manifest digest, and
+    /// `match`/`mismatch`/`valid`/`invalid` for the head digest against the reference leg's.
     #[test]
-    fn engine_digests_seal_only_when_they_are_sha256_hex() {
-        use crate::iterate::seal_hex_digest;
+    fn engine_digests_seal_as_a_verdict_never_the_value() {
+        use crate::iterate::{seal_digest_validity, seal_head_digest};
         let good = "0123456789abcdef".repeat(4);
-        assert_eq!(seal_hex_digest("f", &good), good);
+        let other = "fedcba9876543210".repeat(4);
+        assert_eq!(seal_digest_validity("f", &good), "valid");
+        assert_eq!(seal_head_digest(&good, Some(&good)), "match");
+        assert_eq!(seal_head_digest(&good, Some(&other)), "mismatch");
+        assert_eq!(seal_head_digest(&good, None), "valid");
         for bad in [
             good.to_uppercase(),
             good[..63].to_string(),
@@ -2496,8 +2510,92 @@ mod tests {
             format!("{}{PROMPT_MARKER}", &good[..44]),
             String::new(),
         ] {
-            assert_eq!(seal_hex_digest("f", &bad), "invalid", "{bad:?}");
+            assert_eq!(seal_digest_validity("f", &bad), "invalid", "{bad:?}");
+            assert_eq!(seal_head_digest(&bad, Some(&bad)), "invalid", "{bad:?}");
         }
+    }
+
+    /// An engine that reports MARKER NUMBERS — a non-zero `cache_memory`, a precise peak RAM, a
+    /// head digest other than the reference leg's — gets none of them into the sealed record.
+    #[test]
+    fn a_sealed_record_carries_no_engine_chosen_marker_numbers() {
+        const CACHE_MARKER: i64 = 1_234_567;
+        let golden = official_golden(None);
+        let failed = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || Session::connect(conformant_engine().cache_memory(CACHE_MARKER)).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        );
+        assert!(!failed.passed);
+        assert!(
+            failed.metrics.error.contains("cache_memory non-zero"),
+            "{}",
+            failed.metrics.error
+        );
+        let json = failed.to_sealed_json().unwrap();
+        assert!(!json.contains("1234567"), "{json}");
+
+        let timing = TimingResult {
+            peak_ram_gb: 13.371,
+            ..in_band_timing()
+        };
+        let mut payload = finish_official(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        let head = "0123456789abcdef".repeat(4);
+        let manifest = "13579bdf".repeat(8);
+        let pinned = "fedcba9876543210".repeat(4);
+        seal_engine_identity(
+            &mut payload.metrics,
+            &bench_runner::Hello {
+                nonce: "n".to_string(),
+                protocol_version: Some(1),
+                backend: None,
+                device: None,
+                capabilities: Vec::new(),
+                spec_modes: Vec::new(),
+                head_provenance: Some(bench_protocol::HeadProvenance {
+                    sha256: head.clone(),
+                    bytes: 1,
+                    file_count: 1,
+                }),
+                max_batch_size: None,
+                runner: Some(bench_protocol::RunnerIdentity {
+                    id: "r".to_string(),
+                    model_type: "m".to_string(),
+                    manifest_sha256: manifest.clone(),
+                    build: "b".to_string(),
+                }),
+                resident: None,
+            },
+            Some(&pinned),
+        );
+        let json = payload.to_sealed_json().unwrap();
+        for marker in ["13.371", "13.37", &head, &manifest] {
+            assert!(!json.contains(marker), "{marker} sealed: {json}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let m = &v["metrics"];
+        // 13.371 → 13.5 (nearest 0.5 GB) → 14 (the public 2-significant-figure coarsening).
+        assert_eq!(m["peak_ram_gb"], 14.0);
+        assert_eq!(m["head_provenance_sha256"], "mismatch");
+        assert_eq!(m["per_prompt"][0]["head_provenance_sha256"], "mismatch");
+        assert_eq!(m["runner_manifest_sha256"], "valid");
     }
 
     /// benchd's OWN refusals reach the sealed record byte-for-byte: they carry benchd's comparison
@@ -4636,7 +4734,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("verify_replay_disagreements 33"),
+                .contains("verify_replay_disagreements # > rejected drafts #"),
             "expected the named disagreement refusal, got: {}",
             payload.metrics.error
         );
@@ -4678,7 +4776,7 @@ mod tests {
             runner: None,
             resident: None,
         };
-        seal_engine_identity(&mut metrics, &hello);
+        seal_engine_identity(&mut metrics, &hello, Some(&"ab".repeat(32)));
         assert_eq!(
             metrics.engine_backend,
             Some(sealed_text(
@@ -4687,7 +4785,7 @@ mod tests {
         );
         assert_eq!(metrics.engine_device, Some(sealed_text("cuda sm_121")));
         assert_eq!(metrics.engine_protocol_version, Some(1));
-        assert_eq!(metrics.head_provenance_sha256, Some("ab".repeat(32)));
+        assert_eq!(metrics.head_provenance_sha256.as_deref(), Some("match"));
         assert_eq!(
             metrics.per_prompt[0].head_provenance_sha256, metrics.head_provenance_sha256,
             "the board reads the head digest off the per-prompt entry"
@@ -4709,6 +4807,7 @@ mod tests {
                 runner: None,
                 resident: None,
             },
+            None,
         );
         let json = ScorePayload {
             score: None,
@@ -4764,13 +4863,14 @@ mod tests {
                     load_epoch: 1_756_944_000,
                 }),
             },
+            None,
         );
         assert_eq!(
             metrics.runner_id,
             Some(sealed_text("layr/qwen4exp-125b-a6b"))
         );
         assert_eq!(metrics.runner_model_type, Some(sealed_text("qwen4_exp")));
-        assert_eq!(metrics.runner_manifest_sha256, Some("ab".repeat(32)));
+        assert_eq!(metrics.runner_manifest_sha256.as_deref(), Some("valid"));
         assert_eq!(metrics.runner_build, Some(sealed_text("c4089870")));
         assert_eq!(metrics.resident_pid, Some(4242));
         assert_eq!(metrics.resident_load_epoch, Some(1_756_944_000));
@@ -4788,7 +4888,7 @@ mod tests {
         let obj = v["metrics"].as_object().unwrap();
         assert_eq!(obj["runner_id"], sealed_text("layr/qwen4exp-125b-a6b"));
         assert_eq!(obj["runner_model_type"], sealed_text("qwen4_exp"));
-        assert_eq!(obj["runner_manifest_sha256"], "ab".repeat(32));
+        assert_eq!(obj["runner_manifest_sha256"], "valid");
         assert_eq!(obj["runner_build"], sealed_text("c4089870"));
         assert_eq!(obj["resident_pid"], 4242);
         assert_eq!(obj["resident_load_epoch"], 1_756_944_000u64);

@@ -8250,6 +8250,7 @@ mod tests {
                         step: 3,
                         expected: 903,
                         actual: 999_999,
+                        expected_from_engine: false,
                     })
                 } else {
                     ok_candidate()
@@ -8876,6 +8877,7 @@ mod tests {
                 step: 3,
                 expected: 703,
                 actual: 999_999,
+                expected_from_engine: false,
             })
         };
         let cfg = test_cfg(1, 1);

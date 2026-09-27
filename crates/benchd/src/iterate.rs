@@ -1171,7 +1171,9 @@ pub(crate) fn apply_timing_metrics(
     scoring: ScoringInputs,
 ) {
     let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
-    metrics.peak_ram_gb = finite_nonneg(timing.peak_ram_gb);
+    // Engine-reported: sealed to the nearest 0.5 GB, logged in full.
+    eprintln!("benchd: engine peak_ram_gb {}", timing.peak_ram_gb);
+    metrics.peak_ram_gb = (finite_nonneg(timing.peak_ram_gb) * 2.0).round() / 2.0;
     metrics.bandwidth_gb_per_token = 0.0;
     metrics.bandwidth_source = BANDWIDTH_SOURCE.to_string();
     metrics.decode_seconds_per_token = finite_nonneg(timing.decode_seconds_per_token);
@@ -1868,7 +1870,8 @@ pub(crate) fn seal_timing_surface_facts(
 }
 
 /// The SEALED form of an engine-supplied identity string (a `hello` field, the self-reported verify
-/// mode): `sha256=<hex> bytes=<n>` of the text, never the text. A later pair's engine has already
+/// mode): `sha256=<hex> bytes=<bucket>` of the text (the length as its power-of-two bucket,
+/// [`bench_runner::seal_byte_len`]), never the text. A later pair's engine has already
 /// seen the hidden prompts and the record goes back to the participant, so free text here would be
 /// a read-back channel. The plain text goes to benchd's stderr under `field`.
 pub(crate) fn seal_hello_text(field: &str, text: &str) -> String {
@@ -1876,25 +1879,46 @@ pub(crate) fn seal_hello_text(field: &str, text: &str) -> String {
     format!(
         "sha256={} bytes={}",
         bench_core::hash::sha256_hex(text.as_bytes()),
-        text.len()
+        bench_runner::seal_byte_len(text.len())
     )
 }
 
-/// The SEALED form of an engine-supplied digest (`head_provenance.sha256`,
-/// `runner.manifest_sha256`): the value itself when it is exactly 64 lowercase hex, else the
-/// literal `invalid`, so the field cannot carry free text. The raw value of a refused one goes to
-/// benchd's stderr under `field`.
-pub(crate) fn seal_hex_digest(field: &str, value: &str) -> String {
-    if value.len() == 64
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        value.to_string()
+}
+
+/// The SEALED form of an engine-supplied digest (`runner.manifest_sha256`): `valid` when it is
+/// exactly 64 lowercase hex, else `invalid` — never the value, which is 256 engine-chosen bits.
+/// The raw value goes to benchd's stderr under `field`.
+pub(crate) fn seal_digest_validity(field: &str, value: &str) -> String {
+    eprintln!("benchd: engine {field}: {value:?}");
+    if is_sha256_hex(value) {
+        "valid"
     } else {
-        eprintln!("benchd: engine {field} is not a sha256 digest: {value:?}");
-        "invalid".to_string()
+        "invalid"
     }
+    .to_string()
+}
+
+/// The SEALED form of the engine's `head_provenance.sha256`, never the value: `invalid` unless it
+/// is 64 lowercase hex, else `match` / `mismatch` against `pinned` — the head digest the TRUSTED
+/// reference leg reported on this run — or `valid` when this run has no reference leg to compare
+/// against. The raw value goes to benchd's stderr.
+pub(crate) fn seal_head_digest(value: &str, pinned: Option<&str>) -> String {
+    eprintln!("benchd: engine head_provenance.sha256: {value:?} (reference leg: {pinned:?})");
+    if !is_sha256_hex(value) {
+        "invalid"
+    } else {
+        match pinned {
+            Some(p) if p == value => "match",
+            Some(_) => "mismatch",
+            None => "valid",
+        }
+    }
+    .to_string()
 }
 
 /// The DEPTH a sealed `effective_spec` reports: `0` for `serial` (no drafter, so zero is its true
