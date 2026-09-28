@@ -43,6 +43,14 @@ from its own control leg. benchd never averages the pairs: the run scores the pa
 is the lower median over the pairs (the middle pair on an odd count, the lower of the two central
 pairs on an even count), and seals every pair as measured in `metrics.paired_legs`.
 
+A track may rotate its scored prompt per job. Its fixture then declares
+`live_golden_rotation: {"mode": "per_job_random", "pool": [...]}` and `speculative_oracles.<prompt>.mtp<d>`,
+and the trusted workflow draws one pool prompt per job from `/dev/urandom` and passes it as
+`--live-prompt`. benchd refuses at load a pool prompt that lacks its serial pin or any per-depth
+oracle, resolves the drawn prompt's pins from the fixture, refuses goldens of another prompt or with
+other pins, gates the control leg with the band captured on the fixture's `calibration_prompt`, and
+seals the name as `metrics.live_prompt`.
+
 Two gates then apply to that ratio. The decode speedup must be at or above
 `decode_speedup_floor`, and the prefill speedup must be at or above
 `prefill_speedup_floor`. Each axis has its own floor, and each floor fails the run on its own.

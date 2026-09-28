@@ -665,6 +665,14 @@ OPTIONS:
     --control-golden-bytes <N>   Integrity pin for --control-golden: refuse it unless its byte
                                  count matches (both pin flags must be given together; checked
                                  before parse).
+    --live-prompt <NAME>         The scored prompt the trusted workflow drew for THIS job from the
+                                 contract's live_golden_rotation.pool. benchd resolves that
+                                 prompt's serial pin and its per-depth oracle pin from --contract
+                                 itself, refuses a name outside the pool, a --golden or
+                                 --control-golden that names another prompt or carries another
+                                 pin, and seals the name as metrics.live_prompt. REQUIRED with
+                                 --mode official when the contract declares live_golden_rotation;
+                                 refused when it declares none.
     --mode <local-iterate|local-submit|official>
                                  Decode window: 128 (local-iterate, default), 1023 (local-submit), 128 (official)
     --score-path <OUT>           Output score path (default: score.local-iterate.json for
@@ -3781,6 +3789,9 @@ struct IterateArgs {
     /// The `--control-golden-sha256` / `--control-golden-bytes` integrity pin, checked on the raw
     /// bytes before the parse exactly as `golden_pin` is.
     control_golden_pin: Option<GoldenIntegrityPin>,
+    /// `--live-prompt <NAME>` — the prompt the trusted workflow drew for this job from the
+    /// contract's `live_golden_rotation.pool`. See [`resolve_iterate_live_prompt`].
+    live_prompt: Option<String>,
     /// `--engine-resource NAME=PATH` (repeatable) — the out-of-checkpoint inputs the runner needs
     /// to LOAD the model (runner contract §8.1/§13b). Each becomes `--resource NAME=PATH`
     /// on EVERY engine spawn this run makes. THE VALUE COMES FROM THIS COMMAND LINE, as the engine
@@ -3821,6 +3832,7 @@ static ITERATE_FLAGS: &[FlagSpec] = &[
     FlagSpec::value(&["--control-golden"]),
     FlagSpec::value(&["--control-golden-sha256"]),
     FlagSpec::value(&["--control-golden-bytes"]),
+    FlagSpec::value(&["--live-prompt"]),
     // Repeatable resource passthrough. The value is taken from THIS command line and is never
     // read out of a manifest, fixture or other submission-editable file.
     FlagSpec::repeatable(&[engine_resource::ENGINE_RESOURCE_FLAG]),
@@ -4256,9 +4268,26 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // the reference-model identity in the track contract, so this command has no pin to apply.
     // That is a SCOPED residual, not a hidden one — recorded as the
     // contract-less half of the #114 row (the ranked path, `measure-job`, always carries one).
+    // THE SCORED PROMPT. On a track that rotates its scored prompt per job, the pins the two
+    // goldens are verified against are the ones the CONTRACT names for the drawn prompt — never
+    // only the ones on this command line.
+    let live_prompt = resolve_iterate_live_prompt(
+        loaded_contract
+            .as_ref()
+            .and_then(|l| l.live_prompts.as_ref()),
+        args,
+    )?;
+    let golden_pin = match live_prompt.as_ref() {
+        Some(live) => Some(live.oracle.clone()),
+        None => args.golden_pin.clone(),
+    };
+    let control_golden_pin = match live_prompt.as_ref() {
+        Some(live) if args.control_golden.is_some() => Some(live.serial.clone()),
+        _ => args.control_golden_pin.clone(),
+    };
     let golden = load_golden_checked(
         &args.golden,
-        args.golden_pin.as_ref(),
+        golden_pin.as_ref(),
         args.mode.golden_required_steps(&window),
         None,
         &track_id,
@@ -4627,9 +4656,15 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 args.golden.display()
             )
         })?;
+        // On a rotating track the band is captured on the contract's calibration_prompt and gates
+        // the control leg whichever pool prompt was drawn (whether one band holds across the pool
+        // is being measured; per-prompt bands would replace this).
+        let band_prompt = live_prompt
+            .as_ref()
+            .map_or(prompt.as_str(), |l| l.calibration_prompt.as_str());
         calibration
             .calibration
-            .check_identity(&track_id, &box_name, &prompt)?;
+            .check_identity(&track_id, &box_name, band_prompt)?;
 
         // LEG 1's OWN GOLDEN. The control leg is SERIAL, so it must verify its decode tokens
         // against the SERIAL tape. On a track whose timed oracle at the declared depth is
@@ -4664,7 +4699,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 }
                 Some(load_golden_checked(
                     path,
-                    args.control_golden_pin.as_ref(),
+                    control_golden_pin.as_ref(),
                     args.mode.golden_required_steps(&window),
                     None,
                     &track_id,
@@ -5086,6 +5121,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // given, leaving the local modes' sealed bytes unchanged.
     let mut payload = payload;
     payload.metrics.contract_sha256 = loaded_contract.as_ref().map(|l| l.sha256.clone());
+    // THE DRAWN PROMPT'S NAME (public: one of the pool), so a result says which prompt it timed.
+    payload.metrics.live_prompt = live_prompt.as_ref().map(|l| l.name.clone());
     // WHICH SOURCE DECIDED EACH GROUP (STEP 1, David 2026-09-15). The digest above names the bytes;
     // this names which groups of the scored regime those bytes actually decided and which still
     // came from the in-tree per-track table. A sealed score therefore says what regime it was
@@ -5306,6 +5343,84 @@ fn env_track_id() -> Option<String> {
 /// and how [`iterate_platform`] resolves the platform: ONE track id, read once, keying every
 /// per-track fact. FAIL-CLOSED both ways — no track id refuses, and a track whose fixture declares
 /// no model shape refuses BY NAME rather than falling back to any tree default.
+/// Resolve `--live-prompt` against the contract's rotation (`None` when it declares none).
+///
+/// - no rotation: `--live-prompt` is refused by name; absent, nothing changes.
+/// - rotation, no `--live-prompt`: refused on `--mode official` (the ranked workflow always draws
+///   one); a local mode runs as before.
+/// - both: the name must be a pool prompt; `--golden` (and `--control-golden`) must name that
+///   prompt; any pin given on the command line must equal the contract's pin for that prompt at
+///   the declared depth (serial for the control golden). The resolved pins then REPLACE the
+///   command-line ones, so the goldens are verified against the contract.
+fn resolve_iterate_live_prompt(
+    rotation: Option<&bench_core::live_prompt::LivePromptRotation>,
+    args: &IterateArgs,
+) -> Result<Option<bench_core::live_prompt::ResolvedLivePrompt>, String> {
+    let (rotation, name) =
+        match (rotation, args.live_prompt.as_deref()) {
+            (None, None) => return Ok(None),
+            (None, Some(name)) => {
+                return Err(format!(
+                "--live-prompt {name:?} names a drawn prompt, but the --contract fixture declares \
+                 no live_golden_rotation; the only scored prompt is its live_golden"
+            ))
+            }
+            (Some(_), None) if args.mode == Mode::Official => return Err(
+                "the --contract fixture declares live_golden_rotation, so an official run scores \
+                 the prompt the ranked workflow drew for this job: pass it as --live-prompt"
+                    .to_string(),
+            ),
+            (Some(_), None) => return Ok(None),
+            (Some(rotation), Some(name)) => (rotation, name),
+        };
+    let depth = match args.spec.as_ref() {
+        None => 0,
+        Some(spec) if spec.mode == "serial" => 0,
+        Some(spec) => match (spec.mode.as_str(), spec.mtp.as_ref().and_then(|m| m.depth)) {
+            ("mtp", Some(depth)) => depth,
+            (mode, _) => {
+                return Err(format!(
+                    "--live-prompt {name:?}: the contract pins a timed oracle per MTP depth, and a \
+                     {mode:?} spec with no explicit mtp depth names none of them"
+                ))
+            }
+        },
+    };
+    let resolved = rotation.resolve(name, depth)?;
+    for (flag, path) in [
+        ("--golden", Some(args.golden.as_path())),
+        ("--control-golden", args.control_golden.as_deref()),
+    ] {
+        let Some(path) = path else { continue };
+        if baseline::golden_prompt_name(path).as_deref() != Some(name) {
+            return Err(format!(
+                "{flag} {} does not measure the drawn prompt {name:?} (--live-prompt); both legs \
+                 of every pair measure the one prompt drawn for the job",
+                path.display()
+            ));
+        }
+    }
+    for (flag, given, want) in [
+        ("--golden", args.golden_pin.as_ref(), &resolved.oracle),
+        (
+            "--control-golden",
+            args.control_golden_pin.as_ref(),
+            &resolved.serial,
+        ),
+    ] {
+        if let Some(given) = given {
+            if given != want {
+                return Err(format!(
+                    "{flag} pin (sha256 {}, {} bytes) is not the contract's pin for prompt \
+                     {name:?} at draft depth {depth} (sha256 {}, {} bytes)",
+                    given.sha256, given.bytes, want.sha256, want.bytes
+                ));
+            }
+        }
+    }
+    Ok(Some(resolved))
+}
+
 fn iterate_model_identity(
     contract: &contract::Contract,
     env_track_id: Option<&str>,
@@ -6680,6 +6795,7 @@ fn build_iterate_args(flags: &ParsedFlags) -> Result<IterateArgs, String> {
         box_name: flags.string("--box"),
         control_golden: flags.path("--control-golden"),
         control_golden_pin,
+        live_prompt: flags.string("--live-prompt"),
         engine_resources,
     })
 }
@@ -7604,6 +7720,238 @@ mod tests {
                 "the only denied read is the private golden: {profile}"
             );
         }
+    }
+
+    /// A contract that rotates its scored prompt over `pool`, with every prompt in `pinned`
+    /// carrying its serial pin and an oracle for each permitted depth 1..=3. Serial pins are
+    /// `a`-repeated with bytes 100+i; the mtp<d> oracle of prompt i is `<d>`-repeated with bytes
+    /// 1000*(i+1)+d.
+    fn rotation_contract(pool: &[&str], pinned: &[&str]) -> serde_json::Value {
+        let names = ["botany", "beagle", "travel"];
+        let mut oracles = serde_json::Map::new();
+        for (i, name) in names.iter().enumerate() {
+            if pinned.contains(name) {
+                let per: serde_json::Map<String, serde_json::Value> = (1..=3u64)
+                    .map(|d| {
+                        (
+                            format!("mtp{d}"),
+                            serde_json::json!({
+                                "r2_path": format!("p/{name}.mtp{d}.golden.json"),
+                                "sha256": d.to_string().repeat(64),
+                                "bytes": 1000 * (i as u64 + 1) + d,
+                            }),
+                        )
+                    })
+                    .collect();
+                oracles.insert(name.to_string(), serde_json::Value::Object(per));
+            }
+        }
+        serde_json::json!({
+            "live_golden": "botany",
+            "live_golden_rotation": {"mode": "per_job_random", "pool": pool},
+            "calibration_prompt": "botany",
+            "timed_prompt_pool": names.iter().enumerate().map(|(i, n)| serde_json::json!({
+                "r2_path": format!("p/{n}.golden.json"),
+                "sha256": "a".repeat(64),
+                "bytes": 100 + i as u64,
+            })).collect::<Vec<_>>(),
+            "speculative_oracles": oracles,
+            "mtp_head": {"permitted_draft_depths": [1, 2, 3]},
+        })
+    }
+
+    fn rotation_of(v: &serde_json::Value) -> bench_core::live_prompt::LivePromptRotation {
+        bench_core::live_prompt::rotation_from_contract(&serde_json::to_vec(v).unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn live_args(extra: &[&str]) -> IterateArgs {
+        let argv: Vec<String> = ["--engine", "e", "--weights", "w", "--contract", "c.json"]
+            .iter()
+            .chain(extra)
+            .map(|s| s.to_string())
+            .collect();
+        parse_iterate_args(&argv).unwrap().unwrap()
+    }
+
+    /// THE DRAWN PROMPT's pins come from the CONTRACT: per prompt, per depth, serial for the
+    /// control leg — and they replace whatever the command line carried.
+    #[test]
+    fn live_prompt_resolves_the_drawn_prompts_pins_per_depth() {
+        let rotation = rotation_of(&rotation_contract(
+            &["botany", "beagle"],
+            &["botany", "beagle"],
+        ));
+        let args = live_args(&[
+            "--mode",
+            "official",
+            "--live-prompt",
+            "beagle",
+            "--mtp-depth",
+            "2",
+            "--golden",
+            "/g/beagle.mtp2.golden.json",
+            "--control-golden",
+            "/g/beagle.golden.json",
+        ]);
+        let live = resolve_iterate_live_prompt(Some(&rotation), &args)
+            .unwrap()
+            .expect("a drawn prompt resolves");
+        assert_eq!(live.name, "beagle");
+        assert_eq!(live.oracle.sha256, "2".repeat(64));
+        assert_eq!(live.oracle.bytes, 2002);
+        assert_eq!(live.serial.bytes, 101);
+        assert_eq!(live.calibration_prompt, "botany");
+
+        // The serial leg of the SAME prompt resolves the serial pin as its oracle.
+        let serial = live_args(&[
+            "--mode",
+            "official",
+            "--live-prompt",
+            "botany",
+            "--golden",
+            "/g/botany.golden.json",
+            "--golden-sha256",
+            &"a".repeat(64),
+            "--golden-bytes",
+            "100",
+        ]);
+        let live = resolve_iterate_live_prompt(Some(&rotation), &serial)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.oracle, live.serial);
+        assert_eq!(live.oracle.bytes, 100);
+    }
+
+    #[test]
+    fn live_prompt_refusals_are_by_name() {
+        let rotation = rotation_of(&rotation_contract(
+            &["botany", "beagle"],
+            &["botany", "beagle"],
+        ));
+        let refuse = |extra: &[&str], needle: &str| {
+            let e = resolve_iterate_live_prompt(Some(&rotation), &live_args(extra)).unwrap_err();
+            assert!(e.contains(needle), "wanted {needle:?} in {e}");
+        };
+        // A name outside the pool (travel is pinned but not drawable).
+        refuse(
+            &[
+                "--mode",
+                "official",
+                "--live-prompt",
+                "travel",
+                "--golden",
+                "/g/travel.golden.json",
+            ],
+            "not in the contract's live_golden_rotation.pool",
+        );
+        // An official run on a rotating track with no drawn prompt.
+        refuse(
+            &["--mode", "official", "--golden", "/g/botany.golden.json"],
+            "pass it as --live-prompt",
+        );
+        // A golden of another prompt.
+        refuse(
+            &[
+                "--mode",
+                "official",
+                "--live-prompt",
+                "beagle",
+                "--golden",
+                "/g/botany.golden.json",
+            ],
+            "does not measure the drawn prompt \"beagle\"",
+        );
+        refuse(
+            &[
+                "--mode",
+                "official",
+                "--live-prompt",
+                "beagle",
+                "--golden",
+                "/g/beagle.golden.json",
+                "--control-golden",
+                "/g/botany.golden.json",
+            ],
+            "--control-golden /g/botany.golden.json does not measure the drawn prompt",
+        );
+        // A command-line pin that is not the contract's for that prompt and depth.
+        refuse(
+            &[
+                "--mode",
+                "official",
+                "--live-prompt",
+                "beagle",
+                "--mtp-depth",
+                "1",
+                "--golden",
+                "/g/beagle.mtp1.golden.json",
+                "--golden-sha256",
+                &"2".repeat(64),
+                "--golden-bytes",
+                "2002",
+            ],
+            "--golden pin (sha256 2222",
+        );
+        // A depth the contract pins no oracle for.
+        refuse(
+            &[
+                "--mode",
+                "official",
+                "--live-prompt",
+                "beagle",
+                "--mtp-depth",
+                "4",
+                "--golden",
+                "/g/beagle.mtp4.golden.json",
+            ],
+            "no timed oracle at draft depth 4",
+        );
+        // No rotation declared, but a drawn prompt given.
+        let e = resolve_iterate_live_prompt(
+            None,
+            &live_args(&[
+                "--live-prompt",
+                "botany",
+                "--golden",
+                "/g/botany.golden.json",
+            ]),
+        )
+        .unwrap_err();
+        assert!(e.contains("declares no live_golden_rotation"), "{e}");
+        // …and the fallbacks: no rotation and no flag, or a local run with no flag, change nothing.
+        let local = live_args(&["--golden", "/g/botany.golden.json"]);
+        assert_eq!(resolve_iterate_live_prompt(None, &local).unwrap(), None);
+        assert_eq!(
+            resolve_iterate_live_prompt(Some(&rotation), &local).unwrap(),
+            None
+        );
+    }
+
+    /// A contract whose rotation pool holds a prompt without all of its pins is refused at LOAD,
+    /// so no command that reads it — the scored run included — ever starts.
+    #[test]
+    fn a_contract_with_an_unpinned_pool_prompt_refuses_to_load() {
+        let dir = std::env::temp_dir().join(format!("benchd-rotation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("contract.json");
+        let mut v = rotation_contract(&["botany", "beagle"], &["botany", "beagle"]);
+        v["speculative_oracles"]["beagle"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mtp2");
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let e = contract::load(&path).unwrap_err();
+        assert!(e.contains("speculative_oracles.beagle.mtp2"), "{e}");
+        let v = rotation_contract(&["botany", "beagle"], &["botany", "beagle"]);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let loaded = contract::load(&path).unwrap();
+        assert_eq!(
+            loaded.live_prompts.map(|r| r.pool),
+            Some(vec!["botany".to_string(), "beagle".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// LEG 1's OWN GOLDEN parses, and it is pinned by the SAME rule the candidate golden is:
@@ -9666,6 +10014,8 @@ mod tests {
             &"d".repeat(64),
             "--control-golden-bytes",
             "43",
+            "--live-prompt",
+            "botany",
             "--engine-resource",
             "qwen4exp.ngramRowSource=/rows",
             "--engine-resource",
@@ -9706,6 +10056,7 @@ mod tests {
         let ctl = parsed.control_golden_pin.as_ref().unwrap();
         assert_eq!(ctl.sha256, "d".repeat(64));
         assert_eq!(ctl.bytes, 43);
+        assert_eq!(parsed.live_prompt.as_deref(), Some("botany"));
         assert_eq!(parsed.engine_resources.len(), 2);
         assert_eq!(parsed.engine_resources[0].name, "qwen4exp.ngramRowSource");
         assert_eq!(parsed.engine_resources[0].path, "/rows");
