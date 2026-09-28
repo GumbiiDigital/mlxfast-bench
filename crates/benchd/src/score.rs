@@ -324,6 +324,11 @@ pub struct ScoreMetrics {
     /// reads a different golden than the candidate leg (`--control-golden`); this states which one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_golden_sha256: Option<String>,
+    /// ADDITIVE — the NAME of the prompt this run scored, on a track that draws its scored prompt
+    /// per job from the contract's `live_golden_rotation.pool` (`--live-prompt`). Public (one of
+    /// the pool) so results are auditable; absent on a track that does not rotate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_prompt: Option<String>,
     /// ADDITIVE — the reference tree's engine commit the calibration was captured at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_reference_commit: Option<String>,
@@ -600,6 +605,7 @@ impl ScoreMetrics {
             baseline_box: self.baseline_box.clone(),
             baseline_calibration_sha256: self.baseline_calibration_sha256.clone(),
             baseline_golden_sha256: self.baseline_golden_sha256.clone(),
+            live_prompt: self.live_prompt.clone(),
             baseline_reference_commit: self.baseline_reference_commit.clone(),
             baseline_band_passed: self.baseline_band_passed,
             baseline_leg_prefill_seconds_per_token: self.baseline_leg_prefill_seconds_per_token,
@@ -1386,6 +1392,7 @@ mod sealed_key_pin_tests {
                 baseline_box: Some("v108".to_string()),
                 baseline_calibration_sha256: Some("v110".to_string()),
                 baseline_golden_sha256: Some("v112".to_string()),
+                live_prompt: Some("v113".to_string()),
                 baseline_reference_commit: Some("v114".to_string()),
                 baseline_band_passed: Some(true),
                 baseline_leg_prefill_seconds_per_token: Some(118.5),
@@ -1511,6 +1518,7 @@ mod sealed_key_pin_tests {
     "gpqa_ttft_source": "v23",
     "harness_hash": "v58",
     "head_provenance_sha256": "v92",
+    "live_prompt": "v113",
     "local_phases": {
       "correctness": "not_run",
       "correctness_checked_steps": 0,

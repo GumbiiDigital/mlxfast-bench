@@ -18,6 +18,7 @@ pub mod free_run;
 pub mod golden;
 pub mod harness_hash;
 pub mod hash;
+pub mod live_prompt;
 pub mod near_tie;
 pub mod per_stream_attestation;
 pub mod prefill_window;

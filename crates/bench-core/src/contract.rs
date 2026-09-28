@@ -1123,6 +1123,10 @@ pub struct LoadedContract {
     /// artifact records the verdicts but not the bytes that produced them, so a later reader cannot
     /// tell which fixture was in force. `metrics.golden_hash` records the golden the same way.
     pub sha256: String,
+    /// The fixture's scored-prompt rotation, validated from the SAME bytes: `None` when it declares
+    /// no `live_golden_rotation`. A rotation whose pool holds a prompt without its serial pin or
+    /// any per-depth oracle refuses the load ([`crate::live_prompt::rotation_from_contract`]).
+    pub live_prompts: Option<crate::live_prompt::LivePromptRotation>,
 }
 
 /// Read, digest, parse and CERTIFY a `--contract` file. ONE read of ONE file: every
@@ -1134,6 +1138,7 @@ pub fn load(path: &Path) -> Result<LoadedContract, String> {
     Ok(LoadedContract {
         contract: Contract::parse(&bytes)?,
         sha256,
+        live_prompts: crate::live_prompt::rotation_from_contract(&bytes)?,
     })
 }
 
