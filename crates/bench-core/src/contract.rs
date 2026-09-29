@@ -88,11 +88,32 @@ pub struct Contract {
     pub allowed_modes: Option<Vec<String>>,
     /// PAIRS PER SCORED RUN on the paired per-box path (David 2026-09-09: "2 pairs on both mlx and
     /// cuda"; "1 pair is not sufficient"). Each pair is one serial-control leg on the reference
-    /// tree followed by one candidate leg, same prompt, same box. The fixture is the ONLY source
-    /// of this count: no flag, no environment, no default — so a box cannot silently run fewer
-    /// pairs than the track declares.
+    /// tree followed by one candidate leg, same box. Both legs of a pair measure the same prompt.
+    /// A run given N goldens measures golden `(k - 1) mod N` in pair `k`, so the count must be a
+    /// multiple of N. The fixture is the ONLY source of this count: no flag, no environment, no
+    /// default — so a box cannot silently run fewer pairs than the track declares.
     #[serde(default)]
     pub official_pairs: Option<u32>,
+    /// THE TIMED TOKEN TOLERANCE of the paired path, in tokens per thousand (David 2026-09-28,
+    /// the blanket 10 % rule of 2026-08-25 moved to the single-stream paired path).
+    ///
+    /// Absent: every timed decode token of the candidate leg must equal the golden's oracle, and
+    /// one different token fails the run. Present with value N: the reference engine replays the
+    /// candidate's own tokens teacher-forced, and a pair fails when more than N per thousand of
+    /// its tokens differ from the reference engine's choice for the same prefix. `0` means exact.
+    /// The fixture is the ONLY source: no flag, no environment.
+    #[serde(default)]
+    pub timed_token_tolerance_per_thousand: Option<u32>,
+    /// THE NEAR-TIE LIMIT of the timed token tolerance (David 2026-09-28: "10% for near ties
+    /// only"). It needs [`Contract::timed_token_tolerance_per_thousand`].
+    ///
+    /// Absent: every different token counts against the tolerance. Present with value G: a
+    /// different token is tolerated only when it is a NEAR TIE: the candidate's token is the
+    /// reference engine's second choice, and the relative gap between the reference's first and
+    /// second choice ([`crate::near_tie::relative_gap`]) is `<= G`. Any other different token
+    /// fails the run, whatever the count. G is finite, at least 0 and less than 1.
+    #[serde(default)]
+    pub timed_token_near_tie_relative_gap: Option<f64>,
     /// THE DECODE SPEEDUP FLOOR this project's scored run must clear (David 2026-09-09: 0.95).
     /// The fixture is the ONLY source on the scoring path — no flag, no environment, no default —
     /// so a track cannot be scored against a floor it never declared, and each project sets its
@@ -275,6 +296,8 @@ impl Contract {
         official_scoring_enabled: None,
         allowed_modes: None,
         official_pairs: None,
+        timed_token_tolerance_per_thousand: None,
+        timed_token_near_tie_relative_gap: None,
         decode_speedup_floor: None,
         prefill_speedup_floor: None,
         scored_batch_size: None,
@@ -1128,6 +1151,42 @@ pub fn official_pairs(contract: &Contract, track_id: &str) -> Result<usize, Stri
     }
 }
 
+/// A timed token tolerance is a count per thousand tokens, so it is at most 1000. `0` is legal
+/// and means exact. Absent declares nothing and is not refused.
+fn certify_timed_token_tolerance(declared: Option<u32>, track_id: &str) -> Result<(), String> {
+    match declared {
+        Some(n) if n > 1000 => Err(format!(
+            "the --contract track fixture for {track_id:?} declares \
+             timed_token_tolerance_per_thousand: {n}; a tolerance per thousand tokens must be at \
+             most 1000; refusing"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A near-tie limit is a relative gap, so it is finite, at least 0 and less than 1. It narrows the
+/// timed token tolerance, so a fixture that declares it without the tolerance is refused.
+fn certify_near_tie_relative_gap(contract: &Contract, track_id: &str) -> Result<(), String> {
+    let Some(gap) = contract.timed_token_near_tie_relative_gap else {
+        return Ok(());
+    };
+    if !(gap.is_finite() && (0.0..1.0).contains(&gap)) {
+        return Err(format!(
+            "the --contract track fixture for {track_id:?} declares \
+             timed_token_near_tie_relative_gap: {gap}; a near-tie relative gap must be finite, at \
+             least 0 and less than 1; refusing"
+        ));
+    }
+    if contract.timed_token_tolerance_per_thousand.is_none() {
+        return Err(format!(
+            "the --contract track fixture for {track_id:?} declares \
+             timed_token_near_tie_relative_gap: {gap} but no timed_token_tolerance_per_thousand; \
+             the near-tie limit narrows that tolerance and has no meaning without it; refusing"
+        ));
+    }
+    Ok(())
+}
+
 /// THE BATCH SIZE IS A CONFIGURED WIDTH, not a constant benchd checks a fixture against (David
 /// 2026-09-15: "Benchd should support batching. Batching as part of the configuration.").
 ///
@@ -1193,6 +1252,8 @@ impl Contract {
         if self.official_pairs.is_some() {
             official_pairs(self, track_id)?;
         }
+        certify_timed_token_tolerance(self.timed_token_tolerance_per_thousand, track_id)?;
+        certify_near_tie_relative_gap(self, track_id)?;
         certify_scored_batch_size(self.scored_batch_size, track_id)?;
         certify_scored_regime(self, track_id)?;
         certify_official_baseline(self, track_id)?;
@@ -1383,6 +1444,71 @@ mod official_pairs_tests {
         let err = Contract::parse(br#"{"official_scoring_enabled": true, "official_pairs": 0}"#)
             .unwrap_err();
         assert!(err.contains("official_pairs: 0"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod timed_token_tolerance_tests {
+    use super::*;
+
+    /// Absent keeps the exact rule, 0 and 1000 are legal, and a value above 1000 is refused at
+    /// the parse by name.
+    #[test]
+    fn the_tolerance_is_certified_at_the_parse() {
+        let absent = Contract::parse(br#"{"official_pairs": 2}"#).unwrap();
+        assert_eq!(absent.timed_token_tolerance_per_thousand, None);
+        for n in [0u32, 100, 1000] {
+            let doc = format!(r#"{{"timed_token_tolerance_per_thousand": {n}}}"#);
+            let c = Contract::parse(doc.as_bytes()).unwrap();
+            assert_eq!(c.timed_token_tolerance_per_thousand, Some(n));
+        }
+        let err =
+            Contract::parse(br#"{"track_id": "t", "timed_token_tolerance_per_thousand": 1001}"#)
+                .unwrap_err();
+        assert!(
+            err.contains("timed_token_tolerance_per_thousand: 1001"),
+            "{err}"
+        );
+    }
+
+    /// The near-tie gap needs the tolerance, and it must be finite, at least 0 and below 1.
+    #[test]
+    fn the_near_tie_gap_is_certified_at_the_parse() {
+        let ok = Contract::parse(
+            br#"{"timed_token_tolerance_per_thousand": 100, "timed_token_near_tie_relative_gap": 0.05}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.timed_token_near_tie_relative_gap, Some(0.05));
+        let zero = Contract::parse(
+            br#"{"timed_token_tolerance_per_thousand": 100, "timed_token_near_tie_relative_gap": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.timed_token_near_tie_relative_gap, Some(0.0));
+
+        let err = Contract::parse(br#"{"timed_token_near_tie_relative_gap": 0.05}"#).unwrap_err();
+        assert!(
+            err.contains("timed_token_near_tie_relative_gap: 0.05")
+                && err.contains("no timed_token_tolerance_per_thousand"),
+            "{err}"
+        );
+        for bad in ["1", "1.5", "-0.01"] {
+            let doc = format!(
+                r#"{{"timed_token_tolerance_per_thousand": 100, "timed_token_near_tie_relative_gap": {bad}}}"#
+            );
+            let err = Contract::parse(doc.as_bytes()).unwrap_err();
+            assert!(err.contains("less than 1"), "{bad}: {err}");
+        }
+        // JSON has no NaN or infinity, so the non-finite case is certified on the value itself.
+        let non_finite = Contract {
+            timed_token_tolerance_per_thousand: Some(100),
+            timed_token_near_tie_relative_gap: Some(f64::NAN),
+            ..Contract::NONE_DECLARED
+        };
+        let err = non_finite.certify().unwrap_err();
+        assert!(
+            err.contains("timed_token_near_tie_relative_gap: NaN"),
+            "{err}"
+        );
     }
 }
 

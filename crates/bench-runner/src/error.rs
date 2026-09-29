@@ -155,11 +155,11 @@ impl fmt::Display for RunnerError {
             RunnerError::TokenMismatch {
                 label,
                 step,
-                expected,
+                expected: _,
                 actual,
             } => write!(
                 f,
-                "{label} mismatch at step {step}: expected oracle token {expected}, engine returned {actual}"
+                "{label} mismatch at step {step}: the engine returned token {actual}, which is not the token the golden expects at this step"
             ),
             RunnerError::SessionDiscarded => {
                 write!(f, "session discarded by a prior error; no further requests permitted")

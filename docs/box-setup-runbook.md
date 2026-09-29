@@ -29,12 +29,13 @@ Both Qwen 3.8 125B-A6B tracks measure their own denominator. A ranked run
 measures the pairs the track fixture declares in `official_pairs` — 2 on both
 platforms — on this box, in the same job. Every pair is a SERIAL-CONTROL leg on
 the organizer-staged reference tree and then a CANDIDATE leg on the submission
-tree. Each pair scores on its own control leg, and the run scores the pair whose
+tree, both on the same prompt. When the run is given N goldens, pair k measures
+golden (k - 1) mod N. Each pair scores on its own control leg, and the run scores the pair whose
 composite is the lower median over the pairs. Pairs are never averaged. No
 denominator is pinned anywhere.
 
-What the box needs is its own HEALTH BAND for that control leg. Write it once
-per box with:
+What the box needs is its own HEALTH BAND for that control leg, one for each
+prompt. Write it once per box with:
 
 ```sh
 benchd calibrate-baseline \
@@ -45,11 +46,15 @@ benchd calibrate-baseline \
   --out "$REFERENCE_WORKSPACE/baseline-calibration.json"
 ```
 
+Give `--golden` once for each prompt a ranked run on this box measures. The verb
+writes one file with one band for each prompt, and the ranked run checks each
+control leg against the band of the prompt it measured.
+
 `--weights` defaults to the reference tree's own transform output
 (`$REFERENCE_WORKSPACE/weights`): the control leg must never load the
 candidate's, because the transform is participant-editable.
 
-The verb runs the ranked path's own control leg four times, under the full
+The verb runs the ranked path's own control leg four times for each prompt, under the full
 official methodology, and refuses by name (`CALIBRATION-CV-EXCEEDED`) when the
 box is too noisy for the mean to describe it. Repeat it whenever the organizer
 moves the reference tree.

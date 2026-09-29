@@ -87,6 +87,15 @@ the middle pair on an odd count, the lower of the two central pairs on an even
 count. Pairs are never averaged. Every enforced figure in `score.json` is that
 one pair's, and the other pairs stay in `metrics.paired_legs` as measured.
 
+A run can measure more than one prompt. The command line gives one `--golden`
+for each prompt, N in all. Pair k (1-based) measures golden (k - 1) mod N, in
+command-line order, so `official_pairs` must be a multiple of N. The control
+leg and the candidate leg of one pair measure the same prompt. Each row of
+`metrics.paired_legs` carries `prompt_sha256`, the golden that pair measured.
+`metrics.per_prompt` has one record for each golden, in command-line order.
+`golden_hash`, `baseline_golden_sha256` and the run-level drafting facts are
+the scored pair's.
+
 The window split of section 2 is what makes the two gains separable. Without it
 there is one whole-window number and no prefill half to score.
 

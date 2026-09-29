@@ -132,8 +132,9 @@ A track scores against a baseline in ONE of two ways. The two never mix.
 Ruled by David on 2026-09-08. Each ranked box has its own baseline, and the
 baseline is a MEASUREMENT, not a pin. A ranked run measures the number of PAIRS
 the track fixture declares in `official_pairs` — 2 on both platforms — on ONE
-box in ONE job, on the one fixed prompt the fixture's live golden carries. Every
-pair is the same two legs in the same order:
+box in ONE job. The run is given N goldens, and pair k (1-based) measures golden
+(k - 1) mod N. Every pair is the same two legs in the same order, on the same
+prompt:
 
 1. the SERIAL-CONTROL leg on the organizer-staged reference tree
    (`MLXFAST_BASELINE_WORKSPACE`), with no speculation;

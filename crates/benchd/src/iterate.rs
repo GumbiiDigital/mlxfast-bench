@@ -3053,6 +3053,7 @@ mod tests {
             effective_spec: None,
             free_run_audit: None,
             phase_window: None,
+            emitted_tokens: Vec::new(),
         };
 
         let payload = local_iterate_score(
@@ -3102,6 +3103,7 @@ mod tests {
             effective_spec: None,
             free_run_audit: None,
             phase_window: None,
+            emitted_tokens: Vec::new(),
         };
         let payload = local_iterate_score(
             Mode::LocalIterate,
@@ -3153,6 +3155,7 @@ mod tests {
                 effective_spec: None,
                 free_run_audit: None,
                 phase_window: None,
+                emitted_tokens: Vec::new(),
             };
             let payload = local_iterate_score(
                 mode,

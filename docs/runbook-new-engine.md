@@ -14,7 +14,7 @@ This page covers the track. Do it once per track. A ranked run is paired, and th
 | goldens | `correctness_prompts/<track_id>/` in the engine repo | the timed pool, the live golden, one oracle for each permitted draft depth |
 | per-box state | the runner service environment on the box | the track label, the built reference tree, this box's calibration file |
 
-The fixture names the rest: `live_golden` is the one scored prompt, `live_golden_speculative` holds
+The fixture names the rest: `live_golden` is a scored prompt, `live_golden_speculative` holds
 one tape for each depth, `baseline_reference_commit` is the commit the reference tree must sit at,
 `official_pairs` is the number of pairs one ranked run measures (2 on both platforms, David ruling
 2026-09-09), `decode_speedup_floor` and `prefill_speedup_floor` are the two speedup floors the
@@ -25,19 +25,32 @@ fixture or constant holds one either. benchd refuses a golden that carries
 
 Two names carry the per-box state. `MLXFAST_BASELINE_WORKSPACE` is the built reference tree;
 `MLXFAST_BASELINE_CALIBRATION` is this box's `baseline-calibration.json`. `tools/calibrate-box.sh`
-writes that file. It runs `benchd calibrate-baseline` for 4 passes on the reference tree, and it
-refuses to write when the coefficient of variation is above 1 % on either axis. The file is a health
-band for the serial-control leg, never a denominator: a stale file cannot move a score, only stop a
+writes that file. It runs `benchd calibrate-baseline` for 4 passes on the reference tree for each
+prompt, and it refuses to write when the coefficient of variation is above 1 % on either axis. The
+file holds one band for each prompt. A band is a health band for the serial-control leg, never a
+denominator: a stale file cannot move a score, only stop a
 run. benchd itself is built and published from bench `main` to the dist channel. The engine names
 the channel only; `tools/fetch-benchd.sh` resolves it and verifies the binary against
 `benchd.manifest.json`. A ranked box holds that pair offline in `BENCHD_BIN_DIR`.
 
-Each ranked job measures `official_pairs` pairs on the same box, in the same job, over the live
-golden. Every pair is the same two legs in the same order. Leg 1 is the **serial-control leg**, on
+Each ranked job measures `official_pairs` pairs on the same box, in the same job, over the goldens
+on its command line (one `--golden` for each prompt, N in all). Pair k (1-based) measures golden
+(k - 1) mod N, so `official_pairs` must be a multiple of N. Every pair is the same two legs in the
+same order, and both legs of a pair measure the same prompt. Leg 1 is the **serial-control leg**, on
 the reference tree, with no speculation: benchd verifies its tokens against the serial tape
-(`--control-golden`), checks its cost against this box's band, and stops the run when the leg falls
-outside. Leg 2 is the **candidate leg**, on the submission tree at its declared draft depth,
-verified against that depth's tape. Each leg boots its own engine and loads the model once. Each
+(`--control-golden`), checks its cost against this box's band for that prompt, and stops the run
+when the leg falls outside. Leg 2 is the **candidate leg**, on the submission tree at its declared draft depth,
+verified against that depth's tape. One different timed token fails the run, unless the fixture
+declares `timed_token_tolerance_per_thousand` (N). With N, the candidate leg runs its whole decode
+window, and after the last pair the reference tree's engine replays the candidate's own tokens
+teacher-forced. A pair fails when more than N per thousand of its tokens differ from the reference
+engine's choice for the same prefix. Leg 1 stays exact. With a tolerance, a ranked run does not
+prove that the candidate's output is the reference output; it proves that at most N per thousand of
+its tokens differ from what the reference engine chooses for the same prefix. When the fixture also
+declares `timed_token_near_tie_relative_gap` (G), only near ties are tolerated: the candidate's
+token must be the reference engine's second choice, with a relative gap between the reference's
+first and second choice of at most G. Any other different token fails the run, whatever the count.
+The cost of the near-tie rule: it forgives a change of winner between two tokens that the reference engine scores almost the same, and nothing else. Each leg boots its own engine and loads the model once. Each
 pair has its own composite, `(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`,
 from its own control leg. benchd never averages the pairs: the run scores the pair whose composite
 is the lower median over the pairs (the middle pair on an odd count, the lower of the two central

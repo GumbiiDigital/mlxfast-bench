@@ -54,6 +54,16 @@ pub trait EngineHandle {
 /// Canonical argmax / tie-break: LOWEST token id among the max-logit set
 /// (docs/architecture.md §2 "canonical argmax tie-break (lowest token id)").
 /// Returns `None` for an empty slice.
+/// The engine's token as a failure message names it.
+fn produced(token: Option<Token>) -> String {
+    token.map_or_else(|| "no token".to_string(), |t| format!("token {t}"))
+}
+
+/// A diagnostic value as a failure message names it.
+fn or_unknown<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+}
+
 pub fn canonical_argmax(logits: &[TopLogit]) -> Option<Token> {
     let mut best: Option<TopLogit> = None;
     for &cur in logits {
@@ -334,9 +344,12 @@ pub fn evaluate_anchor_case(
         String::new()
     } else {
         format!(
-            "anchor {} failed: argmax={:?} not accepted and rank/delta tolerance not met \
-(expected_token={}, rank={:?}, top_logit_delta={:?})",
-            case.name, argmax, case.expected_token, expected_rank, top_logit_delta
+            "anchor {} failed: the engine chose {}, which is not an accepted token, and the \
+expected token is outside the tolerance (its rank is {}, its logit is {} below the top logit)",
+            case.name,
+            produced(argmax),
+            or_unknown(expected_rank),
+            or_unknown(top_logit_delta)
         )
     };
 
@@ -374,11 +387,11 @@ pub fn evaluate_free_run_case(case: &GoldenFreeRunCase, generated: &[Token]) -> 
     } else {
         let step = first_mismatch.unwrap();
         format!(
-            "free-run {} diverged at step {}: expected {:?} got {:?}",
+            "free-run {} diverged at step {}: the engine produced {}, which is not the token \
+the golden expects at this step",
             case.name,
             step,
-            case.expected_tokens.get(step).copied(),
-            generated.get(step).copied()
+            produced(generated.get(step).copied())
         )
     };
     // Swift compareFreeRunTokens: PASS → the enforced prefix length, FAIL → step + 1.
@@ -492,10 +505,10 @@ pub fn evaluate_teacher_forced_case(
     };
     let reason = match (passed, first) {
         (true, _) => String::new(),
-        (false, Some((step, expected, actual))) => format!(
-            "teacher-forced {} mismatch at step {step}: expected {expected}, got {actual} \
-({mismatch_count} mismatches over {compared_steps} steps exceeds the \
-{COHORT_TOKEN_TOLERANCE_PER_THOUSAND}-per-thousand budget)",
+        (false, Some((step, _, actual))) => format!(
+            "teacher-forced {} mismatch at step {step}: the engine produced token {actual}, \
+which is not the token the golden expects at this step ({mismatch_count} mismatches over \
+{compared_steps} steps exceeds the {COHORT_TOKEN_TOLERANCE_PER_THOUSAND}-per-thousand budget)",
             case.name
         ),
         // Unreachable in practice: zero mismatches is always inside the budget.
@@ -700,6 +713,7 @@ mod tests {
         let r = evaluate_anchor_case(&case, &out, VOCAB_SIZE);
         assert!(!r.passed);
         assert_eq!(r.expected_rank, Some(3));
+        assert!(!r.reason.contains("100"), "{}", r.reason);
     }
 
     #[test]
@@ -752,6 +766,11 @@ mod tests {
         let r = evaluate_free_run_case(&case, &[10, 11, 99, 13]);
         assert!(!r.passed);
         assert_eq!(r.first_mismatch_step, Some(2));
+        assert!(
+            r.reason.contains("99") && !r.reason.contains("12"),
+            "{}",
+            r.reason
+        );
     }
 
     // --- fake engine + run_conformance ---

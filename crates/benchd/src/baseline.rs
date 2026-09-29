@@ -2,7 +2,7 @@
 //!
 //! A ranked run of a track whose fixture declares
 //! [`bench_core::contract::scores_against_live_control_leg`] measures TWO legs on
-//! ONE box in ONE job, on the one fixed prompt the fixture's live golden carries:
+//! ONE box in ONE job, on the prompt of each pair's golden:
 //!
 //! 1. a SERIAL-CONTROL leg on the organizer-staged REFERENCE tree, with no speculation;
 //! 2. the CANDIDATE leg on the submission tree, at its declared draft depth.
@@ -13,16 +13,17 @@
 //!
 //! * [`resolve_workspace`] / [`load_calibration`] — the two required inputs, from the flags or the
 //!   [`BASELINE_WORKSPACE_ENV`] / [`BASELINE_CALIBRATION_ENV`] environment variables;
-//! * [`BaselineCalibration::check_identity`] — the file names THIS track and THIS box;
+//! * [`BaselineCalibration::check_identity`] — the file names THIS track and THIS box, and holds
+//!   an entry for the prompt;
 //! * [`BaselineCalibration::check_band`] — the control leg's measured seconds-per-token sit inside
-//!   this box's HEALTH BAND. The band is a health gate on leg 1 and NEVER a denominator: no number
-//!   in the file reaches the score;
+//!   this box's HEALTH BAND for the prompt it measured. The band is a health gate on leg 1 and
+//!   NEVER a denominator: no number in the file reaches the score;
 //! * [`refuse_golden_with_stored_pair`] / [`refuse_stored_baseline_override`] — a golden carrying
 //!   `benchmark.baseline_*_seconds_per_token`, and the `MLXFAST_PAIRED_BASELINE_*` env /
 //!   `--baseline-*` flags, are refused on this path because each is a stored denominator.
 //!
-//! It also owns the AUTHORING half: [`calibration_from_passes`] turns the N control legs
-//! `benchd calibrate-baseline` measured into the file, and refuses by name
+//! It also owns the AUTHORING half: [`calibration_from_passes`] turns the control legs
+//! `benchd calibrate-baseline` measured on each prompt into the file, and refuses by name
 //! ([`bench_core::constants::CALIBRATION_CV_EXCEEDED`]) when the box is too noisy for the mean to
 //! describe it.
 
@@ -39,8 +40,10 @@ pub const BASELINE_CALIBRATION_ENV: &str = "MLXFAST_BASELINE_CALIBRATION";
 /// file's `box` field whenever it is set; absent, the operator states the box with `--box`.
 pub const RUNNER_NAME_ENV: &str = "RUNNER_NAME";
 
-/// The schema version this benchd reads and writes. A file at any other version is refused.
-pub const CALIBRATION_VERSION: u32 = 1;
+/// The schema version this benchd writes. It reads this version and [`CALIBRATION_VERSION_SINGLE_PROMPT`].
+pub const CALIBRATION_VERSION: u32 = 2;
+/// The earlier single-prompt form. This benchd still reads it, as a file with one prompt entry.
+pub const CALIBRATION_VERSION_SINGLE_PROMPT: u32 = 1;
 
 /// The value sealed as `metrics.baseline_source` on a paired run: the denominator was MEASURED by
 /// the serial-control leg of this same job, not read from anywhere.
@@ -56,11 +59,11 @@ pub const BASELINE_WORKSPACE_NO_ENGINE: &str = "BASELINE-WORKSPACE-NO-ENGINE";
 pub const BASELINE_ENGINE_NOT_ROOT_RELATIVE: &str = "BASELINE-ENGINE-NOT-ROOT-RELATIVE";
 /// The candidate weights' re-rooted path would leave the reference tree.
 pub const BASELINE_WEIGHTS_NOT_ROOT_RELATIVE: &str = "BASELINE-WEIGHTS-NOT-ROOT-RELATIVE";
-/// The calibration file was captured on another prompt than the one this run measures.
+/// The calibration file has no entry for a prompt this run measures.
 pub const BASELINE_CALIBRATION_PROMPT_MISMATCH: &str = "BASELINE-CALIBRATION-PROMPT-MISMATCH";
 /// No calibration file was named, or it could not be read.
 pub const BASELINE_CALIBRATION_MISSING: &str = "BASELINE-CALIBRATION-MISSING";
-/// The calibration file was read but is not a valid v1 calibration.
+/// The calibration file was read but is not a valid calibration.
 pub const BASELINE_CALIBRATION_INVALID: &str = "BASELINE-CALIBRATION-INVALID";
 /// The calibration file names another track.
 pub const BASELINE_CALIBRATION_TRACK_MISMATCH: &str = "BASELINE-CALIBRATION-TRACK-MISMATCH";
@@ -82,6 +85,16 @@ pub const CONTROL_GOLDEN_PROMPT_MISMATCH: &str = "CONTROL-GOLDEN-PROMPT-MISMATCH
 /// `--control-golden` was given on a run that measures no control leg, where it would be silently
 /// ignored.
 pub const CONTROL_GOLDEN_WITHOUT_PAIRED_PATH: &str = "CONTROL-GOLDEN-WITHOUT-PAIRED-PATH";
+/// A golden flag was given a different number of times than `--golden`: a pin flag, a control
+/// golden flag, or `--prompt`. Each one matches `--golden` by position, so the counts must agree.
+pub const GOLDEN_COUNT_MISMATCH: &str = "GOLDEN-COUNT-MISMATCH";
+/// More than one `--golden` was given on a run that measures no control leg. Only the paired path
+/// measures several goldens, so every other path would ignore all but the first.
+pub const MULTIPLE_GOLDENS_WITHOUT_PAIRED_PATH: &str = "MULTIPLE-GOLDENS-WITHOUT-PAIRED-PATH";
+/// The track's pair count is not a multiple of the number of goldens, so the goldens would not
+/// get the same number of pairs.
+pub const OFFICIAL_PAIRS_NOT_A_MULTIPLE_OF_GOLDENS: &str =
+    "OFFICIAL-PAIRS-NOT-A-MULTIPLE-OF-GOLDENS";
 
 /// The band literals [`calibration_from_passes`] writes. benchd READS the band from the file — a
 /// box that needs a different band re-calibrates, it does not edit a constant here.
@@ -94,6 +107,10 @@ pub const DEFAULT_DECODE_BAND_LOW: f64 = 0.98;
 pub const DEFAULT_DECODE_BAND_HIGH: f64 = 1.02;
 
 /// One box's calibration file: VALUES ONLY, and every value is a HEALTH fact about the box.
+///
+/// The header names the track, the box, the reference tree and the benchd that measured. Each
+/// entry of `prompts` holds the band of one prompt, because a control leg's cost is a property of
+/// the prompt it measures.
 ///
 /// `deny_unknown_fields` + no `serde(default)`: a file missing a field, or carrying one this
 /// benchd does not know, is REFUSED rather than silently defaulted. A calibration is the thing
@@ -109,7 +126,29 @@ pub struct BaselineCalibration {
     pub box_name: String,
     /// The reference tree's engine commit at capture time (40 lowercase hex).
     pub reference_commit: String,
-    /// The live golden's prompt name.
+    pub captured_at: String,
+    /// The benchd source commit that measured the legs (40 lowercase hex).
+    pub benchd_source_commit: String,
+    /// One entry per calibrated prompt, in the order they were measured. Prompt names are unique.
+    pub prompts: Vec<PromptCalibration>,
+    /// GATE LOG (David 2026-09-17): every GATE POINT the calibration passes ran behind, in run
+    /// order, each naming its PASS and the phase it guarded, and what BOTH gates read. Same
+    /// records and same field names as a score's `metrics.gates`, except that a pass has one leg,
+    /// so a record carries `pass` in place of `pair` and no `leg`. Pass numbers run on across the
+    /// prompts: the passes of entry 2 follow the passes of entry 1.
+    ///
+    /// OMITTED when empty, so a file captured with the gates off keeps the key set it had, and
+    /// `default` lets this benchd read every calibration file written before the gates were
+    /// sealed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<crate::quiescegate::GateRecord>,
+}
+
+/// The band of ONE prompt on one box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCalibration {
+    /// The prompt name ([`golden_prompt_name`] of the golden that was measured).
     pub prompt: String,
     /// How many control legs the mean is over.
     pub passes: u32,
@@ -122,19 +161,66 @@ pub struct BaselineCalibration {
     pub prefill_band_high: f64,
     pub decode_band_low: f64,
     pub decode_band_high: f64,
-    pub captured_at: String,
-    /// The benchd source commit that measured the legs (40 lowercase hex).
-    pub benchd_source_commit: String,
-    /// GATE LOG (David 2026-09-17): every GATE POINT the calibration passes ran behind, in run
-    /// order, each naming its PASS and the phase it guarded, and what BOTH gates read. Same
-    /// records and same field names as a score's `metrics.gates`, except that a pass has one leg,
-    /// so a record carries `pass` in place of `pair` and no `leg`.
-    ///
-    /// OMITTED when empty, so a file captured with the gates off keeps the key set it had, and
-    /// `default` lets this benchd read every calibration file written before the gates were
-    /// sealed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gates: Vec<crate::quiescegate::GateRecord>,
+}
+
+/// The single-prompt file form ([`CALIBRATION_VERSION_SINGLE_PROMPT`]). This benchd reads it as a
+/// file with one prompt entry, so a box that holds this form keeps working.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SinglePromptCalibration {
+    #[serde(rename = "version")]
+    _version: u32,
+    track_id: String,
+    #[serde(rename = "box")]
+    box_name: String,
+    reference_commit: String,
+    prompt: String,
+    passes: u32,
+    prefill_seconds_per_token_mean: f64,
+    decode_seconds_per_token_mean: f64,
+    prefill_cv: f64,
+    decode_cv: f64,
+    prefill_band_low: f64,
+    prefill_band_high: f64,
+    decode_band_low: f64,
+    decode_band_high: f64,
+    captured_at: String,
+    benchd_source_commit: String,
+    #[serde(default)]
+    gates: Vec<crate::quiescegate::GateRecord>,
+}
+
+impl From<SinglePromptCalibration> for BaselineCalibration {
+    fn from(f: SinglePromptCalibration) -> Self {
+        BaselineCalibration {
+            // The in-memory value is the current form, so it serializes as one.
+            version: CALIBRATION_VERSION,
+            track_id: f.track_id,
+            box_name: f.box_name,
+            reference_commit: f.reference_commit,
+            captured_at: f.captured_at,
+            benchd_source_commit: f.benchd_source_commit,
+            prompts: vec![PromptCalibration {
+                prompt: f.prompt,
+                passes: f.passes,
+                prefill_seconds_per_token_mean: f.prefill_seconds_per_token_mean,
+                decode_seconds_per_token_mean: f.decode_seconds_per_token_mean,
+                prefill_cv: f.prefill_cv,
+                decode_cv: f.decode_cv,
+                prefill_band_low: f.prefill_band_low,
+                prefill_band_high: f.prefill_band_high,
+                decode_band_low: f.decode_band_low,
+                decode_band_high: f.decode_band_high,
+            }],
+            gates: f.gates,
+        }
+    }
+}
+
+/// Only the `version` key, read first to choose the file form.
+#[derive(Deserialize)]
+struct CalibrationVersion {
+    version: u32,
 }
 
 /// A calibration file together with the identity of the BYTES it was read from — the digest the
@@ -154,31 +240,36 @@ fn is_commit_sha40(s: &str) -> bool {
 }
 
 impl BaselineCalibration {
-    /// Parse and VALIDATE one calibration file's bytes. Every refusal names
+    /// Parse and VALIDATE one calibration file's bytes, in either file form. Every refusal names
     /// [`BASELINE_CALIBRATION_INVALID`] and the field that failed.
     pub fn parse(bytes: &[u8]) -> Result<BaselineCalibration, String> {
-        let calibration: BaselineCalibration = serde_json::from_slice(bytes)
-            .map_err(|e| format!("{BASELINE_CALIBRATION_INVALID}: {e}"))?;
+        let invalid = |e: serde_json::Error| format!("{BASELINE_CALIBRATION_INVALID}: {e}");
+        let CalibrationVersion { version } = serde_json::from_slice(bytes).map_err(invalid)?;
+        let calibration: BaselineCalibration = match version {
+            CALIBRATION_VERSION => serde_json::from_slice(bytes).map_err(invalid)?,
+            CALIBRATION_VERSION_SINGLE_PROMPT => {
+                serde_json::from_slice::<SinglePromptCalibration>(bytes)
+                    .map_err(invalid)?
+                    .into()
+            }
+            other => {
+                return Err(format!(
+                    "{BASELINE_CALIBRATION_INVALID}: version is {other}, and this benchd reads \
+                     versions {CALIBRATION_VERSION_SINGLE_PROMPT} and {CALIBRATION_VERSION}"
+                ))
+            }
+        };
         calibration.validate()?;
         Ok(calibration)
     }
 
     fn validate(&self) -> Result<(), String> {
         let bad = |what: &str| Err(format!("{BASELINE_CALIBRATION_INVALID}: {what}"));
-        if self.version != CALIBRATION_VERSION {
-            return bad(&format!(
-                "version is {}, and this benchd reads version {CALIBRATION_VERSION}",
-                self.version
-            ));
-        }
         if self.track_id.trim().is_empty() {
             return bad("track_id is empty");
         }
         if self.box_name.trim().is_empty() {
             return bad("box is empty");
-        }
-        if self.prompt.trim().is_empty() {
-            return bad("prompt is empty");
         }
         if !is_commit_sha40(&self.reference_commit) {
             return bad(&format!(
@@ -192,14 +283,137 @@ impl BaselineCalibration {
                 self.benchd_source_commit
             ));
         }
+        if self.captured_at.trim().is_empty() {
+            return bad("captured_at is empty");
+        }
+        if self.prompts.is_empty() {
+            return bad("prompts is empty");
+        }
+        for (i, entry) in self.prompts.iter().enumerate() {
+            if self.prompts[..i].iter().any(|e| e.prompt == entry.prompt) {
+                return bad(&format!(
+                    "prompt {:?} has more than one entry",
+                    entry.prompt
+                ));
+            }
+            entry.validate()?;
+        }
+        Ok(())
+    }
+
+    /// The entry of `prompt`, or a refusal by name that lists the prompts the file holds.
+    pub fn entry(&self, prompt: &str) -> Result<&PromptCalibration, String> {
+        self.prompts
+            .iter()
+            .find(|e| e.prompt == prompt)
+            .ok_or_else(|| {
+                let held: Vec<&str> = self.prompts.iter().map(|e| e.prompt.as_str()).collect();
+                format!(
+                    "{BASELINE_CALIBRATION_PROMPT_MISMATCH}: the calibration holds prompts \
+                     {held:?}, and this run measures prompt {prompt:?}; a band describes the leg \
+                     it was measured from, so it cannot gate a leg on another prompt"
+                )
+            })
+    }
+
+    /// The file must name THIS track and THIS box, and hold an entry for THIS prompt. Every
+    /// refusal quotes both values.
+    ///
+    /// The PROMPT is checked for the same reason the box is: a band describes what a control leg
+    /// costs, and a control leg's cost is a property of the prompt it measured. An entry captured
+    /// on one prompt says nothing about a leg measured on another, so a run whose golden has no
+    /// entry is refused rather than checked against a band that does not describe it.
+    pub fn check_identity(
+        &self,
+        track_id: &str,
+        box_name: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        if self.track_id != track_id {
+            return Err(format!(
+                "{BASELINE_CALIBRATION_TRACK_MISMATCH}: the calibration names track {:?}, and \
+                 this run scores track {track_id:?}",
+                self.track_id
+            ));
+        }
+        if self.box_name != box_name {
+            return Err(format!(
+                "{BASELINE_CALIBRATION_BOX_MISMATCH}: the calibration was captured on box {:?}, \
+                 and this run is on box {box_name:?}; each ranked box carries its own calibration",
+                self.box_name
+            ));
+        }
+        self.entry(prompt).map(|_| ())
+    }
+
+    /// The HEALTH GATE on the serial-control leg of `prompt`: `measured <= mean * high` on both
+    /// axes, against that prompt's entry. It is regression detection only: a control leg SLOWER
+    /// than the band says the box is not well (thermal, contention, a wrong tree) and the run
+    /// seals no score. A leg FASTER than its calibration is a well box and passes; the candidate is
+    /// scored against that same live leg, so a fast box hands the candidate nothing. `*_band_low`
+    /// is recorded by the calibrator and never read here. Nothing here reaches the score — a leg
+    /// inside the band is scored by its own measured value.
+    pub fn check_band(
+        &self,
+        prompt: &str,
+        prefill_spt: f64,
+        decode_spt: f64,
+    ) -> Result<(), String> {
+        let entry = self.entry(prompt)?;
+        for (axis, measured, mean, high) in [
+            (
+                "prefill",
+                prefill_spt,
+                entry.prefill_seconds_per_token_mean,
+                entry.prefill_band_high,
+            ),
+            (
+                "decode",
+                decode_spt,
+                entry.decode_seconds_per_token_mean,
+                entry.decode_band_high,
+            ),
+        ] {
+            if !(measured.is_finite() && measured > 0.0) {
+                return Err(format!(
+                    "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
+                     band: the {axis} leg measured {measured} seconds per token, which is not a \
+                     finite positive number"
+                ));
+            }
+            let hi = mean * high;
+            if measured > hi {
+                return Err(format!(
+                    "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
+                     band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
+                     calibrated at {mean} on prompt {prompt:?} with a ceiling of {hi} ({high} of \
+                     the mean); the box is slower than when it was calibrated; refusing to seal a \
+                     score",
+                    self.box_name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PromptCalibration {
+    /// Every refusal names the prompt and the field that failed.
+    fn validate(&self) -> Result<(), String> {
+        let bad = |what: &str| {
+            Err(format!(
+                "{BASELINE_CALIBRATION_INVALID}: prompt {:?}: {what}",
+                self.prompt
+            ))
+        };
+        if self.prompt.trim().is_empty() {
+            return bad("prompt is empty");
+        }
         if self.passes < 2 {
             return bad(&format!(
                 "passes is {}, and a mean with a coefficient of variation needs at least 2",
                 self.passes
             ));
-        }
-        if self.captured_at.trim().is_empty() {
-            return bad("captured_at is empty");
         }
         for (name, value) in [
             (
@@ -227,8 +441,9 @@ impl BaselineCalibration {
             }
             if value > max_cv {
                 return Err(format!(
-                    "{CALIBRATION_CV_EXCEEDED}: {name} is {value} \
+                    "{CALIBRATION_CV_EXCEEDED}: prompt {:?}: {name} is {value} \
                      ({:.4}%), above the fixed maximum of {CALIBRATION_MAX_CV_PERCENT}%",
+                    self.prompt,
                     value * 100.0
                 ));
             }
@@ -268,86 +483,20 @@ impl BaselineCalibration {
         }
         Ok(())
     }
+}
 
-    /// The file must name THIS track, THIS box and THIS prompt. Every refusal quotes both values.
-    ///
-    /// The PROMPT is checked for the same reason the box is: a band describes what a control leg
-    /// costs, and a control leg's cost is a property of the prompt it measured. A file captured on
-    /// one prompt says nothing about a leg measured on another, so a run whose golden is not the
-    /// calibrated one is refused rather than checked against a band that does not describe it.
-    pub fn check_identity(
-        &self,
-        track_id: &str,
-        box_name: &str,
-        prompt: &str,
-    ) -> Result<(), String> {
-        if self.track_id != track_id {
-            return Err(format!(
-                "{BASELINE_CALIBRATION_TRACK_MISMATCH}: the calibration names track {:?}, and \
-                 this run scores track {track_id:?}",
-                self.track_id
-            ));
-        }
-        if self.box_name != box_name {
-            return Err(format!(
-                "{BASELINE_CALIBRATION_BOX_MISMATCH}: the calibration was captured on box {:?}, \
-                 and this run is on box {box_name:?}; each ranked box carries its own calibration",
-                self.box_name
-            ));
-        }
-        if self.prompt != prompt {
-            return Err(format!(
-                "{BASELINE_CALIBRATION_PROMPT_MISMATCH}: the calibration was captured on prompt \
-                 {:?}, and this run measures prompt {prompt:?}; a band describes the leg it was \
-                 measured from, so it cannot gate a leg on another prompt",
-                self.prompt
-            ));
-        }
-        Ok(())
+/// Refuse a run whose pair count is not a multiple of its golden count. Pair `k` (1-based)
+/// measures golden `(k - 1) mod goldens`, so only a multiple gives every golden the same number
+/// of pairs.
+pub fn check_pairs_cover_goldens(pairs: usize, goldens: usize) -> Result<(), String> {
+    if goldens == 0 || !pairs.is_multiple_of(goldens) {
+        return Err(format!(
+            "{OFFICIAL_PAIRS_NOT_A_MULTIPLE_OF_GOLDENS}: the track fixture declares \
+             official_pairs: {pairs}, and this run was given {goldens} golden(s); each golden gets \
+             the same number of pairs, so official_pairs must be a multiple of the golden count"
+        ));
     }
-
-    /// The HEALTH GATE on the serial-control leg: `measured <= mean * high` on both axes. It is
-    /// regression detection only: a control leg SLOWER than the band says the box is not well
-    /// (thermal, contention, a wrong tree) and the run seals no score. A leg FASTER than its
-    /// calibration is a well box and passes; the candidate is scored against that same live leg,
-    /// so a fast box hands the candidate nothing. `*_band_low` is recorded by the calibrator and
-    /// never read here. Nothing here reaches the score — a leg inside the band is scored by its
-    /// own measured value.
-    pub fn check_band(&self, prefill_spt: f64, decode_spt: f64) -> Result<(), String> {
-        for (axis, measured, mean, high) in [
-            (
-                "prefill",
-                prefill_spt,
-                self.prefill_seconds_per_token_mean,
-                self.prefill_band_high,
-            ),
-            (
-                "decode",
-                decode_spt,
-                self.decode_seconds_per_token_mean,
-                self.decode_band_high,
-            ),
-        ] {
-            if !(measured.is_finite() && measured > 0.0) {
-                return Err(format!(
-                    "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
-                     band: the {axis} leg measured {measured} seconds per token, which is not a \
-                     finite positive number"
-                ));
-            }
-            let hi = mean * high;
-            if measured > hi {
-                return Err(format!(
-                    "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
-                     band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
-                     calibrated at {mean} with a ceiling of {hi} ({high} of the mean); the box \
-                     is slower than when it was calibrated; refusing to seal a score",
-                    self.box_name
-                ));
-            }
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Resolve the REFERENCE WORKSPACE from the flag, else [`BASELINE_WORKSPACE_ENV`]. It must exist
@@ -692,40 +841,74 @@ pub fn reference_weights_path(
     ))
 }
 
-/// WHAT a calibration is OF: the track, the box, the reference tree, the prompt, the benchd that
-/// measured, and when. Everything in the file that is not a measurement.
+/// WHAT a calibration is OF: the track, the box, the reference tree, the benchd that measured,
+/// and when. Everything in the file header that is not a measurement.
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationIdentity<'a> {
     pub track_id: &'a str,
     pub box_name: &'a str,
     pub reference_commit: &'a str,
-    pub prompt: &'a str,
     pub benchd_source_commit: &'a str,
     pub captured_at: &'a str,
 }
 
-/// Author the calibration file from the N control legs `benchd calibrate-baseline` measured.
+/// The control legs `benchd calibrate-baseline` measured on ONE prompt.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptPasses<'a> {
+    pub prompt: &'a str,
+    pub prefill_legs: &'a [f64],
+    pub decode_legs: &'a [f64],
+}
+
+/// Author the calibration file from the control legs `benchd calibrate-baseline` measured, one
+/// entry per prompt, in the order given.
 ///
 /// The gate is the SAME fixed one the stored-pair capture used: a per-axis SAMPLE coefficient of
 /// variation above [`CALIBRATION_MAX_CV_PERCENT`] refuses by name — a box whose legs spread that
 /// wide has no mean that describes it, so it has no band either.
 pub fn calibration_from_passes(
     identity: &CalibrationIdentity<'_>,
-    prefill_legs: &[f64],
-    decode_legs: &[f64],
+    prompts: &[PromptPasses<'_>],
     gates: Vec<crate::quiescegate::GateRecord>,
 ) -> Result<BaselineCalibration, String> {
+    let mut entries = Vec::with_capacity(prompts.len());
+    for passes in prompts {
+        entries.push(prompt_calibration_from_passes(passes)?);
+    }
+    let calibration = BaselineCalibration {
+        version: CALIBRATION_VERSION,
+        track_id: identity.track_id.to_string(),
+        box_name: identity.box_name.to_string(),
+        reference_commit: identity.reference_commit.to_string(),
+        captured_at: identity.captured_at.to_string(),
+        benchd_source_commit: identity.benchd_source_commit.to_string(),
+        prompts: entries,
+        gates,
+    };
+    // The file this run writes must be one this same benchd would accept.
+    calibration.validate()?;
+    Ok(calibration)
+}
+
+/// One prompt's entry from its measured legs.
+fn prompt_calibration_from_passes(passes: &PromptPasses<'_>) -> Result<PromptCalibration, String> {
+    let PromptPasses {
+        prompt,
+        prefill_legs,
+        decode_legs,
+    } = *passes;
     if prefill_legs.len() != decode_legs.len() {
         return Err(format!(
-            "{BASELINE_CALIBRATION_INVALID}: {} prefill legs against {} decode legs",
+            "{BASELINE_CALIBRATION_INVALID}: prompt {prompt:?}: {} prefill legs against {} decode \
+             legs",
             prefill_legs.len(),
             decode_legs.len()
         ));
     }
     if prefill_legs.len() < 2 {
         return Err(format!(
-            "{BASELINE_CALIBRATION_INVALID}: {} pass(es); a mean with a coefficient of variation \
-             needs at least 2",
+            "{BASELINE_CALIBRATION_INVALID}: prompt {prompt:?}: {} pass(es); a mean with a \
+             coefficient of variation needs at least 2",
             prefill_legs.len()
         ));
     }
@@ -733,27 +916,29 @@ pub fn calibration_from_passes(
     let mut means = Vec::with_capacity(2);
     for (axis, legs) in [("prefill", prefill_legs), ("decode", decode_legs)] {
         let mean = crate::capture::mean(legs).ok_or_else(|| {
-            format!("{BASELINE_CALIBRATION_INVALID}: the {axis} legs have no finite positive mean")
+            format!(
+                "{BASELINE_CALIBRATION_INVALID}: prompt {prompt:?}: the {axis} legs have no \
+                 finite positive mean"
+            )
         })?;
         let cv = crate::capture::sample_cv_percent(legs).ok_or_else(|| {
-            format!("{BASELINE_CALIBRATION_INVALID}: the {axis} legs have no sample CV")
+            format!(
+                "{BASELINE_CALIBRATION_INVALID}: prompt {prompt:?}: the {axis} legs have no \
+                 sample CV"
+            )
         })?;
         if cv > CALIBRATION_MAX_CV_PERCENT {
             return Err(format!(
-                "{CALIBRATION_CV_EXCEEDED}: the {axis} legs vary by {cv:.4}%, above the fixed \
-                 maximum of {CALIBRATION_MAX_CV_PERCENT}%; this box is not quiet enough for a mean \
-                 to describe it"
+                "{CALIBRATION_CV_EXCEEDED}: prompt {prompt:?}: the {axis} legs vary by {cv:.4}%, \
+                 above the fixed maximum of {CALIBRATION_MAX_CV_PERCENT}%; this box is not quiet \
+                 enough for a mean to describe it"
             ));
         }
         means.push(mean);
         cvs.push(cv / 100.0);
     }
-    let calibration = BaselineCalibration {
-        version: CALIBRATION_VERSION,
-        track_id: identity.track_id.to_string(),
-        box_name: identity.box_name.to_string(),
-        reference_commit: identity.reference_commit.to_string(),
-        prompt: identity.prompt.to_string(),
+    Ok(PromptCalibration {
+        prompt: prompt.to_string(),
         passes: prefill_legs.len() as u32,
         prefill_seconds_per_token_mean: means[0],
         decode_seconds_per_token_mean: means[1],
@@ -763,13 +948,7 @@ pub fn calibration_from_passes(
         prefill_band_high: DEFAULT_PREFILL_BAND_HIGH,
         decode_band_low: DEFAULT_DECODE_BAND_LOW,
         decode_band_high: DEFAULT_DECODE_BAND_HIGH,
-        captured_at: identity.captured_at.to_string(),
-        benchd_source_commit: identity.benchd_source_commit.to_string(),
-        gates,
-    };
-    // The file this run writes must be one this same benchd would accept.
-    calibration.validate()?;
-    Ok(calibration)
+    })
 }
 
 /// Write the calibration file ATOMICALLY (temp file + rename) and return the digest of the bytes
@@ -816,18 +995,22 @@ mod tests {
         BaselineCalibration::parse(serde_json::to_vec(doc).unwrap().as_slice())
     }
 
+    /// THE SINGLE-PROMPT FILE FORM STILL LOADS, as a file with one prompt entry, so a box that
+    /// holds it keeps working.
     #[test]
     fn a_valid_calibration_parses_with_every_field_carried() {
         let cal = parse(&valid_document()).unwrap();
-        assert_eq!(cal.version, 1);
+        assert_eq!(cal.version, CALIBRATION_VERSION);
         assert_eq!(cal.track_id, "qwen3.8-125b-a6b-mlx-v1");
         assert_eq!(cal.box_name, "m5-max-128gb-4-qwen38-125b-a6b-mlx");
-        assert_eq!(cal.prompt, "botany");
-        assert_eq!(cal.passes, 4);
-        assert_eq!(cal.prefill_seconds_per_token_mean, 0.0006282488193359375);
-        assert_eq!(cal.decode_seconds_per_token_mean, 0.0329116748046875);
-        assert_eq!(cal.prefill_band_low, 0.95);
-        assert_eq!(cal.decode_band_high, 1.02);
+        assert_eq!(cal.prompts.len(), 1);
+        let entry = &cal.prompts[0];
+        assert_eq!(entry.prompt, "botany");
+        assert_eq!(entry.passes, 4);
+        assert_eq!(entry.prefill_seconds_per_token_mean, 0.0006282488193359375);
+        assert_eq!(entry.decode_seconds_per_token_mean, 0.0329116748046875);
+        assert_eq!(entry.prefill_band_low, 0.95);
+        assert_eq!(entry.decode_band_high, 1.02);
         // Round-trip: what this benchd writes is what it reads.
         let round_tripped =
             BaselineCalibration::parse(serde_json::to_string(&cal).unwrap().as_bytes()).unwrap();
@@ -890,6 +1073,78 @@ mod tests {
         );
     }
 
+    /// The current form: the shared header, then one entry per prompt.
+    fn two_prompt_document() -> serde_json::Value {
+        let entry = |prompt: &str, decode_mean: f64| {
+            json!({
+                "prompt": prompt,
+                "passes": 4,
+                "prefill_seconds_per_token_mean": 0.0006,
+                "decode_seconds_per_token_mean": decode_mean,
+                "prefill_cv": 0.004,
+                "decode_cv": 0.002,
+                "prefill_band_low": 0.95,
+                "prefill_band_high": 1.05,
+                "decode_band_low": 0.98,
+                "decode_band_high": 1.02,
+            })
+        };
+        json!({
+            "version": 2,
+            "track_id": "track-a",
+            "box": "box-a",
+            "reference_commit": "a".repeat(40),
+            "captured_at": "2026-09-27T00:00:00Z",
+            "benchd_source_commit": "b".repeat(40),
+            "prompts": [entry("botany", 0.030), entry("kelp", 0.060)],
+        })
+    }
+
+    /// ONE FILE, ONE BAND PER PROMPT. The identity check passes for each prompt the file holds and
+    /// refuses, by name, a prompt it does not hold. The band check reads the entry of the prompt
+    /// the leg measured: the same decode time is inside one prompt's band and outside the other's.
+    #[test]
+    fn a_calibration_holds_one_band_per_prompt() {
+        let cal = parse(&two_prompt_document()).unwrap();
+        assert_eq!(cal.prompts.len(), 2);
+        for prompt in ["botany", "kelp"] {
+            assert!(cal.check_identity("track-a", "box-a", prompt).is_ok());
+        }
+        let err = cal.check_identity("track-a", "box-a", "fern").unwrap_err();
+        assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
+        assert!(err.contains("fern") && err.contains("kelp"), "{err}");
+
+        assert!(cal.check_band("kelp", 0.0006, 0.060).is_ok());
+        let err = cal.check_band("botany", 0.0006, 0.060).unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+        assert!(err.contains("botany"), "{err}");
+        let err = cal.check_band("fern", 0.0006, 0.030).unwrap_err();
+        assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
+
+        // Two entries for one prompt would make the lookup ambiguous.
+        let mut doc = two_prompt_document();
+        doc["prompts"][1]["prompt"] = json!("botany");
+        let err = parse(&doc).unwrap_err();
+        assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
+        assert!(err.contains("more than one entry"), "{err}");
+    }
+
+    /// Pair `k` measures golden `(k - 1) mod N`, so the pair count must be a multiple of N.
+    #[test]
+    fn the_pair_count_must_be_a_multiple_of_the_golden_count() {
+        assert!(check_pairs_cover_goldens(2, 1).is_ok());
+        assert!(check_pairs_cover_goldens(6, 3).is_ok());
+        let err = check_pairs_cover_goldens(4, 3).unwrap_err();
+        assert!(
+            err.contains(OFFICIAL_PAIRS_NOT_A_MULTIPLE_OF_GOLDENS),
+            "{err}"
+        );
+        assert!(
+            err.contains("official_pairs: 4") && err.contains('3'),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_missing_field_refuses_by_name() {
         for field in [
@@ -928,7 +1183,7 @@ mod tests {
     #[test]
     fn a_wrong_version_a_short_commit_and_a_noisy_capture_refuse_by_name() {
         let mut doc = valid_document();
-        doc["version"] = json!(2);
+        doc["version"] = json!(3);
         let err = parse(&doc).unwrap_err();
         assert!(
             err.contains(BASELINE_CALIBRATION_INVALID) && err.contains("version"),
@@ -976,18 +1231,18 @@ mod tests {
     fn the_band_check_refuses_only_a_slower_leg_on_either_axis() {
         let cal = parse(&valid_document()).unwrap();
         let (p, d) = (
-            cal.prefill_seconds_per_token_mean,
-            cal.decode_seconds_per_token_mean,
+            cal.prompts[0].prefill_seconds_per_token_mean,
+            cal.prompts[0].decode_seconds_per_token_mean,
         );
         // Dead centre and the ceiling of each band are INSIDE.
-        assert!(cal.check_band(p, d).is_ok());
-        assert!(cal.check_band(p * 1.05, d * 1.02).is_ok());
+        assert!(cal.check_band("botany", p, d).is_ok());
+        assert!(cal.check_band("botany", p * 1.05, d * 1.02).is_ok());
         // A FASTER leg is a well box: below `*_band_low`, and far below it, both pass. The
         // low bound is recorded, never read.
-        assert!(cal.check_band(p * 0.95, d * 0.98).is_ok());
-        assert!(cal.check_band(p * 0.9, d).is_ok());
-        assert!(cal.check_band(p, d * 0.9).is_ok());
-        assert!(cal.check_band(p * 0.5, d * 0.5).is_ok());
+        assert!(cal.check_band("botany", p * 0.95, d * 0.98).is_ok());
+        assert!(cal.check_band("botany", p * 0.9, d).is_ok());
+        assert!(cal.check_band("botany", p, d * 0.9).is_ok());
+        assert!(cal.check_band("botany", p * 0.5, d * 0.5).is_ok());
 
         // A SLOWER leg, on either axis, refuses by name.
         for (label, prefill, decode) in [
@@ -995,7 +1250,7 @@ mod tests {
             ("decode high", p, d * 1.1),
             ("decode just over", p, d * 1.0201),
         ] {
-            let err = cal.check_band(prefill, decode).unwrap_err();
+            let err = cal.check_band("botany", prefill, decode).unwrap_err();
             assert!(
                 err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND)
                     && err.contains("serial-control leg outside this box's band"),
@@ -1004,8 +1259,8 @@ mod tests {
             assert!(err.contains(&cal.box_name), "{label}: {err}");
         }
         // A non-finite or non-positive measurement is outside every band.
-        assert!(cal.check_band(f64::NAN, d).is_err());
-        assert!(cal.check_band(p, 0.0).is_err());
+        assert!(cal.check_band("botany", f64::NAN, d).is_err());
+        assert!(cal.check_band("botany", p, 0.0).is_err());
     }
 
     #[test]
@@ -1185,29 +1440,38 @@ mod tests {
             track_id: "qwen3.8-125b-a6b-mlx-v1",
             box_name: "m5-max-128gb-4-qwen38-125b-a6b-mlx",
             reference_commit: &reference,
-            prompt: "botany",
             benchd_source_commit: &benchd,
             captured_at: "2026-09-08T00:00:00Z",
         };
+        let passes = |prefill_legs: &'static [f64], decode_legs: &'static [f64]| PromptPasses {
+            prompt: "botany",
+            prefill_legs,
+            decode_legs,
+        };
         let cal = calibration_from_passes(
             &identity,
-            &[0.001, 0.001, 0.001, 0.001],
-            &[0.030, 0.030, 0.030, 0.030],
+            &[passes(
+                &[0.001, 0.001, 0.001, 0.001],
+                &[0.030, 0.030, 0.030, 0.030],
+            )],
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(cal.passes, 4);
-        assert_eq!(cal.prefill_seconds_per_token_mean, 0.001);
-        assert_eq!(cal.decode_seconds_per_token_mean, 0.030);
-        assert_eq!(cal.prefill_cv, 0.0);
-        assert_eq!(cal.prefill_band_low, DEFAULT_PREFILL_BAND_LOW);
-        assert_eq!(cal.decode_band_high, DEFAULT_DECODE_BAND_HIGH);
+        let entry = &cal.prompts[0];
+        assert_eq!(entry.passes, 4);
+        assert_eq!(entry.prefill_seconds_per_token_mean, 0.001);
+        assert_eq!(entry.decode_seconds_per_token_mean, 0.030);
+        assert_eq!(entry.prefill_cv, 0.0);
+        assert_eq!(entry.prefill_band_low, DEFAULT_PREFILL_BAND_LOW);
+        assert_eq!(entry.decode_band_high, DEFAULT_DECODE_BAND_HIGH);
 
         // A decode axis that varies by ~4.7% is well past the fixed 1% maximum.
         let err = calibration_from_passes(
             &identity,
-            &[0.001, 0.001, 0.001, 0.001],
-            &[0.030, 0.032, 0.029, 0.031],
+            &[passes(
+                &[0.001, 0.001, 0.001, 0.001],
+                &[0.030, 0.032, 0.029, 0.031],
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -1232,15 +1496,63 @@ mod tests {
         );
         assert!(loaded
             .calibration
-            .check_identity(&cal.track_id, &cal.box_name, &cal.prompt)
+            .check_identity(&cal.track_id, &cal.box_name, "botany")
             .is_ok());
         // The temp file the atomic write used does not survive.
         assert!(!out.with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
 
         // One pass has no coefficient of variation at all.
-        let err = calibration_from_passes(&identity, &[0.001], &[0.030], Vec::new()).unwrap_err();
+        let err = calibration_from_passes(&identity, &[passes(&[0.001], &[0.030])], Vec::new())
+            .unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
+    }
+
+    /// `benchd calibrate-baseline` over two goldens writes ONE file with one entry per prompt, in
+    /// the order given, and that file loads back with both entries.
+    #[test]
+    fn calibration_authoring_writes_one_entry_per_prompt() {
+        let identity = CalibrationIdentity {
+            track_id: "track-a",
+            box_name: "box-a",
+            reference_commit: &"a".repeat(40),
+            benchd_source_commit: &"b".repeat(40),
+            captured_at: "2026-09-27T00:00:00Z",
+        };
+        let cal = calibration_from_passes(
+            &identity,
+            &[
+                PromptPasses {
+                    prompt: "botany",
+                    prefill_legs: &[0.001, 0.001],
+                    decode_legs: &[0.030, 0.030],
+                },
+                PromptPasses {
+                    prompt: "kelp",
+                    prefill_legs: &[0.002, 0.002],
+                    decode_legs: &[0.060, 0.060],
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let prompts: Vec<&str> = cal.prompts.iter().map(|e| e.prompt.as_str()).collect();
+        assert_eq!(prompts, ["botany", "kelp"]);
+        assert_eq!(cal.prompts[1].decode_seconds_per_token_mean, 0.060);
+
+        let dir = std::env::temp_dir().join(format!(
+            "benchd-calibration-prompts-test.{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("baseline-calibration.json");
+        write_calibration(&out, &cal).unwrap();
+        let sealed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(sealed["version"], CALIBRATION_VERSION);
+        assert_eq!(sealed["prompts"][1]["prompt"], "kelp");
+        assert_eq!(load_calibration(Some(&out), None).unwrap().calibration, cal);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE CALIBRATION FILE CARRIES EVERY GATE POINT, PER PASS (David 2026-09-17), in the same
@@ -1254,10 +1566,14 @@ mod tests {
             track_id: "mlx-qwen38",
             box_name: "box-3",
             reference_commit: &"a".repeat(40),
-            prompt: "p",
             benchd_source_commit: &"b".repeat(40),
             captured_at: "2026-09-17T00:00:00Z",
         };
+        let prompts = [PromptPasses {
+            prompt: "p",
+            prefill_legs: &[0.001, 0.001],
+            decode_legs: &[0.030, 0.030],
+        }];
         let point = |pass: i64, phase: &str, waited: u64| GateRecord {
             pair: None,
             pass: Some(pass),
@@ -1283,9 +1599,7 @@ mod tests {
             point(2, "prefill", 30),
             point(2, "decode", 45),
         ];
-        let cal =
-            calibration_from_passes(&identity, &[0.001, 0.001], &[0.030, 0.030], gates.clone())
-                .unwrap();
+        let cal = calibration_from_passes(&identity, &prompts, gates.clone()).unwrap();
         assert_eq!(cal.gates, gates);
 
         let dir = std::env::temp_dir().join(format!(
@@ -1310,9 +1624,7 @@ mod tests {
 
         // NO gate points (the gates were off): the key is omitted, so the file's key set is the
         // one every calibration file before this change had.
-        let ungated =
-            calibration_from_passes(&identity, &[0.001, 0.001], &[0.030, 0.030], Vec::new())
-                .unwrap();
+        let ungated = calibration_from_passes(&identity, &prompts, Vec::new()).unwrap();
         let out = dir.join("ungated.json");
         write_calibration(&out, &ungated).unwrap();
         let sealed: serde_json::Value =

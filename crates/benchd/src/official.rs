@@ -445,12 +445,14 @@ enum TimedWindowFailure {
 /// (`cache_memory == 0`).
 ///
 /// The unmeasured warmup leg is deliberately UNGATED — it is what heats the GPU — and the cool gate
-/// then holds each TIMED phase to the per-phase contract.
+/// then holds each TIMED phase to the per-phase contract. `verify` is how the timed legs check the
+/// engine's tokens against the oracle.
 fn run_timed_window<T, FT, G>(
     params: &TimingParams,
     warmup_params: Option<&TimingParams>,
     spawn_timed: &mut FT,
     cool_gate: &mut G,
+    verify: VerifyMode,
 ) -> Result<(TimingResult, Session<T>), TimedWindowFailure>
 where
     T: LineTransport,
@@ -470,13 +472,9 @@ where
         )
         .map_err(TimedWindowFailure::Warmup)?;
     }
-    let measured = run_timed_benchmark_persistent_on_session(
-        &mut session,
-        cool_gate,
-        params,
-        VerifyMode::Verify,
-    )
-    .map_err(TimedWindowFailure::Timed)?;
+    let measured =
+        run_timed_benchmark_persistent_on_session(&mut session, cool_gate, params, verify)
+            .map_err(TimedWindowFailure::Timed)?;
     Ok((measured, session))
 }
 
@@ -484,11 +482,16 @@ where
 /// failed payload that ends the run. Shared by the single-leg window and the paired path, so an
 /// oracle mismatch, a warmup fault and a protocol fault are classified ONCE. On the load-once
 /// residency the measured session comes back still open for the correctness gate.
+///
+/// `verify` is [`VerifyMode::Verify`] everywhere but on the candidate leg of a paired run whose
+/// track declares a timed token tolerance. There it is [`VerifyMode::PrefillOnly`]: the leg runs the
+/// whole decode window and keeps the tokens it emitted, and the paired path judges them.
 fn measure_candidate_window<T, FT, G>(
     run: OfficialParams<'_>,
     benchmark: &bench_core::golden::BenchmarkGolden,
     spawn_timed: &mut FT,
     cool_gate: &mut G,
+    verify: VerifyMode,
 ) -> Result<(TimingResult, Session<T>), Box<ScorePayload>>
 where
     T: LineTransport,
@@ -514,7 +517,13 @@ where
     // discarded; the timed legs pass the caller's cool gate; the held session comes back so the
     // correctness phase below can reuse the ONE model residency.
     let warmup_params = official_warmup_params(benchmark, spec.clone(), window);
-    let measured_result = run_timed_window(&params, warmup_params.as_ref(), spawn_timed, cool_gate);
+    let measured_result = run_timed_window(
+        &params,
+        warmup_params.as_ref(),
+        spawn_timed,
+        cool_gate,
+        verify,
+    );
     let (measured, held_session) = match measured_result {
         Ok(t) => t,
         Err(TimedWindowFailure::Warmup(e)) => {
@@ -645,6 +654,7 @@ where
         benchmark,
         &mut spawn_timed,
         &mut cool_gate,
+        VerifyMode::Verify,
     ) {
         Ok(measured) => measured,
         Err(payload) => return *payload,
@@ -717,11 +727,13 @@ where
     // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire.
     let params = official_timed_params(benchmark, None, window);
     let warmup_params = official_warmup_params(benchmark, None, window);
+    // EXACT in every mode: the reference tree must reproduce its own golden.
     let measured = run_timed_window(
         &params,
         warmup_params.as_ref(),
         &mut spawn_baseline,
         &mut cool_gate,
+        VerifyMode::Verify,
     );
     // Reap leg 1's residency before returning: leg 2 loads next, and two model residencies must
     // never be live at once.
@@ -744,10 +756,6 @@ where
 pub struct PairedBaselineSeal<'a> {
     pub box_name: &'a str,
     pub calibration_sha256: &'a str,
-    /// The digest of the GOLDEN leg 1 verified its decode tokens against. It is the candidate
-    /// golden's on a track whose timed oracle at the declared depth IS the serial tape, and the
-    /// serial live golden's on a track that carries per-depth oracle tapes.
-    pub control_golden_sha256: &'a str,
     pub reference_commit: &'a str,
     /// `true` once the control leg passed this box's band. A run whose leg failed the band seals
     /// no score, so this is `true` wherever it is sealed.
@@ -757,7 +765,10 @@ pub struct PairedBaselineSeal<'a> {
     pub leg: Option<(f64, f64)>,
 }
 
-/// Seal the paired-baseline facts onto a payload's metrics.
+/// Seal the paired-baseline facts onto a payload's metrics. `control_golden_sha256` is the digest
+/// of the GOLDEN leg 1 verified its decode tokens against: the candidate golden's on a track whose
+/// timed oracle at the declared depth IS the serial tape, and the serial live golden's on a track
+/// that carries per-depth oracle tapes.
 ///
 /// The CANDIDATE leg's numbers are READ BACK from the enforced fields
 /// (`prefill_seconds_per_token` / `decode_seconds_per_token`) rather than passed in again, so the
@@ -769,11 +780,15 @@ pub struct PairedBaselineSeal<'a> {
 /// The historical `baseline_{prefill,decode}_seconds_per_token` fields are NOT written here. They
 /// already carry the control leg's values, because the control leg's values are what the scoring
 /// call was given — that is the point of the design, and the board keeps reading them.
-pub fn seal_paired_baseline(metrics: &mut ScoreMetrics, seal: &PairedBaselineSeal<'_>) {
+pub fn seal_paired_baseline(
+    metrics: &mut ScoreMetrics,
+    seal: &PairedBaselineSeal<'_>,
+    control_golden_sha256: &str,
+) {
     metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
     metrics.baseline_box = Some(seal.box_name.to_string());
     metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
-    metrics.baseline_golden_sha256 = Some(seal.control_golden_sha256.to_string());
+    metrics.baseline_golden_sha256 = Some(control_golden_sha256.to_string());
     metrics.baseline_reference_commit = Some(seal.reference_commit.to_string());
     metrics.baseline_band_passed = Some(seal.band_passed);
     if let Some((prefill, decode)) = seal.leg {
@@ -795,9 +810,9 @@ fn finite_positive(v: f64) -> Option<f64> {
 /// A paired REFUSAL: a failed payload carrying the paired seal, so a reader of a refused run
 /// still learns which box, which calibration bytes and which reference commit it ran under. `leg`
 /// is the control leg's measured pair when one was measured, and `None` when no leg completed —
-/// absent is "no leg ran", never zero.
+/// absent is "no leg ran", never zero. `goldens` are the goldens of the pair that stopped.
 fn paired_refusal(
-    golden: &GoldenFixture,
+    goldens: PairedGoldens<'_>,
     digests: RunDigests<'_>,
     commit: &str,
     error: String,
@@ -807,11 +822,11 @@ fn paired_refusal(
     // and none is invented (`ScoringInputs::no_denominator`).
     scoring: ScoringInputs,
 ) -> ScorePayload {
-    let mut payload = official_failed(golden, digests, commit, error, scoring);
+    let mut payload = official_failed(goldens.candidate, digests, commit, error, scoring);
     let mut seal = seal;
     seal.band_passed = false;
     seal.leg = leg;
-    seal_paired_baseline(&mut payload.metrics, &seal);
+    seal_paired_baseline(&mut payload.metrics, &seal, &goldens.control.sha256);
     payload
 }
 
@@ -824,17 +839,21 @@ fn paired_refusal(
 /// serial tape, and DIFFERENT on a track that carries per-depth oracle tapes: leg 1 is serial by
 /// construction, so it can only be verified against the serial tape. On the MLX engine the
 /// per-depth tape diverges from the serial one at step 1, so one shared golden kills leg 1.
+///
+/// `prompt` is the prompt both goldens measure. It keys the calibration entry that gates leg 1.
 #[derive(Clone, Copy)]
 pub struct PairedGoldens<'a> {
     pub candidate: &'a GoldenFixture,
     pub control: &'a GoldenFixture,
+    pub prompt: &'a str,
 }
 
 /// The ENGINE and WORKER lifecycles of a paired run's two legs, in one value so the paired entry
 /// point states its inputs as two groups — WHO runs the legs, and WHAT window they run.
 ///
 /// `open_*_leg` is a leg's per-platform ENGINE lifecycle: it returns a GUARD that is dropped the
-/// moment its leg ends. `spawn_*` opens that leg's WORKER, rooted at that leg's tree.
+/// moment its leg ends. It is given the index of the pair's goldens, so the caller knows which
+/// golden the leg's workers measure. `spawn_*` opens that leg's WORKER, rooted at that leg's tree.
 pub struct PairedLegs<LB, LC, FB, FT> {
     pub open_baseline_leg: LB,
     pub open_candidate_leg: LC,
@@ -865,6 +884,7 @@ pub struct PairedWindow<G> {
     pub gate_log: std::rc::Rc<crate::quiescegate::GateLog>,
     /// Pairs per scored run, from the pinned track fixture (`official_pairs`; David 2026-09-09
     /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
+    /// Pair `k` (1-based) measures goldens `(k - 1) mod N` of the N the run was given.
     pub pairs: usize,
     /// The speedup floors this run enforces and seals, from the pinned track fixture
     /// (`decode_speedup_floor` / `prefill_speedup_floor`; David 2026-09-09 ruled 0.95 / 0.95,
@@ -875,20 +895,35 @@ pub struct PairedWindow<G> {
     /// migration, David 2026-09-15), falling back to the 0.75/0.25 constants while no fixture
     /// declares them.
     pub weights: ScoringWeights,
+    /// The timed token tolerance, in tokens per thousand, from the pinned track fixture
+    /// (`timed_token_tolerance_per_thousand`). `None` keeps the exact rule: one different token
+    /// fails the run. See [`judge_candidate_tokens`].
+    pub token_tolerance_per_thousand: Option<u32>,
+    /// The near-tie limit of that tolerance, from the pinned track fixture
+    /// (`timed_token_near_tie_relative_gap`). `None` counts every different token against the
+    /// tolerance. With a limit, only near ties are tolerated. See [`judge_candidate_tokens`].
+    pub near_tie_relative_gap: Option<f64>,
 }
 
 /// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
 ///
+/// `goldens` holds one entry per `--golden`, in command-line order, and is never empty. Pair `k`
+/// (1-based) measures entry `(k - 1) mod N`. The caller has already refused a pair count that is
+/// not a multiple of N ([`crate::baseline::check_pairs_cover_goldens`]). In each pair:
+///
 /// 1. **Serial-control leg** on the REFERENCE tree (`spawn_baseline`), no speculation
-///    ([`run_serial_control_leg`]), verified against `goldens.control` — the SERIAL tape.
-/// 2. **Band check** of that leg against THIS BOX's calibration file. The band is a health gate on
-///    leg 1; no number in the file is ever a denominator. Outside the band, the run dies by name
-///    and seals no score.
-/// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, followed by
-///    the full correctness set — [`official_core_windowed`], unchanged, verified against
-///    `goldens.candidate`, with the LIVE measurement from step 1 as its baseline pair. The score is therefore
-///    `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75`, with the floors and the
-///    band shape untouched.
+///    ([`run_serial_control_leg`]), verified against the pair's `control` golden — the SERIAL tape.
+/// 2. **Band check** of that leg against THIS BOX's calibration entry for the pair's prompt. The
+///    band is a health gate on leg 1; no number in the file is ever a denominator. Outside the
+///    band, the run dies by name and seals no score.
+/// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, verified
+///    against the pair's `candidate` golden, with the LIVE measurement from step 1 as its baseline
+///    pair.
+///
+/// The run then scores ONE pair, the lower median over all pairs ([`scored_pair_index`]), and runs
+/// the full correctness set on the scored pair's candidate golden. The score is therefore
+/// `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75` of that pair, with the floors
+/// and the band shape untouched.
 ///
 /// RESIDENCY is sequential, and it brackets each leg on BOTH levels. `open_baseline_leg` /
 /// `open_candidate_leg` are the platform's per-leg ENGINE lifecycle: on a platform whose worker
@@ -901,7 +936,7 @@ pub struct PairedWindow<G> {
 /// The paired seal rides on EVERY payload this returns, including the refusals, because "which box
 /// and which calibration" is exactly what a reader of a refused run needs.
 pub fn official_core_paired<T, L, LB, LC, FB, FT, G>(
-    goldens: PairedGoldens<'_>,
+    goldens: &[PairedGoldens<'_>],
     calibration: &crate::baseline::BaselineCalibration,
     seal: PairedBaselineSeal<'_>,
     digests: RunDigests<'_>,
@@ -911,8 +946,8 @@ pub fn official_core_paired<T, L, LB, LC, FB, FT, G>(
 ) -> ScorePayload
 where
     T: LineTransport,
-    LB: FnMut() -> Result<L, String>,
-    LC: FnMut() -> Result<L, String>,
+    LB: FnMut(usize) -> Result<L, String>,
+    LC: FnMut(usize) -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
     FT: FnMut() -> bench_runner::Result<Session<T>>,
     G: FnMut(&str) -> bench_runner::Result<()>,
@@ -921,16 +956,21 @@ where
     // — the scored one and every refusal alike. What a run gated on before it stopped is exactly
     // what a reader of a refused run needs (David 2026-09-17).
     let gate_log = std::rc::Rc::clone(&window.gate_log);
+    let tolerance = window.token_tolerance_per_thousand;
+    let near_tie_gap = window.near_tie_relative_gap;
     let mut payload =
         official_core_paired_inner(goldens, calibration, seal, digests, commit, legs, window);
     payload.metrics.gates = gate_log.records();
+    // The token rule the run applied rides on every payload, so a reader of the score sees it.
+    payload.metrics.timed_token_tolerance_per_thousand = tolerance;
+    payload.metrics.timed_token_near_tie_relative_gap = near_tie_gap;
     payload
 }
 
 /// [`official_core_paired`]'s body, which returns from many places. The wrapper above seals the
 /// gate log on all of them at once.
 fn official_core_paired_inner<T, L, LB, LC, FB, FT, G>(
-    goldens: PairedGoldens<'_>,
+    goldens: &[PairedGoldens<'_>],
     calibration: &crate::baseline::BaselineCalibration,
     seal: PairedBaselineSeal<'_>,
     digests: RunDigests<'_>,
@@ -940,16 +980,12 @@ fn official_core_paired_inner<T, L, LB, LC, FB, FT, G>(
 ) -> ScorePayload
 where
     T: LineTransport,
-    LB: FnMut() -> Result<L, String>,
-    LC: FnMut() -> Result<L, String>,
+    LB: FnMut(usize) -> Result<L, String>,
+    LC: FnMut(usize) -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
     FT: FnMut() -> bench_runner::Result<Session<T>>,
     G: FnMut(&str) -> bench_runner::Result<()>,
 {
-    let PairedGoldens {
-        candidate: golden,
-        control: control_golden,
-    } = goldens;
     let PairedLegs {
         mut open_baseline_leg,
         mut open_candidate_leg,
@@ -965,10 +1001,18 @@ where
         pairs,
         floors,
         weights,
+        token_tolerance_per_thousand,
+        near_tie_relative_gap,
     } = window;
+    // With a tolerance the candidate leg does not stop at a different decode token; the pairs are
+    // judged after the last one ([`judge_candidate_tokens`]).
+    let candidate_verify = match token_tolerance_per_thousand {
+        Some(_) => VerifyMode::PrefillOnly,
+        None => VerifyMode::Verify,
+    };
     if pairs == 0 {
         return paired_refusal(
-            golden,
+            goldens[0],
             digests,
             commit,
             "the paired official run was asked for 0 pairs; the track fixture must declare at least 1"
@@ -978,23 +1022,28 @@ where
             ScoringInputs::no_denominator(floors, weights),
         );
     }
-    let benchmark = match &golden.benchmark {
-        Some(b) => b,
-        None => {
-            return paired_refusal(
-                golden,
-                digests,
-                commit,
-                "benchmark golden file must contain a benchmark oracle".to_string(),
-                seal,
-                None,
-                ScoringInputs::no_denominator(floors, weights),
-            )
+    // Every candidate golden must carry its oracle before the first leg runs.
+    let mut benchmarks = Vec::with_capacity(goldens.len());
+    for pair_goldens in goldens {
+        match &pair_goldens.candidate.benchmark {
+            Some(b) => benchmarks.push(b),
+            None => {
+                return paired_refusal(
+                    *pair_goldens,
+                    digests,
+                    commit,
+                    "benchmark golden file must contain a benchmark oracle".to_string(),
+                    seal,
+                    None,
+                    ScoringInputs::no_denominator(floors, weights),
+                )
+            }
         }
-    };
+    }
 
     // PAIR LOOP. Every pair is the same two legs in the same order: the serial-control leg on the
-    // reference tree, band-checked against the box calibration, then the candidate leg. A leg's
+    // reference tree, band-checked against the box calibration, then the candidate leg. Both legs
+    // of a pair measure the pair's one prompt; the pairs cycle over the goldens. A leg's
     // ENGINE comes up before its worker and goes down before the next leg's comes up, so two
     // residents never hold GPU memory at once. The LAST pair's candidate session is kept open on
     // the load-once residency so the correctness gate runs over the same model residency.
@@ -1003,12 +1052,16 @@ where
     let mut held_session: Option<Session<T>> = None;
     let mut held_candidate_leg: Option<L> = None;
     for pair in 1..=pairs {
-        let baseline_leg = match open_baseline_leg() {
+        let golden_index = (pair - 1) % goldens.len();
+        let pair_goldens = goldens[golden_index];
+        let golden = pair_goldens.candidate;
+        let benchmark = benchmarks[golden_index];
+        let baseline_leg = match open_baseline_leg(golden_index) {
             Ok(guard) => guard,
             Err(e) => {
                 return with_measured_pairs(
                     paired_refusal(
-                        golden,
+                        pair_goldens,
                         digests,
                         commit,
                         e,
@@ -1024,7 +1077,7 @@ where
         // leg's timed phases run is recorded under that name (David 2026-09-17).
         gate_log.enter_leg(pair, crate::quiescegate::LEG_CONTROL);
         let control_result = run_serial_control_leg(
-            control_golden,
+            pair_goldens.control,
             &window_shape,
             &mut spawn_baseline,
             &mut cool_gate,
@@ -1035,7 +1088,7 @@ where
             Err(e) => {
                 return with_measured_pairs(
                     paired_refusal(
-                        golden,
+                        pair_goldens,
                         digests,
                         commit,
                         e,
@@ -1052,6 +1105,7 @@ where
             control.decode_seconds_per_token,
         ));
         if let Err(e) = calibration.check_band(
+            pair_goldens.prompt,
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
         ) {
@@ -1062,7 +1116,7 @@ where
             };
             return with_measured_pairs(
                 paired_refusal(
-                    golden,
+                    pair_goldens,
                     digests,
                     commit,
                     e,
@@ -1073,12 +1127,12 @@ where
                 records,
             );
         }
-        let candidate_leg = match open_candidate_leg() {
+        let candidate_leg = match open_candidate_leg(golden_index) {
             Ok(guard) => guard,
             Err(e) => {
                 return with_measured_pairs(
                     paired_refusal(
-                        golden,
+                        pair_goldens,
                         digests,
                         commit,
                         e,
@@ -1109,6 +1163,7 @@ where
             benchmark,
             &mut spawn_timed,
             &mut cool_gate,
+            candidate_verify,
         ) {
             Ok(measured) => measured,
             Err(payload) => {
@@ -1117,15 +1172,20 @@ where
                 let mut seal = seal;
                 seal.band_passed = true;
                 seal.leg = measured_leg;
-                seal_paired_baseline(&mut payload.metrics, &seal);
+                seal_paired_baseline(&mut payload.metrics, &seal, &pair_goldens.control.sha256);
                 payload.metrics.paired_legs = records;
                 return payload;
             }
         };
         let (control_seed_window, control_decode_window) = window_per_token(&control);
         let (candidate_seed_window, candidate_decode_window) = window_per_token(&timing);
+        // Tokens equal to the golden's oracle have no mismatch, and no replay runs for them. The
+        // counts of any other pair stay unset until [`judge_candidate_tokens`] replays it.
+        let exact = timing.emitted_tokens == oracle_tokens(benchmark, timing.decode_steps);
+        let exact_count = exact.then_some(0);
         records.push(PairedLegRecord {
             pair: pair as i64,
+            prompt_sha256: golden.sha256.clone(),
             control_prefill_seconds_per_token: control.prefill_seconds_per_token,
             control_decode_seconds_per_token: control.decode_seconds_per_token,
             candidate_prefill_seconds_per_token: timing.prefill_seconds_per_token,
@@ -1134,6 +1194,11 @@ where
             control_decode_window_seconds_per_token: control_decode_window,
             candidate_seed_prefill_window_seconds_per_token: candidate_seed_window,
             candidate_decode_window_seconds_per_token: candidate_decode_window,
+            token_mismatch_count: exact_count,
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: near_tie_relative_gap.and(exact_count),
+            token_mismatch_second_choice_count: exact_count,
+            token_mismatch_second_choice_max_relative_gap: None,
         });
         candidate_timings.push(timing);
         if pair < pairs {
@@ -1151,10 +1216,8 @@ where
     // measured. With ONE pair this is that pair.
     let scored = scored_pair_index(&records, weights);
     let scored_record = records[scored].clone();
-    let candidate = candidate_timings
-        .into_iter()
-        .nth(scored)
-        .expect("one candidate timing per sealed pair");
+    let scored_goldens = goldens[scored % goldens.len()];
+    let candidate = &candidate_timings[scored];
     let control_prefill = scored_record.control_prefill_seconds_per_token;
     let control_decode = scored_record.control_decode_seconds_per_token;
     // The scored run's inputs: the scored pair's control leg as the denominator, the track
@@ -1169,12 +1232,12 @@ where
 
     let mut held = held_session;
     let mut payload = finish_official(
-        golden,
+        scored_goldens.candidate,
         paired_scoring,
         bands,
         digests,
         commit,
-        &candidate,
+        candidate,
         move || {
             held.take().ok_or_else(|| {
                 RunnerError::Protocol(
@@ -1186,13 +1249,101 @@ where
         },
     );
     drop(held_candidate_leg);
+
+    // THE TIMED TOKEN TOLERANCE (David 2026-09-28). The candidate's residency is gone, so the
+    // reference engine can load. A pair over the limit, or a replay that did not complete, refuses
+    // the whole run by name. The refusal replaces the payload above: the token verdict comes
+    // first, as it did when one different token stopped the candidate leg.
+    if let Some(limit) = token_tolerance_per_thousand {
+        if let Err((failing, error)) = judge_candidate_tokens(
+            limit,
+            near_tie_relative_gap,
+            &benchmarks,
+            &candidate_timings,
+            &mut records,
+            &mut open_baseline_leg,
+            &mut spawn_baseline,
+        ) {
+            let record = records[failing].clone();
+            let failing_goldens = goldens[failing % goldens.len()];
+            let control_leg = (
+                record.control_prefill_seconds_per_token,
+                record.control_decode_seconds_per_token,
+            );
+            let mut payload = official_failed_timed_oracle(
+                failing_goldens.candidate,
+                digests,
+                commit,
+                error,
+                record.token_mismatch_first_step,
+                ScoringInputs {
+                    baseline_prefill_spt: control_leg.0,
+                    baseline_decode_spt: control_leg.1,
+                    floors,
+                    weights,
+                },
+            );
+            let mut seal = seal;
+            seal.band_passed = true;
+            seal.leg = Some(control_leg);
+            seal_paired_baseline(&mut payload.metrics, &seal, &failing_goldens.control.sha256);
+            seal_token_counts(&mut payload.metrics, &record);
+            payload.metrics.paired_legs = records;
+            return payload;
+        }
+    }
+
     let mut seal = seal;
     seal.band_passed = true;
     seal.leg = Some((control_prefill, control_decode));
-    seal_paired_baseline(&mut payload.metrics, &seal);
+    seal_paired_baseline(&mut payload.metrics, &seal, &scored_goldens.control.sha256);
     seal_window_split(&mut payload.metrics, &scored_record);
+    seal_token_counts(&mut payload.metrics, &records[scored]);
+    // The payload builders sealed `per_prompt` for the scored pair's golden only, and only when
+    // they kept the timing. Replace it with one record per distinct golden.
+    if !payload.metrics.per_prompt.is_empty() {
+        payload.metrics.per_prompt =
+            paired_per_prompt(goldens, &records, &candidate_timings, weights);
+    }
     payload.metrics.paired_legs = records;
     payload
+}
+
+/// One `per_prompt` record per distinct candidate golden, in command-line order. Each record
+/// carries the drafting facts of one pair that measured its prompt. When a prompt has several
+/// pairs, the record is the pair that the run's own rule picks among them: the lower median of
+/// their composites ([`scored_pair_index`]). With one golden that pair is the scored pair, so the
+/// record is the one the payload builders sealed.
+fn paired_per_prompt(
+    goldens: &[PairedGoldens<'_>],
+    records: &[PairedLegRecord],
+    timings: &[TimingResult],
+    weights: ScoringWeights,
+) -> Vec<crate::score::ScorePerPrompt> {
+    let mut out = Vec::new();
+    for (i, pair_goldens) in goldens.iter().enumerate() {
+        let golden = pair_goldens.candidate;
+        if goldens[..i]
+            .iter()
+            .any(|g| g.candidate.sha256 == golden.sha256)
+        {
+            continue;
+        }
+        let pairs: Vec<usize> = (0..records.len())
+            .filter(|&p| records[p].prompt_sha256 == golden.sha256)
+            .collect();
+        let own: Vec<PairedLegRecord> = pairs.iter().map(|&p| records[p].clone()).collect();
+        let timing = &timings[pairs[scored_pair_index(&own, weights)]];
+        let mut metrics = ScoreMetrics {
+            decode_seconds_per_token: crate::iterate::finite_nonneg(
+                timing.decode_seconds_per_token,
+            ),
+            ..ScoreMetrics::default()
+        };
+        seal_official_per_prompt(&mut metrics, golden, timing);
+        out.extend(metrics.per_prompt);
+    }
+    out
 }
 
 /// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
@@ -1250,6 +1401,236 @@ fn scored_pair_index(records: &[PairedLegRecord], weights: ScoringWeights) -> us
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by(|&a, &b| composite(&records[a]).total_cmp(&composite(&records[b])));
     order[(records.len() - 1) / 2]
+}
+
+/// The EXACT-MATCH name of the refusal "a pair's candidate tokens differ from the reference
+/// engine's choices on more than the track's timed token tolerance". The names do not contain the
+/// word TOKEN: the seal scrubber reads `TOKEN…:` as a credential key and redacts the rest of the
+/// line.
+pub const TIMED_DIVERGENCE_OVER_TOLERANCE: &str = "TIMED-DIVERGENCE-OVER-TOLERANCE";
+
+/// The EXACT-MATCH name of the refusal "a pair's candidate token differs from the reference
+/// engine's choice and is not a near tie under the track's `timed_token_near_tie_relative_gap`".
+pub const TIMED_DIVERGENCE_NOT_A_NEAR_TIE: &str = "TIMED-DIVERGENCE-NOT-A-NEAR-TIE";
+
+/// The EXACT-MATCH name of the refusal "the reference engine's replay of the candidate's tokens did
+/// not complete". Without the replay benchd cannot count the mismatches, so the run seals no score.
+pub const TIMED_REPLAY_FAILED: &str = "TIMED-REPLAY-FAILED";
+
+/// The golden's oracle for the positions a candidate leg emits: the seed token, then the first
+/// `decode_steps` decode tokens.
+fn oracle_tokens(benchmark: &bench_core::golden::BenchmarkGolden, decode_steps: usize) -> Vec<i64> {
+    std::iter::once(benchmark.expected_decode_seed_token)
+        .chain(
+            benchmark
+                .expected_decode_tokens
+                .iter()
+                .take(decode_steps)
+                .copied(),
+        )
+        .collect()
+}
+
+/// The reference engine's choices at one replayed position: its argmax, its second choice, and the
+/// relative gap between the two logits (`bench_core::near_tie::relative_gap`).
+struct ReferenceChoice {
+    first: i64,
+    second: i64,
+    second_gap: f64,
+}
+
+/// Read one teacher-forced response as a [`ReferenceChoice`]. The argmax is the response token;
+/// the second choice is the highest logit of another token.
+fn reference_choice(
+    resp: &bench_protocol::WorkerResponse,
+) -> bench_runner::Result<ReferenceChoice> {
+    let first = resp.token.ok_or_else(|| {
+        RunnerError::Protocol("the reference replay response carried no token".to_string())
+    })?;
+    let logits = resp.top_logits.as_deref().unwrap_or_default();
+    let top = logits
+        .iter()
+        .map(|l| l.logit)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let second = logits
+        .iter()
+        .filter(|l| l.token != first)
+        .max_by(|a, b| a.logit.total_cmp(&b.logit))
+        .ok_or_else(|| {
+            RunnerError::Protocol(
+                "the reference replay response carried no second choice".to_string(),
+            )
+        })?;
+    Ok(ReferenceChoice {
+        first,
+        second: second.token,
+        second_gap: bench_core::near_tie::relative_gap(top, second.logit),
+    })
+}
+
+/// Replay one candidate leg's emitted tokens teacher-forced on the reference engine.
+/// `correctness_begin(seed_prompt)` gives the reference choice for the seed position, and
+/// `correctness_step(emitted[i])` gives the reference choice for position `i + 1`. The replay is
+/// not timed.
+fn replay_candidate_tokens<T: LineTransport>(
+    session: &mut Session<T>,
+    seed_prompt: &[i64],
+    emitted: &[i64],
+) -> bench_runner::Result<Vec<ReferenceChoice>> {
+    session.begin_phase();
+    let mut choices = Vec::with_capacity(emitted.len());
+    let mut resp = session.correctness_begin(seed_prompt)?;
+    for (i, &token) in emitted.iter().enumerate() {
+        choices.push(reference_choice(&resp)?);
+        if i + 1 < emitted.len() {
+            resp = session.correctness_step(token)?;
+        }
+    }
+    session.close_phase()?;
+    Ok(choices)
+}
+
+/// THE TIMED TOKEN TOLERANCE of the paired path (David 2026-09-28): the blanket 10 % rule of
+/// 2026-08-25 ([`bench_core::cohort_tolerance`]) applied to each pair's candidate leg.
+///
+/// A pair whose tokens equal the golden's oracle already carries 0 mismatches and is not replayed.
+/// Every other pair is replayed on the REFERENCE tree: its engine boots the way the serial-control
+/// leg boots it, ONE worker serves every replay, so the reference weights load once. At each
+/// position the candidate's token is compared with the reference engine's choice for the
+/// candidate's own prefix. The decision is `evaluate_cohort_token_tolerance`, with one pair per
+/// stream: a pair passes when `mismatches * 1000 <= limit * tokens`.
+///
+/// NEAR TIES ONLY (David 2026-09-28: "10% for near ties only"). With a `near_tie_gap`, a mismatch
+/// is tolerated only when the candidate's token is the reference engine's second choice and the
+/// relative gap between its first and second choice is `<= near_tie_gap`. The first pair with any
+/// other mismatch refuses the run, before the count rule. Near ties still count against `limit`.
+///
+/// The second-choice figures are REPORT-ONLY. They are written to the records and nothing reads
+/// them to decide.
+///
+/// `Err` carries the index of the pair to name and the refusal text.
+fn judge_candidate_tokens<T, L, LB, FB>(
+    limit: u32,
+    near_tie_gap: Option<f64>,
+    benchmarks: &[&bench_core::golden::BenchmarkGolden],
+    timings: &[TimingResult],
+    records: &mut [PairedLegRecord],
+    open_baseline_leg: &mut LB,
+    spawn_baseline: &mut FB,
+) -> Result<(), (usize, String)>
+where
+    T: LineTransport,
+    LB: FnMut(usize) -> Result<L, String>,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+{
+    let replay_failed =
+        |p: usize, e: String| (p, format!("{TIMED_REPLAY_FAILED}: pair {}: {e}", p + 1));
+    let committed: Vec<Vec<i64>> = timings.iter().map(|t| t.emitted_tokens.clone()).collect();
+    let mut reference = committed.clone();
+    let pending: Vec<usize> = (0..records.len())
+        .filter(|&p| records[p].token_mismatch_count.is_none())
+        .collect();
+    // The first pair with a mismatch that is not a near tie: its index, and the refusal text.
+    let mut not_a_near_tie: Option<(usize, String)> = None;
+    if let Some(&first) = pending.first() {
+        let leg =
+            open_baseline_leg(first % benchmarks.len()).map_err(|e| replay_failed(first, e))?;
+        let mut session = spawn_baseline().map_err(|e| replay_failed(first, e.to_string()))?;
+        for &p in &pending {
+            let emitted = &committed[p];
+            let choices = replay_candidate_tokens(
+                &mut session,
+                &benchmarks[p % benchmarks.len()].decode_seed_tokens,
+                emitted,
+            )
+            .map_err(|e| replay_failed(p, e.to_string()))?;
+            let second_choice_gaps: Vec<f64> = emitted
+                .iter()
+                .zip(&choices)
+                .filter(|(&t, c)| t != c.first && t == c.second)
+                .map(|(_, c)| c.second_gap)
+                .collect();
+            let record = &mut records[p];
+            record.token_mismatch_first_step = emitted
+                .iter()
+                .zip(&choices)
+                .position(|(&t, c)| t != c.first)
+                .map(|i| i as i64);
+            record.token_mismatch_second_choice_count = Some(second_choice_gaps.len() as i64);
+            record.token_mismatch_second_choice_max_relative_gap =
+                second_choice_gaps.into_iter().reduce(f64::max);
+            if let Some(gap_limit) = near_tie_gap {
+                let mut near_ties = 0i64;
+                for (step, (&t, c)) in emitted.iter().zip(&choices).enumerate() {
+                    if t == c.first {
+                        continue;
+                    }
+                    let failed = if t != c.second {
+                        "the token is not the reference engine's second choice".to_string()
+                    } else if c.second_gap > gap_limit {
+                        format!("the gap {} is above the limit", c.second_gap)
+                    } else {
+                        near_ties += 1;
+                        continue;
+                    };
+                    if not_a_near_tie.is_none() {
+                        not_a_near_tie = Some((
+                            p,
+                            format!(
+                                "{TIMED_DIVERGENCE_NOT_A_NEAR_TIE}: pair {} of {}: the timed \
+                                 token at position {step} differs from the reference engine's \
+                                 choice and is not a near tie under the limit {gap_limit}: \
+                                 {failed}",
+                                p + 1,
+                                records.len(),
+                            ),
+                        ));
+                    }
+                }
+                records[p].token_mismatch_near_tie_count = Some(near_ties);
+            }
+            reference[p] = choices.iter().map(|c| c.first).collect();
+        }
+        drop(session);
+        drop(leg);
+    }
+    let verdict = bench_core::cohort_tolerance::evaluate_cohort_token_tolerance(
+        &committed, &reference, limit,
+    )
+    .map_err(|e| replay_failed(0, e.to_string()))?;
+    for count in &verdict.per_stream {
+        records[count.slot].token_mismatch_count = Some(count.mismatches as i64);
+    }
+    if let Some(refusal) = not_a_near_tie {
+        return Err(refusal);
+    }
+    match verdict.first_failing {
+        Some(f) => Err((
+            f.slot,
+            format!(
+                "{TIMED_DIVERGENCE_OVER_TOLERANCE}: pair {} of {}: {} of the candidate's {} timed \
+                 tokens differ from the reference engine's choice for the same prefix; the track \
+                 fixture allows at most {limit} per thousand ({} * 1000 > {limit} * {})",
+                f.slot + 1,
+                records.len(),
+                f.mismatches,
+                f.committed_len,
+                f.mismatches,
+                f.committed_len,
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Seal one pair's token counts as the run-level figures.
+fn seal_token_counts(metrics: &mut ScoreMetrics, record: &PairedLegRecord) {
+    metrics.token_mismatch_count = record.token_mismatch_count;
+    metrics.token_mismatch_first_step = record.token_mismatch_first_step;
+    metrics.token_mismatch_near_tie_count = record.token_mismatch_near_tie_count;
+    metrics.token_mismatch_second_choice_count = record.token_mismatch_second_choice_count;
+    metrics.token_mismatch_second_choice_max_relative_gap =
+        record.token_mismatch_second_choice_max_relative_gap;
 }
 
 /// A refusal that also seals the pairs already measured before it (`metrics.paired_legs`).
@@ -2186,6 +2567,7 @@ mod tests {
             // mean(4, 4, 4, 5) == 4.25 == IN_BAND_MEAN_DRAFT_LEN.
             free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
             phase_window: None,
+            emitted_tokens: Vec::new(),
         }
     }
 
@@ -3508,6 +3890,7 @@ mod tests {
             effective_spec: None,
             free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
             phase_window: None,
+            emitted_tokens: Vec::new(),
         };
         finish_official(
             golden,
@@ -4495,7 +4878,17 @@ mod tests {
             track_id: "qwen3.8-125b-a6b-mlx-v1".to_string(),
             box_name: "m5-max-128gb-4-qwen38-125b-a6b-mlx".to_string(),
             reference_commit: "a".repeat(40),
-            prompt: "botany".to_string(),
+            captured_at: "2026-09-08T00:00:00Z".to_string(),
+            benchd_source_commit: "b".repeat(40),
+            prompts: vec![wide_prompt_calibration("botany")],
+            gates: Vec::new(),
+        }
+    }
+
+    /// One prompt's WIDE band (see [`wide_calibration`]).
+    fn wide_prompt_calibration(prompt: &str) -> crate::baseline::PromptCalibration {
+        crate::baseline::PromptCalibration {
+            prompt: prompt.to_string(),
             passes: 4,
             prefill_seconds_per_token_mean: 1e-6,
             decode_seconds_per_token_mean: 1e-6,
@@ -4505,24 +4898,26 @@ mod tests {
             prefill_band_high: 1e6,
             decode_band_low: 1e-6,
             decode_band_high: 1e6,
-            captured_at: "2026-09-08T00:00:00Z".to_string(),
-            benchd_source_commit: "b".repeat(40),
-            gates: Vec::new(),
         }
     }
 
-    /// A calibration the mock's measurement can never satisfy: a mean of one second per token with
-    /// the shipped band literals.
     /// A calibration every real leg is SLOWER than: means of a nanosecond per token, so the
     /// control leg lands above the band's ceiling and the health gate refuses.
-    fn narrow_calibration() -> crate::baseline::BaselineCalibration {
-        crate::baseline::BaselineCalibration {
+    fn narrow_prompt_calibration(prompt: &str) -> crate::baseline::PromptCalibration {
+        crate::baseline::PromptCalibration {
             prefill_seconds_per_token_mean: 1e-9,
             decode_seconds_per_token_mean: 1e-9,
             prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
             prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
             decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,
             decode_band_high: crate::baseline::DEFAULT_DECODE_BAND_HIGH,
+            ..wide_prompt_calibration(prompt)
+        }
+    }
+
+    fn narrow_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            prompts: vec![narrow_prompt_calibration("botany")],
             ..wide_calibration()
         }
     }
@@ -4533,7 +4928,6 @@ mod tests {
         PairedBaselineSeal {
             box_name: &calibration.box_name,
             calibration_sha256: "c0ffee",
-            control_golden_sha256: "5e21a1",
             reference_commit: &calibration.reference_commit,
             band_passed: false,
             leg: None,
@@ -4556,6 +4950,8 @@ mod tests {
             // The tests drive the ruled floors; the per-project arms set their own.
             floors: SpeedupFloors::DEFAULT,
             weights: ScoringWeights::DEFAULT,
+            token_tolerance_per_thousand: None,
+            near_tie_relative_gap: None,
         }
     }
 
@@ -4599,17 +4995,18 @@ mod tests {
         };
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || Ok(()),
-                open_candidate_leg: || Ok(()),
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
                 spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
                 spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
             },
@@ -4691,23 +5088,24 @@ mod tests {
         }
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || {
+                open_baseline_leg: |_| {
                     events.borrow_mut().push("baseline-engine-up");
                     Ok(LegGuard {
                         events: Rc::clone(&events),
                         label: "baseline-engine-down",
                     })
                 },
-                open_candidate_leg: || {
+                open_candidate_leg: |_| {
                     events.borrow_mut().push("candidate-engine-up");
                     Ok(LegGuard {
                         events: Rc::clone(&events),
@@ -4759,7 +5157,7 @@ mod tests {
         assert_eq!(m.baseline_prefill_seconds_per_token, leg_prefill);
         assert_eq!(m.baseline_decode_seconds_per_token, leg_decode);
         assert_ne!(
-            leg_prefill, calibration.prefill_seconds_per_token_mean,
+            leg_prefill, calibration.prompts[0].prefill_seconds_per_token_mean,
             "the calibration's mean must never be the denominator"
         );
         assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
@@ -4809,23 +5207,24 @@ mod tests {
         window.pairs = 2;
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || {
+                open_baseline_leg: |_| {
                     events.borrow_mut().push("baseline-engine-up");
                     Ok(LegGuard {
                         events: Rc::clone(&events),
                         label: "baseline-engine-down",
                     })
                 },
-                open_candidate_leg: || {
+                open_candidate_leg: |_| {
                     events.borrow_mut().push("candidate-engine-up");
                     Ok(LegGuard {
                         events: Rc::clone(&events),
@@ -4929,6 +5328,7 @@ mod tests {
     fn pair_with_composite(pair: i64, decode_gain: f64) -> PairedLegRecord {
         PairedLegRecord {
             pair,
+            prompt_sha256: String::new(),
             control_prefill_seconds_per_token: 1.0,
             control_decode_seconds_per_token: 1.0,
             candidate_prefill_seconds_per_token: 1.0,
@@ -4937,6 +5337,11 @@ mod tests {
             control_decode_window_seconds_per_token: None,
             candidate_seed_prefill_window_seconds_per_token: None,
             candidate_decode_window_seconds_per_token: None,
+            token_mismatch_count: Some(0),
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: None,
+            token_mismatch_second_choice_count: Some(0),
+            token_mismatch_second_choice_max_relative_gap: None,
         }
     }
 
@@ -4977,6 +5382,177 @@ mod tests {
         );
     }
 
+    /// Two goldens of the same oracle that differ by their digest, and a calibration with a WIDE
+    /// band for each of their prompts.
+    fn two_goldens() -> (GoldenFixture, GoldenFixture) {
+        let first = official_golden(None);
+        let mut second = official_golden(None);
+        second.sha256 = "b".repeat(64);
+        (first, second)
+    }
+
+    /// THE PAIRS CYCLE OVER THE GOLDENS, in command-line order: with two goldens and four pairs,
+    /// pairs 1 and 3 measure golden 1 and pairs 2 and 4 measure golden 2. Both legs of a pair are
+    /// opened for the same golden. Each pair seals the golden it measured, `per_prompt` holds one
+    /// record per golden in order, and the control golden sealed is the scored pair's.
+    #[test]
+    fn the_pairs_cycle_over_the_goldens_and_each_prompt_is_sealed_once() {
+        let (first, second) = two_goldens();
+        let calibration = crate::baseline::BaselineCalibration {
+            prompts: vec![
+                wide_prompt_calibration("botany"),
+                wide_prompt_calibration("kelp"),
+            ],
+            ..wide_calibration()
+        };
+        let opened = std::cell::RefCell::new(Vec::new());
+        let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+        window.pairs = 4;
+
+        let payload = official_core_paired(
+            &[
+                PairedGoldens {
+                    candidate: &first,
+                    control: &first,
+                    prompt: "botany",
+                },
+                PairedGoldens {
+                    candidate: &second,
+                    control: &second,
+                    prompt: "kelp",
+                },
+            ],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |g| {
+                    opened.borrow_mut().push(("control", g));
+                    Ok(())
+                },
+                open_candidate_leg: |g| {
+                    opened.borrow_mut().push(("candidate", g));
+                    Ok(())
+                },
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        );
+
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [
+                ("control", 0),
+                ("candidate", 0),
+                ("control", 1),
+                ("candidate", 1),
+                ("control", 0),
+                ("candidate", 0),
+                ("control", 1),
+                ("candidate", 1),
+            ]
+        );
+        let m = &payload.metrics;
+        let measured: Vec<&str> = m
+            .paired_legs
+            .iter()
+            .map(|r| r.prompt_sha256.as_str())
+            .collect();
+        assert_eq!(
+            measured,
+            [
+                first.sha256.as_str(),
+                second.sha256.as_str(),
+                first.sha256.as_str(),
+                second.sha256.as_str(),
+            ]
+        );
+        // ONE RECORD PER GOLDEN, in order. Each is the lower median of its own two pairs.
+        let per_prompt: Vec<&str> = m
+            .per_prompt
+            .iter()
+            .map(|p| p.prompt_sha256.as_str())
+            .collect();
+        assert_eq!(per_prompt, [first.sha256.as_str(), second.sha256.as_str()]);
+        for (record, own) in m.per_prompt.iter().zip([[0, 2], [1, 3]]) {
+            let pairs = [m.paired_legs[own[0]].clone(), m.paired_legs[own[1]].clone()];
+            let chosen = &pairs[scored_pair_index(&pairs, ScoringWeights::DEFAULT)];
+            assert_eq!(
+                record.mtp_seconds_per_token_mean,
+                chosen.candidate_decode_seconds_per_token
+            );
+        }
+        // The control golden sealed is the one the SCORED pair measured.
+        let scored = &m.paired_legs[scored_pair_index(&m.paired_legs, ScoringWeights::DEFAULT)];
+        assert_eq!(
+            m.baseline_golden_sha256.as_deref(),
+            Some(scored.prompt_sha256.as_str())
+        );
+    }
+
+    /// EACH CONTROL LEG IS GATED BY ITS OWN PROMPT's BAND. Pair 1 measures a prompt with a wide
+    /// band and passes; pair 2 measures a prompt with a narrow band and the run stops there, by
+    /// name, naming that prompt. Pair 1 stays in the audit trail.
+    #[test]
+    fn each_control_leg_is_checked_against_the_band_of_its_own_prompt() {
+        let (first, second) = two_goldens();
+        let calibration = crate::baseline::BaselineCalibration {
+            prompts: vec![
+                wide_prompt_calibration("botany"),
+                narrow_prompt_calibration("kelp"),
+            ],
+            ..wide_calibration()
+        };
+        let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+        window.pairs = 2;
+
+        let payload = official_core_paired(
+            &[
+                PairedGoldens {
+                    candidate: &first,
+                    control: &first,
+                    prompt: "botany",
+                },
+                PairedGoldens {
+                    candidate: &second,
+                    control: &second,
+                    prompt: "kelp",
+                },
+            ],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        );
+
+        assert!(payload.score.is_none());
+        let error = &payload.metrics.error;
+        assert!(
+            error.contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+            "{error}"
+        );
+        assert!(
+            error.contains("pair 2 of 2") && error.contains("kelp"),
+            "{error}"
+        );
+        assert_eq!(payload.metrics.paired_legs.len(), 1);
+        assert_eq!(payload.metrics.paired_legs[0].prompt_sha256, first.sha256);
+        assert_eq!(
+            payload.metrics.baseline_golden_sha256.as_deref(),
+            Some(second.sha256.as_str()),
+            "the refusal names the control golden of the pair that stopped"
+        );
+    }
+
     /// A FAULT IN PAIR 2 ends the run by name, seals no score, and keeps pair 1's measurement in
     /// the audit trail — nothing measured is thrown away, nothing unmeasured is invented.
     #[test]
@@ -5000,17 +5576,18 @@ mod tests {
         window.pairs = 2;
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || Ok(()),
-                open_candidate_leg: || Ok(()),
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
                 spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
                 spawn_timed: || {
                     candidate_spawns.set(candidate_spawns.get() + 1);
@@ -5054,17 +5631,18 @@ mod tests {
         let candidate_engine_ups = Cell::new(0usize);
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || Ok(()),
-                open_candidate_leg: || {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| {
                     candidate_engine_ups.set(candidate_engine_ups.get() + 1);
                     Ok(())
                 },
@@ -5129,21 +5707,22 @@ mod tests {
         let calibration = wide_calibration();
         let baseline_spawns = Cell::new(0usize);
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &golden,
                 control: &golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || {
+                open_baseline_leg: |_| {
                     Err::<(), String>(
                         "LEG-SERVE-BOOT-FAILED: the reference resident died".to_string(),
                     )
                 },
-                open_candidate_leg: || Ok(()),
+                open_candidate_leg: |_| Ok(()),
                 spawn_baseline: || {
                     baseline_spawns.set(baseline_spawns.get() + 1);
                     Session::connect(conformant_engine()).map(|(s, _)| s)
@@ -5193,17 +5772,18 @@ mod tests {
         let candidate_spawns = Cell::new(0usize);
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &candidate_golden,
                 control: &control_golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || Ok(()),
-                open_candidate_leg: || Ok(()),
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
                 // The REFERENCE tree runs serial, so its engine emits the SERIAL tape.
                 spawn_baseline: || {
                     Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
@@ -5247,7 +5827,7 @@ mod tests {
         // The seal names the golden leg 1 was verified against.
         assert_eq!(
             payload.metrics.baseline_golden_sha256.as_deref(),
-            Some("5e21a1")
+            Some(control_golden.sha256.as_str())
         );
     }
 
@@ -5262,17 +5842,18 @@ mod tests {
         let candidate_spawns = Cell::new(0usize);
 
         let payload = official_core_paired(
-            PairedGoldens {
+            &[PairedGoldens {
                 candidate: &candidate_golden,
                 control: &candidate_golden,
-            },
+                prompt: "botany",
+            }],
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             PairedLegs {
-                open_baseline_leg: || Ok(()),
-                open_candidate_leg: || Ok(()),
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
                 spawn_baseline: || {
                     Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
                 },
@@ -5345,7 +5926,7 @@ mod tests {
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
         ));
-        seal_paired_baseline(&mut payload.metrics, &seal);
+        seal_paired_baseline(&mut payload.metrics, &seal, &golden.sha256);
 
         assert!(payload.passed, "{}", payload.metrics.error);
         assert_eq!(payload.score, Some(1.0));
@@ -5434,6 +6015,473 @@ mod tests {
             "the control leg carried a spec: {:?}",
             control.effective_spec
         );
+    }
+
+    /// The golden's oracle at every position a candidate leg emits: the seed token, then the
+    /// decode tokens.
+    fn emitted_oracle(decode: &[i64]) -> Vec<i64> {
+        std::iter::once(SEED_TOKEN)
+            .chain(decode.iter().copied())
+            .collect()
+    }
+
+    /// A candidate engine that emits the oracle `decode` with the decode positions in `changed`
+    /// moved. With `second_choice` the moved token is the reference engine's second choice (the
+    /// mock's top logits are `t, t + 1, …`); without it the token is outside the top eight.
+    fn candidate_with_changes(
+        decode: &[i64],
+        changed: &[usize],
+        second_choice: bool,
+    ) -> MockEngine {
+        let mut emitted = decode.to_vec();
+        for &i in changed {
+            emitted[i] += if second_choice { 1 } else { 1_000 };
+        }
+        engine_on_tape(emitted)
+    }
+
+    /// The reference engine: exact on the control leg's tape, and on each replay it chooses the
+    /// oracle at every position.
+    fn reference_engine(decode: &[i64], replays: usize) -> MockEngine {
+        engine_on_tape(decode.to_vec())
+            .teacher_forced_sequences(vec![emitted_oracle(decode); replays])
+    }
+
+    /// One paired run of `pairs` pairs on `golden` under `tolerance`. `baseline_spawns` counts
+    /// every reference worker: one per control leg, plus one when a replay runs.
+    fn run_with_tolerance(
+        golden: &GoldenFixture,
+        tolerance: Option<u32>,
+        near_tie_gap: Option<f64>,
+        pairs: usize,
+        candidate: impl Fn() -> MockEngine,
+        baseline_spawns: &Cell<usize>,
+    ) -> ScorePayload {
+        let decode = golden
+            .benchmark
+            .as_ref()
+            .unwrap()
+            .expected_decode_tokens
+            .clone();
+        let calibration = wide_calibration();
+        official_core_paired(
+            &[PairedGoldens {
+                candidate: golden,
+                control: golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(reference_engine(&decode, pairs)).map(|(s, _)| s)
+                },
+                spawn_timed: || Session::connect(candidate()).map(|(s, _)| s),
+            },
+            PairedWindow {
+                pairs,
+                token_tolerance_per_thousand: tolerance,
+                near_tie_relative_gap: near_tie_gap,
+                ..paired_window_for_test(|_phase: &str| Ok(()))
+            },
+        )
+    }
+
+    /// ABSENT TOLERANCE: one different decode token stops the candidate leg, exactly as before,
+    /// and no replay runs.
+    #[test]
+    fn an_absent_tolerance_keeps_the_exact_rule() {
+        let golden = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let payload = run_with_tolerance(
+            &golden,
+            None,
+            None,
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &[5], false),
+            &spawns,
+        );
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("benchmark free-run decode token mismatch at step 5"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(spawns.get(), 1, "the control leg only; no replay");
+        assert_eq!(payload.metrics.timed_token_tolerance_per_thousand, None);
+    }
+
+    /// UNDER THE LIMIT: 12 of 129 tokens is at most 100 per thousand (12 * 1000 <= 100 * 129).
+    /// The candidate leg runs to its end, one replay worker counts the mismatches, the run is not
+    /// refused for its tokens, and the counts and the limit are sealed.
+    #[test]
+    fn mismatches_under_the_limit_pass_and_seal_the_counts() {
+        let golden = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let changed: Vec<usize> = (10..22).collect();
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            None,
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &changed, false),
+            &spawns,
+        );
+        let m = &payload.metrics;
+        assert!(
+            !m.error.contains(TIMED_DIVERGENCE_OVER_TOLERANCE),
+            "{}",
+            m.error
+        );
+        assert!(!m.error.contains(TIMED_REPLAY_FAILED), "{}", m.error);
+        assert!(!m.error.contains("token mismatch"), "{}", m.error);
+        assert_eq!(spawns.get(), 2, "the control leg, then one replay worker");
+        let record = &m.paired_legs[0];
+        assert_eq!(record.token_mismatch_count, Some(12));
+        // Decode position 10 is emitted position 11 (position 0 is the seed token).
+        assert_eq!(record.token_mismatch_first_step, Some(11));
+        assert_eq!(record.token_mismatch_second_choice_count, Some(0));
+        assert_eq!(record.token_mismatch_second_choice_max_relative_gap, None);
+        assert_eq!(m.token_mismatch_count, Some(12));
+        assert_eq!(m.token_mismatch_first_step, Some(11));
+        assert_eq!(m.timed_token_tolerance_per_thousand, Some(100));
+    }
+
+    /// OVER THE LIMIT: 13 of 129 tokens is over 100 per thousand. The run is refused by name,
+    /// with the pair, the count and the limit, and seals no score.
+    #[test]
+    fn one_mismatch_over_the_limit_refuses_by_name() {
+        let golden = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let changed: Vec<usize> = (10..23).collect();
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            None,
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &changed, false),
+            &spawns,
+        );
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        let error = &payload.metrics.error;
+        assert!(error.contains(TIMED_DIVERGENCE_OVER_TOLERANCE), "{error}");
+        assert!(error.contains("pair 1 of 1"), "{error}");
+        assert!(error.contains("13 of the candidate's 129"), "{error}");
+        assert!(error.contains("at most 100 per thousand"), "{error}");
+        assert_eq!(
+            payload.metrics.paired_legs[0].token_mismatch_count,
+            Some(13)
+        );
+        assert_eq!(payload.metrics.token_mismatch_count, Some(13));
+        assert_eq!(payload.metrics.first_failing_step, Some(11));
+        assert_eq!(payload.metrics.baseline_band_passed, Some(true));
+    }
+
+    /// THE CONTROL LEG STAYS EXACT: even under the widest tolerance, one different token on the
+    /// reference tree refuses the run by name before the candidate leg opens.
+    #[test]
+    fn the_control_leg_stays_exact_in_tolerant_mode() {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let payload = official_core_paired(
+            &[PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || {
+                    Session::connect(candidate_with_changes(&oracle_decode_tokens(), &[3], false))
+                        .map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+            },
+            PairedWindow {
+                token_tolerance_per_thousand: Some(1000),
+                ..paired_window_for_test(|_phase: &str| Ok(()))
+            },
+        );
+        let error = &payload.metrics.error;
+        assert!(error.contains(SERIAL_CONTROL_LEG_FAILED), "{error}");
+        assert!(
+            error.contains("benchmark free-run decode token mismatch at step 3"),
+            "{error}"
+        );
+        assert_eq!(candidate_spawns.get(), 0, "the candidate leg never opens");
+    }
+
+    /// EXACT CANDIDATES COST NOTHING: tokens equal to the oracle carry 0 mismatches, and no
+    /// replay worker is spawned.
+    #[test]
+    fn an_exact_candidate_triggers_no_replay() {
+        let golden = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let payload = run_with_tolerance(&golden, Some(100), None, 2, conformant_engine, &spawns);
+        assert_eq!(
+            spawns.get(),
+            2,
+            "one worker per control leg and nothing more"
+        );
+        for record in &payload.metrics.paired_legs {
+            assert_eq!(record.token_mismatch_count, Some(0));
+            assert_eq!(record.token_mismatch_first_step, None);
+            assert_eq!(record.token_mismatch_second_choice_count, Some(0));
+        }
+        assert_eq!(payload.metrics.token_mismatch_count, Some(0));
+    }
+
+    /// Every whole integer in a sealed document: each integer value, and each run of digits in a
+    /// string that is not part of a decimal number.
+    fn numbers_in(value: &serde_json::Value) -> Vec<i64> {
+        match value {
+            serde_json::Value::Number(n) => n.as_i64().into_iter().collect(),
+            serde_json::Value::String(text) => text
+                .split(|c: char| !c.is_ascii_digit() && c != '.')
+                .filter(|word| !word.contains('.'))
+                .filter_map(|word| word.parse().ok())
+                .collect(),
+            serde_json::Value::Array(items) => items.iter().flat_map(numbers_in).collect(),
+            serde_json::Value::Object(map) => map.values().flat_map(numbers_in).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// NO TOKEN ID IS SEALED: not a hidden golden's decode token, not a token the candidate
+    /// emitted, and not a first or second choice of the reference engine — on a passing replay
+    /// and on a refusal alike.
+    #[test]
+    fn the_sealed_output_holds_no_token_id() {
+        let decode: Vec<i64> = (0..BENCHMARK_DECODE_STEPS as i64)
+            .map(|i| 247_000 + i)
+            .collect();
+        let golden = official_golden_with_oracle(decode.clone(), None);
+        // Under the plain rule, and under a near-tie limit that refuses and one that passes.
+        for changed in [(10..22).collect::<Vec<usize>>(), (10..23).collect()] {
+            for second_choice in [false, true] {
+                for near_tie_gap in [None, Some(0.09), Some(0.2)] {
+                    let payload = run_with_tolerance(
+                        &golden,
+                        Some(100),
+                        near_tie_gap,
+                        1,
+                        || candidate_with_changes(&decode, &changed, second_choice),
+                        &Cell::new(0usize),
+                    );
+                    let sealed: serde_json::Value =
+                        serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+                    let sealed_numbers = numbers_in(&sealed);
+                    for token in &decode {
+                        for id in [*token, token + 1, token + 1_000] {
+                            assert!(
+                                !sealed_numbers.contains(&id),
+                                "token id {id} reached the sealed output"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// NEAR TIES ONLY: every mismatch is the reference's second choice inside the declared gap
+    /// (the mock's gap is 0.1 at every position). The run is not refused for its tokens, and the
+    /// near-tie count and the declared gap are sealed.
+    #[test]
+    fn near_ties_inside_the_gap_pass_and_seal_the_near_tie_count() {
+        let golden = official_golden(None);
+        let changed: Vec<usize> = (10..22).collect();
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            Some(0.2),
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &changed, true),
+            &Cell::new(0usize),
+        );
+        let m = &payload.metrics;
+        assert!(!m.error.contains("TIMED-DIVERGENCE"), "{}", m.error);
+        assert_eq!(m.paired_legs[0].token_mismatch_count, Some(12));
+        assert_eq!(m.paired_legs[0].token_mismatch_near_tie_count, Some(12));
+        assert_eq!(m.token_mismatch_near_tie_count, Some(12));
+        assert_eq!(m.timed_token_near_tie_relative_gap, Some(0.2));
+    }
+
+    /// INCLUSIVE: a gap exactly equal to the limit is a near tie.
+    #[test]
+    fn a_gap_equal_to_the_limit_is_a_near_tie() {
+        let golden = official_golden(None);
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            Some(0.1),
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &[10], true),
+            &Cell::new(0usize),
+        );
+        let m = &payload.metrics;
+        assert!(!m.error.contains("TIMED-DIVERGENCE"), "{}", m.error);
+        assert_eq!(m.paired_legs[0].token_mismatch_near_tie_count, Some(1));
+    }
+
+    /// A SECOND CHOICE ABOVE THE GAP is not a near tie. One such mismatch refuses the run by
+    /// name, although one mismatch in 129 is inside the per-thousand limit.
+    #[test]
+    fn a_second_choice_above_the_gap_is_refused_as_not_a_near_tie() {
+        let golden = official_golden(None);
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            Some(0.09),
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &[10], true),
+            &Cell::new(0usize),
+        );
+        assert!(payload.score.is_none());
+        let error = &payload.metrics.error;
+        assert!(error.contains(TIMED_DIVERGENCE_NOT_A_NEAR_TIE), "{error}");
+        assert!(error.contains("pair 1 of 1"), "{error}");
+        assert!(error.contains("position 11"), "{error}");
+        assert!(error.contains("under the limit 0.09"), "{error}");
+        assert!(error.contains("the gap 0.1 is above the limit"), "{error}");
+        assert_eq!(payload.metrics.paired_legs[0].token_mismatch_count, Some(1));
+        assert_eq!(
+            payload.metrics.paired_legs[0].token_mismatch_near_tie_count,
+            Some(0)
+        );
+    }
+
+    /// A TOKEN THAT IS NOT THE SECOND CHOICE is not a near tie, whatever the gap.
+    #[test]
+    fn a_token_that_is_not_the_second_choice_is_refused_as_not_a_near_tie() {
+        let golden = official_golden(None);
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            Some(0.2),
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &[10], false),
+            &Cell::new(0usize),
+        );
+        let error = &payload.metrics.error;
+        assert!(error.contains(TIMED_DIVERGENCE_NOT_A_NEAR_TIE), "{error}");
+        assert!(
+            error.contains("the token is not the reference engine's second choice"),
+            "{error}"
+        );
+    }
+
+    /// NEAR TIES STILL COUNT: 13 near ties in 129 tokens is over 100 per thousand.
+    #[test]
+    fn near_ties_over_the_limit_are_refused_by_the_count_rule() {
+        let golden = official_golden(None);
+        let changed: Vec<usize> = (10..23).collect();
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            Some(0.2),
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &changed, true),
+            &Cell::new(0usize),
+        );
+        let error = &payload.metrics.error;
+        assert!(error.contains(TIMED_DIVERGENCE_OVER_TOLERANCE), "{error}");
+        assert!(!error.contains(TIMED_DIVERGENCE_NOT_A_NEAR_TIE), "{error}");
+        assert_eq!(payload.metrics.token_mismatch_near_tie_count, Some(13));
+    }
+
+    /// A TOLERANCE WITHOUT A GAP keeps the plain rule: a token outside the reference's top two
+    /// is counted, not refused, and no near-tie figure is sealed.
+    #[test]
+    fn a_tolerance_without_a_gap_keeps_the_plain_rule() {
+        let golden = official_golden(None);
+        let payload = run_with_tolerance(
+            &golden,
+            Some(100),
+            None,
+            1,
+            || candidate_with_changes(&oracle_decode_tokens(), &[10], false),
+            &Cell::new(0usize),
+        );
+        let m = &payload.metrics;
+        assert!(!m.error.contains("TIMED-DIVERGENCE"), "{}", m.error);
+        assert_eq!(m.paired_legs[0].token_mismatch_count, Some(1));
+        assert_eq!(m.paired_legs[0].token_mismatch_near_tie_count, None);
+        assert_eq!(m.token_mismatch_near_tie_count, None);
+        assert_eq!(m.timed_token_near_tie_relative_gap, None);
+    }
+
+    /// THE NEAR-TIE FIGURES DECIDE NOTHING. The same mismatch count gives the same decision
+    /// whether each different token is the reference's second choice or far from its top eight;
+    /// only the report-only figures change.
+    #[test]
+    fn the_near_tie_figures_change_no_decision() {
+        let golden = official_golden(None);
+        for (changed, refused) in [
+            ((10..22).collect::<Vec<usize>>(), false),
+            ((10..23).collect(), true),
+        ] {
+            let run = |second_choice: bool| {
+                let spawns = Cell::new(0usize);
+                run_with_tolerance(
+                    &golden,
+                    Some(100),
+                    None,
+                    1,
+                    || candidate_with_changes(&oracle_decode_tokens(), &changed, second_choice),
+                    &spawns,
+                )
+            };
+            let far = run(false);
+            let near = run(true);
+            for payload in [&far, &near] {
+                assert_eq!(
+                    payload
+                        .metrics
+                        .error
+                        .contains(TIMED_DIVERGENCE_OVER_TOLERANCE),
+                    refused,
+                    "{}",
+                    payload.metrics.error
+                );
+                assert_eq!(
+                    payload.metrics.token_mismatch_count,
+                    Some(changed.len() as i64)
+                );
+            }
+            assert_eq!(far.metrics.token_mismatch_second_choice_count, Some(0));
+            assert_eq!(
+                near.metrics.token_mismatch_second_choice_count,
+                Some(changed.len() as i64)
+            );
+            assert_eq!(
+                far.metrics.token_mismatch_second_choice_max_relative_gap,
+                None
+            );
+            // The mock's top two logits are 10.0 and 9.0: (10 - 9) / 10.
+            assert_eq!(
+                near.metrics.token_mismatch_second_choice_max_relative_gap,
+                Some(0.1)
+            );
+        }
     }
 
     /// A golden with no benchmark oracle has no prompt for a control leg, and the refusal names

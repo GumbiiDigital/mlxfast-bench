@@ -589,7 +589,7 @@ mod tests {
     /// speculative-decode seal, the engine identity (backend/device/protocol version, the
     /// loaded-head digest, the runner identity, and the resident-process identity), and the
     /// PAIRED-BASELINE seal (which box, which calibration bytes, which reference commit, and the
-    /// two legs' measured pairs). All are benchd-only additions the SWIFT
+    /// two legs' measured pairs), and the timed token tolerance with its counts. All are benchd-only additions the SWIFT
     /// reference never emits, and all are omitted-when-unset — rostering a key that is absent on
     /// BOTH sides would hard-fail every pair as SCHEMA-DRIFT-MISSING, which is why they are
     /// unrostered rather than bucketed.
@@ -635,6 +635,13 @@ mod tests {
         "spec_serial_verification_rounds",
         "spec_verification_mode",
         "spec_verify_replay_disagreements",
+        "timed_token_near_tie_relative_gap",
+        "timed_token_tolerance_per_thousand",
+        "token_mismatch_count",
+        "token_mismatch_first_step",
+        "token_mismatch_near_tie_count",
+        "token_mismatch_second_choice_count",
+        "token_mismatch_second_choice_max_relative_gap",
     ];
 
     /// §T1 EXHAUSTIVENESS, second half. `roster_covers_score_metrics_exactly` compares the roster
@@ -685,6 +692,7 @@ mod tests {
             candidate_leg_seed_prefill_window_seconds_per_token: Some(0.0004),
             gates: vec![crate::quiescegate::GateRecord::default()],
             paired_legs: vec![crate::score::PairedLegRecord {
+                prompt_sha256: "f".repeat(64),
                 pair: 1,
                 control_prefill_seconds_per_token: 0.0006,
                 control_decode_seconds_per_token: 0.032,
@@ -694,7 +702,19 @@ mod tests {
                 control_decode_window_seconds_per_token: None,
                 candidate_seed_prefill_window_seconds_per_token: None,
                 candidate_decode_window_seconds_per_token: None,
+                token_mismatch_count: Some(0),
+                token_mismatch_first_step: None,
+                token_mismatch_near_tie_count: Some(0),
+                token_mismatch_second_choice_count: Some(0),
+                token_mismatch_second_choice_max_relative_gap: None,
             }],
+            timed_token_tolerance_per_thousand: Some(100),
+            timed_token_near_tie_relative_gap: Some(0.05),
+            token_mismatch_count: Some(3),
+            token_mismatch_first_step: Some(17),
+            token_mismatch_near_tie_count: Some(2),
+            token_mismatch_second_choice_count: Some(2),
+            token_mismatch_second_choice_max_relative_gap: Some(0.0125),
             ..Default::default()
         };
         let v = serde_json::to_value(&populated).unwrap();
