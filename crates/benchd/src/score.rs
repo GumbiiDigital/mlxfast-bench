@@ -514,7 +514,16 @@ pub fn sealed_error(error: &str, case: Option<&str>) -> String {
     }
 }
 
-/// The SEALED form of a candidate-influenced gap: 2 decimals.
+/// [`sealed_count_bucket`] for an unsigned engine counter.
+pub fn sealed_count_bucket_u64(n: u64) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        n.next_power_of_two()
+    }
+}
+
+/// The SEALED form of a candidate-influenced gap or rate: 2 decimals.
 pub fn sealed_gap(gap: f64) -> f64 {
     (gap * 100.0).round() / 100.0
 }
@@ -704,20 +713,38 @@ impl ScoreMetrics {
             partial_result: self.partial_result,
             // Carried VERBATIM: `mtp_seconds_per_token_mean` must stay byte-equal to
             // `decode_seconds_per_token`, which is a ranking field and is not coarsened either.
-            per_prompt: self.per_prompt.clone(),
+            // Carried except its engine-reported counts, which seal bucketed (see below).
+            per_prompt: self
+                .per_prompt
+                .iter()
+                .map(|p| ScorePerPrompt {
+                    spec_rounds: p.spec_rounds.map(sealed_count_bucket_u64),
+                    spec_drafted_total: p.spec_drafted_total.map(sealed_count_bucket_u64),
+                    spec_accepted_total: p.spec_accepted_total.map(sealed_count_bucket_u64),
+                    ..p.clone()
+                })
+                .collect(),
             // The SPEC and ENGINE-IDENTITY seals are carried VERBATIM. They are counts, an echoed
             // mode/depth, a ratio and identity strings — facts about what ran, not diagnostic
             // real-valued measurements, so coarsening them would only lose information.
             effective_spec_mode: self.effective_spec_mode.clone(),
             effective_spec_depth: self.effective_spec_depth,
-            spec_rounds: self.spec_rounds,
-            spec_drafted_total: self.spec_drafted_total,
-            spec_accepted_total: self.spec_accepted_total,
-            spec_acceptance_rate: self.spec_acceptance_rate,
-            spec_verify_replay_disagreements: self.spec_verify_replay_disagreements,
+            // The spec COUNTERS are engine-reported and freely engine-chosen: bucketed
+            // ([`sealed_count_bucket`]), the rate at 2 decimals. benchd logs the exact values.
+            spec_rounds: self.spec_rounds.map(sealed_count_bucket_u64),
+            spec_drafted_total: self.spec_drafted_total.map(sealed_count_bucket_u64),
+            spec_accepted_total: self.spec_accepted_total.map(sealed_count_bucket_u64),
+            spec_acceptance_rate: self.spec_acceptance_rate.map(sealed_gap),
+            spec_verify_replay_disagreements: self
+                .spec_verify_replay_disagreements
+                .map(sealed_count_bucket_u64),
             spec_verification_mode: self.spec_verification_mode.clone(),
-            spec_rectangular_verification_rounds: self.spec_rectangular_verification_rounds,
-            spec_serial_verification_rounds: self.spec_serial_verification_rounds,
+            spec_rectangular_verification_rounds: self
+                .spec_rectangular_verification_rounds
+                .map(sealed_count_bucket_u64),
+            spec_serial_verification_rounds: self
+                .spec_serial_verification_rounds
+                .map(sealed_count_bucket_u64),
             acceptance_lengths: self.acceptance_lengths,
             engine_backend: self.engine_backend.clone(),
             engine_device: self.engine_device.clone(),
@@ -1103,6 +1130,49 @@ mod tests {
         let removed: Vec<String> = before.difference(&after).cloned().collect();
         assert_eq!(added, ADDITIVE_METRICS_KEYS, "the additive set, exactly");
         assert!(removed.is_empty(), "existing keys removed: {removed:?}");
+    }
+
+    /// THE SPEC COUNTERS are engine-reported: the sealed record carries only their power-of-two
+    /// buckets (flat and per-prompt) and the acceptance rate at 2 decimals.
+    #[test]
+    fn the_sealed_record_holds_only_bucketed_spec_counters() {
+        let payload = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                spec_rounds: Some(12345),
+                spec_drafted_total: Some(777),
+                spec_accepted_total: Some(555),
+                spec_acceptance_rate: Some(0.714_285_7),
+                spec_verify_replay_disagreements: Some(33),
+                spec_rectangular_verification_rounds: Some(12001),
+                spec_serial_verification_rounds: Some(343),
+                per_prompt: vec![ScorePerPrompt {
+                    spec_rounds: Some(12345),
+                    spec_drafted_total: Some(777),
+                    spec_accepted_total: Some(555),
+                    ..ScorePerPrompt::default()
+                }],
+                ..zero_metrics()
+            },
+        };
+        let json = payload.to_sealed_json().unwrap();
+        for raw in ["12345", "777", "555", "0.714", "12001", "343", ": 33"] {
+            assert!(!json.contains(raw), "{raw} sealed: {json}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let m = &v["metrics"];
+        assert_eq!(m["spec_rounds"], 16384);
+        assert_eq!(m["spec_drafted_total"], 1024);
+        assert_eq!(m["spec_accepted_total"], 1024);
+        assert_eq!(m["spec_acceptance_rate"], 0.71);
+        assert_eq!(m["spec_verify_replay_disagreements"], 64);
+        assert_eq!(m["spec_rectangular_verification_rounds"], 16384);
+        assert_eq!(m["spec_serial_verification_rounds"], 512);
+        let pp = &m["per_prompt"][0];
+        assert_eq!(pp["spec_rounds"], 16384);
+        assert_eq!(pp["spec_drafted_total"], 1024);
+        assert_eq!(pp["spec_accepted_total"], 1024);
     }
 
     /// A PROMPT NAME never reaches the sealed record: not the drawn prompt's name, not a case
@@ -1823,9 +1893,9 @@ mod sealed_key_pin_tests {
         "head_provenance_sha256": "v135",
         "mtp_seconds_per_token_mean": 127.5,
         "prompt_sha256": "v125",
-        "spec_accepted_total": 133,
-        "spec_drafted_total": 131,
-        "spec_rounds": 129
+        "spec_accepted_total": 256,
+        "spec_drafted_total": 256,
+        "spec_rounds": 256
       }
     ],
     "prefill_seconds_per_token": 4.5,
@@ -1845,13 +1915,13 @@ mod sealed_key_pin_tests {
     "semantic_gpqa_pass_count": 25,
     "semantic_gpqa_passed": true,
     "spec_acceptance_rate": 75.5,
-    "spec_accepted_total": 73,
-    "spec_drafted_total": 71,
-    "spec_rectangular_verification_rounds": 81,
-    "spec_rounds": 69,
-    "spec_serial_verification_rounds": 83,
+    "spec_accepted_total": 128,
+    "spec_drafted_total": 128,
+    "spec_rectangular_verification_rounds": 128,
+    "spec_rounds": 128,
+    "spec_serial_verification_rounds": 128,
     "spec_verification_mode": "v79",
-    "spec_verify_replay_disagreements": 77,
+    "spec_verify_replay_disagreements": 128,
     "timed_benchmark_seconds": 16.0,
     "timed_token_near_tie_relative_gap": 0.25,
     "timed_token_tolerance_per_thousand": 149,

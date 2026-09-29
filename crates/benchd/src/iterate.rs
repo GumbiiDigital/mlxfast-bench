@@ -1864,6 +1864,18 @@ pub(crate) fn seal_timing_surface_facts(
             crate::score::AcceptanceLengthsSummary::of(audit.acceptance_lengths());
     }
 
+    // The exact engine-reported spec counters go to the log; the sealed record buckets them.
+    eprintln!(
+        "benchd: spec rounds {:?}, drafted {:?}, accepted {:?}, acceptance rate {:?}, verify \
+         replay disagreements {:?}, rectangular rounds {:?}, serial rounds {:?}",
+        metrics.spec_rounds,
+        metrics.spec_drafted_total,
+        metrics.spec_accepted_total,
+        metrics.spec_acceptance_rate,
+        metrics.spec_verify_replay_disagreements,
+        metrics.spec_rectangular_verification_rounds,
+        metrics.spec_serial_verification_rounds
+    );
     metrics.per_prompt = vec![ScorePerPrompt {
         prompt_sha256: golden.sha256.clone(),
         effective_mean_draft_len: finite_nonneg(audit.effective_mean_draft_len()),

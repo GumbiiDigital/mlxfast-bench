@@ -5111,8 +5111,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             v["metrics"]["spec_verify_replay_disagreements"],
-            serde_json::json!(30),
-            "the sealed key is spec_verify_replay_disagreements"
+            serde_json::json!(32),
+            "the sealed key is spec_verify_replay_disagreements, bucketed (30 -> 32)"
         );
         // The counters it sits beside are untouched, and NOTHING ENFORCED moved.
         assert_eq!(payload.metrics.spec_drafted_total, Some(64));
