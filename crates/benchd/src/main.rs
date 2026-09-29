@@ -7727,7 +7727,7 @@ mod tests {
     /// `a`-repeated with bytes 100+i; the mtp<d> oracle of prompt i is `<d>`-repeated with bytes
     /// 1000*(i+1)+d.
     fn rotation_contract(pool: &[&str], pinned: &[&str]) -> serde_json::Value {
-        let names = ["botany", "beagle", "travel"];
+        let names = ["botany", "bravo", "charlie"];
         let mut oracles = serde_json::Map::new();
         for (i, name) in names.iter().enumerate() {
             if pinned.contains(name) {
@@ -7780,25 +7780,25 @@ mod tests {
     #[test]
     fn live_prompt_resolves_the_drawn_prompts_pins_per_depth() {
         let rotation = rotation_of(&rotation_contract(
-            &["botany", "beagle"],
-            &["botany", "beagle"],
+            &["botany", "bravo"],
+            &["botany", "bravo"],
         ));
         let args = live_args(&[
             "--mode",
             "official",
             "--live-prompt",
-            "beagle",
+            "bravo",
             "--mtp-depth",
             "2",
             "--golden",
-            "/g/beagle.mtp2.golden.json",
+            "/g/bravo.mtp2.golden.json",
             "--control-golden",
-            "/g/beagle.golden.json",
+            "/g/bravo.golden.json",
         ]);
         let live = resolve_iterate_live_prompt(Some(&rotation), &args)
             .unwrap()
             .expect("a drawn prompt resolves");
-        assert_eq!(live.name, "beagle");
+        assert_eq!(live.name, "bravo");
         assert_eq!(live.oracle.sha256, "2".repeat(64));
         assert_eq!(live.oracle.bytes, 2002);
         assert_eq!(live.serial.bytes, 101);
@@ -7827,8 +7827,8 @@ mod tests {
     #[test]
     fn live_prompt_refusals_are_by_name() {
         let rotation = rotation_of(&rotation_contract(
-            &["botany", "beagle"],
-            &["botany", "beagle"],
+            &["botany", "bravo"],
+            &["botany", "bravo"],
         ));
         let refuse = |extra: &[&str], needle: &str| {
             let e = resolve_iterate_live_prompt(Some(&rotation), &live_args(extra)).unwrap_err();
@@ -7840,7 +7840,7 @@ mod tests {
                 "--mode",
                 "official",
                 "--live-prompt",
-                "travel",
+                "charlie",
                 "--golden",
                 "/g/travel.golden.json",
             ],
@@ -7857,20 +7857,20 @@ mod tests {
                 "--mode",
                 "official",
                 "--live-prompt",
-                "beagle",
+                "bravo",
                 "--golden",
                 "/g/botany.golden.json",
             ],
-            "does not measure the drawn prompt \"beagle\"",
+            "does not measure the drawn prompt \"bravo\"",
         );
         refuse(
             &[
                 "--mode",
                 "official",
                 "--live-prompt",
-                "beagle",
+                "bravo",
                 "--golden",
-                "/g/beagle.golden.json",
+                "/g/bravo.golden.json",
                 "--control-golden",
                 "/g/botany.golden.json",
             ],
@@ -7882,11 +7882,11 @@ mod tests {
                 "--mode",
                 "official",
                 "--live-prompt",
-                "beagle",
+                "bravo",
                 "--mtp-depth",
                 "1",
                 "--golden",
-                "/g/beagle.mtp1.golden.json",
+                "/g/bravo.mtp1.golden.json",
                 "--golden-sha256",
                 &"2".repeat(64),
                 "--golden-bytes",
@@ -7900,11 +7900,11 @@ mod tests {
                 "--mode",
                 "official",
                 "--live-prompt",
-                "beagle",
+                "bravo",
                 "--mtp-depth",
                 "4",
                 "--golden",
-                "/g/beagle.mtp4.golden.json",
+                "/g/bravo.mtp4.golden.json",
             ],
             "no timed oracle at draft depth 4",
         );
@@ -7936,20 +7936,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("benchd-rotation-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("contract.json");
-        let mut v = rotation_contract(&["botany", "beagle"], &["botany", "beagle"]);
-        v["speculative_oracles"]["beagle"]
+        let mut v = rotation_contract(&["botany", "bravo"], &["botany", "bravo"]);
+        v["speculative_oracles"]["bravo"]
             .as_object_mut()
             .unwrap()
             .remove("mtp2");
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         let e = contract::load(&path).unwrap_err();
-        assert!(e.contains("speculative_oracles.beagle.mtp2"), "{e}");
-        let v = rotation_contract(&["botany", "beagle"], &["botany", "beagle"]);
+        assert!(e.contains("speculative_oracles.bravo.mtp2"), "{e}");
+        let v = rotation_contract(&["botany", "bravo"], &["botany", "bravo"]);
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         let loaded = contract::load(&path).unwrap();
         assert_eq!(
             loaded.live_prompts.map(|r| r.pool),
-            Some(vec!["botany".to_string(), "beagle".to_string()])
+            Some(vec!["botany".to_string(), "bravo".to_string()])
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
