@@ -682,7 +682,7 @@ OPTIONS:
                                  prompt's serial pin and its per-depth oracle pin from --contract
                                  itself, refuses a name outside the pool, a --golden or
                                  --control-golden that names another prompt or carries another
-                                 pin, and seals the name as metrics.live_prompt. It names exactly
+                                 pin, and logs the name (never sealed). It names exactly
                                  one golden: refused with more than one --golden or
                                  --control-golden. REQUIRED with --mode official when the contract
                                  declares live_golden_rotation; refused when it declares none.
@@ -5240,8 +5240,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // given, leaving the local modes' sealed bytes unchanged.
     let mut payload = payload;
     payload.metrics.contract_sha256 = loaded_contract.as_ref().map(|l| l.sha256.clone());
-    // THE DRAWN PROMPT'S NAME (public: one of the pool), so a result says which prompt it timed.
-    payload.metrics.live_prompt = live_prompt.as_ref().map(|l| l.name.clone());
+    // THE DRAWN PROMPT'S NAME goes to the log, never the sealed record: pool names hint at the
+    // hidden prompts. The pair rows' `prompt_sha256` identifies the golden opaquely.
+    if let Some(live) = live_prompt.as_ref() {
+        eprintln!("benchd iterate: live prompt {:?}", live.name);
+    }
     // WHICH SOURCE DECIDED EACH GROUP (STEP 1, David 2026-09-15). The digest above names the bytes;
     // this names which groups of the scored regime those bytes actually decided and which still
     // came from the in-tree per-track table. A sealed score therefore says what regime it was

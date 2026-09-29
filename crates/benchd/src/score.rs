@@ -324,9 +324,9 @@ pub struct ScoreMetrics {
     /// reads a different golden than the candidate leg (`--control-golden`); this states which one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_golden_sha256: Option<String>,
-    /// ADDITIVE — the NAME of the prompt this run scored, on a track that draws its scored prompt
-    /// per job from the contract's `live_golden_rotation.pool` (`--live-prompt`). Public (one of
-    /// the pool) so results are auditable; absent on a track that does not rotate.
+    /// RETIRED from the sealed record — the NAME of the drawn prompt (`--live-prompt`). Pool names
+    /// hint at the hidden prompts, so benchd logs the name and never sets or seals this key; it
+    /// stays in the schema so older records still parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_prompt: Option<String>,
     /// ADDITIVE — the reference tree's engine commit the calibration was captured at.
@@ -736,7 +736,8 @@ impl ScoreMetrics {
             baseline_box: self.baseline_box.clone(),
             baseline_calibration_sha256: self.baseline_calibration_sha256.clone(),
             baseline_golden_sha256: self.baseline_golden_sha256.clone(),
-            live_prompt: self.live_prompt.clone(),
+            // A prompt NAME is never sealed (pool names hint at the hidden prompts).
+            live_prompt: None,
             baseline_reference_commit: self.baseline_reference_commit.clone(),
             baseline_band_passed: self.baseline_band_passed,
             baseline_leg_prefill_seconds_per_token: self.baseline_leg_prefill_seconds_per_token,
@@ -1102,6 +1103,37 @@ mod tests {
         let removed: Vec<String> = before.difference(&after).cloned().collect();
         assert_eq!(added, ADDITIVE_METRICS_KEYS, "the additive set, exactly");
         assert!(removed.is_empty(), "existing keys removed: {removed:?}");
+    }
+
+    /// A PROMPT NAME never reaches the sealed record: not the drawn prompt's name, not a case
+    /// named after a prompt.
+    #[test]
+    fn the_sealed_record_holds_no_prompt_name() {
+        let payload = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                live_prompt: Some("plutarch".to_string()),
+                first_failing_case: Some("plutarch".to_string()),
+                error: "free-run plutarch diverged at step 9: the engine produced token 4242"
+                    .to_string(),
+                ..zero_metrics()
+            },
+        };
+        let json = payload.to_sealed_json().unwrap();
+        for raw in ["plutarch", "4242", "step 9"] {
+            assert!(!json.contains(raw), "{raw} sealed: {json}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["metrics"].get("live_prompt").is_none(), "{json}");
+        assert_eq!(
+            v["metrics"]["error"],
+            format!(
+                "free-run case {} did not match the golden",
+                sealed_case("plutarch")
+            )
+            .as_str()
+        );
     }
 
     /// THE TOKEN COUNTS ARE THE CANDIDATE'S CHOICE: the sealed record carries them only bucketed
@@ -1758,7 +1790,6 @@ mod sealed_key_pin_tests {
     "gpqa_ttft_source": "v23",
     "harness_hash": "v58",
     "head_provenance_sha256": "v92",
-    "live_prompt": "v113",
     "local_phases": {
       "correctness": "not_run",
       "correctness_checked_steps": 0,

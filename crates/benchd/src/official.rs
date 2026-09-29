@@ -6190,9 +6190,12 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("pair 2 of 2") && error.contains("kelp"),
+            error.contains("pair 2 of 2") && !error.contains("kelp"),
             "{error}"
         );
+        // No prompt name anywhere in the sealed record.
+        let json = payload.to_sealed_json().unwrap();
+        assert!(!json.contains("kelp") && !json.contains("botany"), "{json}");
         assert_eq!(payload.metrics.paired_legs.len(), 1);
         assert_eq!(payload.metrics.paired_legs[0].prompt_sha256, first.sha256);
         assert_eq!(

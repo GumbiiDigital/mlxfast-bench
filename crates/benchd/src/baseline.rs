@@ -307,11 +307,17 @@ impl BaselineCalibration {
             .iter()
             .find(|e| e.prompt == prompt)
             .ok_or_else(|| {
+                // The prompt NAMES go to the log only: this text can reach a sealed record (the
+                // band check), and pool names hint at the hidden prompts.
                 let held: Vec<&str> = self.prompts.iter().map(|e| e.prompt.as_str()).collect();
+                eprintln!(
+                    "benchd: the calibration holds prompts {held:?}; this run measures {prompt:?}"
+                );
                 format!(
-                    "{BASELINE_CALIBRATION_PROMPT_MISMATCH}: the calibration holds prompts \
-                     {held:?}, and this run measures prompt {prompt:?}; a band describes the leg \
-                     it was measured from, so it cannot gate a leg on another prompt"
+                    "{BASELINE_CALIBRATION_PROMPT_MISMATCH}: the calibration holds no entry for \
+                     the prompt this run measures (the names are in benchd's log); a band \
+                     describes the leg it was measured from, so it cannot gate a leg on another \
+                     prompt"
                 )
             })
     }
@@ -383,12 +389,12 @@ impl BaselineCalibration {
             }
             let hi = mean * high;
             if measured > hi {
+                eprintln!("benchd: the {axis} leg on prompt {prompt:?} is outside its band");
                 return Err(format!(
                     "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
                      band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
-                     calibrated at {mean} on prompt {prompt:?} with a ceiling of {hi} ({high} of \
-                     the mean); the box is slower than when it was calibrated; refusing to seal a \
-                     score",
+                     calibrated at {mean} with a ceiling of {hi} ({high} of the mean); the box is \
+                     slower than when it was calibrated; refusing to seal a score",
                     self.box_name
                 ));
             }
@@ -1124,8 +1130,8 @@ mod tests {
         // another prompt is refused rather than gated against a band that does not describe it.
         let err = cal.check_identity(TRACK, BOX, "kelp").unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
-        assert!(err.contains("kelp"), "{err}");
-        assert!(err.contains("botany"), "{err}");
+        // The text can reach a sealed record: it names no prompt (the log does).
+        assert!(!err.contains("kelp") && !err.contains("botany"), "{err}");
         // …and the calibrated prompt still passes, so the check is not refusing everything.
         assert!(cal.check_identity(TRACK, BOX, "botany").is_ok());
 
@@ -1194,12 +1200,15 @@ mod tests {
         }
         let err = cal.check_identity("track-a", "box-a", "fern").unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
-        assert!(err.contains("fern") && err.contains("kelp"), "{err}");
+        assert!(!err.contains("fern") && !err.contains("kelp"), "{err}");
 
         assert!(cal.check_band("kelp", 0.0006, 0.060).is_ok());
         let err = cal.check_band("botany", 0.0006, 0.060).unwrap_err();
         assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
-        assert!(err.contains("botany"), "{err}");
+        assert!(
+            !err.contains("botany"),
+            "no prompt name in a sealable refusal: {err}"
+        );
         let err = cal.check_band("fern", 0.0006, 0.030).unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
 
