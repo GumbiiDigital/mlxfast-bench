@@ -258,6 +258,11 @@ impl RunnerError {
                 f,
                 "{label} mismatch at step {step}: the timed passes disagree (earlier pass {expected}, engine returned {actual})"
             ),
+            // SEALED: neither the engine's token nor the step it chose to diverge at.
+            RunnerError::TokenMismatch { label, .. } if !reveal => write!(
+                f,
+                "{label} mismatch: the engine's token is not the token the golden expects"
+            ),
             RunnerError::TokenMismatch {
                 label,
                 step,
@@ -536,7 +541,11 @@ mod tests {
         };
         assert!(!plain.carries_engine_data());
         let sealed = plain.to_string();
-        assert!(sealed.contains("step 5"), "{sealed}");
-        assert!(!sealed.contains("42"), "{sealed}");
+        // Sealed: no golden token (42), no engine token (7), no step (5); the log keeps them.
+        for n in ["42", "7", "5"] {
+            assert!(!sealed.contains(n), "{n} in {sealed}");
+        }
+        let log = plain.diagnostic();
+        assert!(log.contains("step 5") && log.contains("token 7"), "{log}");
     }
 }

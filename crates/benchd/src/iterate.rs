@@ -1615,6 +1615,14 @@ pub(crate) fn failed_score(
             metrics.checked_steps = checked_steps;
         }
     }
+    // The sealed record reduces the case name, the failure text, the step and the engine's token
+    // (`ScoreMetrics::with_coarsened_public_diagnostics`); the full values go to the log here.
+    if failure.case.is_some() || failure.actual_token.is_some() {
+        eprintln!(
+            "benchd: failure {:?} (case {:?}, step {:?}, engine token {:?})",
+            failure.error, failure.case, failure.step, failure.actual_token
+        );
+    }
     metrics.first_failing_case = failure.case;
     metrics.first_failing_step = failure.step;
     metrics.expected_token = failure.expected_token;
@@ -3650,6 +3658,20 @@ mod tests {
         assert_eq!(m.expected_token, Some(999), "golden's expected token");
         assert_eq!(m.actual_token, Some(2), "engine's actual token");
         assert_eq!(m.error, "local-iterate teacher-forced token mismatch");
+        // THE SEALED RECORD: no engine token, no golden token, the step only as its bucket, and
+        // the case by digest with the failure's class only.
+        let v: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        let sealed = &v["metrics"];
+        assert!(sealed["actual_token"].is_null(), "{sealed}");
+        assert!(sealed["expected_token"].is_null(), "{sealed}");
+        assert_eq!(sealed["first_failing_step"], 4);
+        let case = crate::score::sealed_case("local-iterate");
+        assert_eq!(sealed["first_failing_case"], case.as_str());
+        assert_eq!(
+            sealed["error"],
+            format!("correctness case {case} did not match the golden").as_str()
+        );
     }
 
     #[test]

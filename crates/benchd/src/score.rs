@@ -481,6 +481,39 @@ pub fn sealed_count_bucket(n: i64) -> i64 {
     }
 }
 
+/// The label of the timed-oracle failure class, which names no prompt and is sealed as is.
+const BENCHMARK_CASE: &str = "benchmark";
+
+/// The SEALED name of a correctness case: `case-sha256:<first 16 hex>` of its name, except the
+/// fixed timed-oracle label. A live golden's case is named after its prompt, and pool names hint at
+/// the hidden prompts; the organizer maps the digest back from the golden.
+pub fn sealed_case(name: &str) -> String {
+    if name == BENCHMARK_CASE {
+        return name.to_string();
+    }
+    format!("case-sha256:{}", &sha256_hex(name.as_bytes())[..16])
+}
+
+/// The SEALED failure text. A correctness case's failure text names the case and carries what
+/// the engine produced (its token, the step, a rank or a logit gap), so it is sealed as its class
+/// and the case digest only; benchd logged the full text when it failed. Every other error is
+/// sealed as it stands (it was scrubbed at `iterate::failed_score`).
+pub fn sealed_error(error: &str, case: Option<&str>) -> String {
+    match case {
+        Some(name) if name != BENCHMARK_CASE => {
+            let class = ["anchor", "free-run", "teacher-forced"]
+                .into_iter()
+                .find(|c| error.starts_with(&format!("{c} ")))
+                .unwrap_or("correctness");
+            format!(
+                "{class} case {} did not match the golden",
+                sealed_case(name)
+            )
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// The SEALED form of a candidate-influenced gap: 2 decimals.
 pub fn sealed_gap(gap: f64) -> f64 {
     (gap * 100.0).round() / 100.0
@@ -648,17 +681,19 @@ impl ScoreMetrics {
             expert_peak_cached_tensors: self.expert_peak_cached_tensors,
             expert_hit_rate: r(self.expert_hit_rate),
             first_failing_layer: self.first_failing_layer,
-            first_failing_case: self.first_failing_case.clone(),
-            first_failing_step: self.first_failing_step,
+            first_failing_case: self.first_failing_case.as_deref().map(sealed_case),
+            // The step a failure happened at is the engine's choice: bucketed. The engine's own
+            // token is never sealed (both go to benchd's stderr at `iterate::failed_score`).
+            first_failing_step: self.first_failing_step.map(sealed_count_bucket),
             // The golden's token is never published. The case and the step locate the failure.
             expected_token: None,
-            actual_token: self.actual_token,
+            actual_token: None,
             max_abs_diff: r(self.max_abs_diff),
             golden_hash: self.golden_hash.clone(),
             contract_sha256: self.contract_sha256.clone(),
             contract_sources: self.contract_sources,
             bandwidth_source: self.bandwidth_source.clone(),
-            error: self.error.clone(),
+            error: sealed_error(&self.error, self.first_failing_case.as_deref()),
             commit: self.commit.clone(),
             timestamp: self.timestamp.clone(),
             harness_hash: self.harness_hash.clone(),
@@ -1641,7 +1676,7 @@ mod sealed_key_pin_tests {
       "count": 3,
       "mean": 2.0
     },
-    "actual_token": 49,
+    "actual_token": null,
     "bandwidth_gb_per_token": 2.5,
     "bandwidth_source": "v54",
     "baseline_band_passed": true,
@@ -1680,7 +1715,7 @@ mod sealed_key_pin_tests {
     "engine_backend": "v86",
     "engine_device": "v88",
     "engine_protocol_version": 90,
-    "error": "v55",
+    "error": "correctness case case-sha256:04247d855818b509 did not match the golden",
     "expected_token": null,
     "expert_bytes_read": 36,
     "expert_cache_evictions": 35,
@@ -1689,9 +1724,9 @@ mod sealed_key_pin_tests {
     "expert_hit_rate": 40.0,
     "expert_peak_cached_tensors": 38,
     "expert_read_seconds": 38.0,
-    "first_failing_case": "v43",
+    "first_failing_case": "case-sha256:04247d855818b509",
     "first_failing_layer": 41,
-    "first_failing_step": 45,
+    "first_failing_step": 64,
     "gates": [
       {
         "cool": {

@@ -569,7 +569,14 @@ where
                 scoring,
             )));
         }
-        Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
+        Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch {
+            label,
+            step,
+            actual,
+            ..
+        })) => {
+            // The engine's token and its step go to the log only (see below).
+            eprintln!("benchd official: {label} mismatch at step {step}: engine token {actual}");
             // The benchmark-ORACLE failure class the local path cannot test: a corrupted
             // oracle (or a fast-garbage engine) diverges and FAILS official. Byte-match Swift
             // `makeFailedScore` for a `BenchmarkTokenMismatchError`
@@ -592,11 +599,10 @@ where
             // intentional divergence from Swift's teacher-forced description, sanctioned by the
             // ruling: teacher-forced-per-step is retained ONLY for the untimed correctness gate.
             let is_decode_token_class = label == "benchmark free-run decode token";
+            // SEALED: the step is the candidate's choice, so the text does not carry it and the
+            // `first_failing_step` field is sealed only bucketed (`sealed_count_bucket`).
             let (error, first_failing_step) = if is_decode_token_class {
-                (
-                    format!("{label} mismatch at step {step}"),
-                    Some(step as i64),
-                )
+                (format!("{label} mismatch"), Some(step as i64))
             } else {
                 (format!("{label} mismatch"), None)
             };
@@ -3943,6 +3949,18 @@ mod tests {
             payload.metrics.checked_steps, 1,
             "fail at base step 0 → checkedSteps 1"
         );
+        // A case named after a prompt never reaches the sealed record by name.
+        let json = payload.to_sealed_json().unwrap();
+        assert!(!json.contains("case-a"), "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["metrics"]["error"],
+            format!(
+                "teacher-forced case {} did not match the golden",
+                crate::score::sealed_case("case-a")
+            )
+            .as_str()
+        );
     }
 
     #[test]
@@ -4319,9 +4337,11 @@ mod tests {
         // label now names the free-run verb ("benchmark free-run decode token"). makeFailedScore
         // still nulls the tokens. The string diverges from Swift's teacher-forced description by
         // design — teacher-forced-per-step is retained only for the untimed correctness gate.
+        // The step is the engine's choice: not in the text; the field keeps it in memory and
+        // the sealed record buckets it.
         assert_eq!(
-            payload.metrics.error, "benchmark free-run decode token mismatch at step 3",
-            "free-run decode-token class keeps the step suffix"
+            payload.metrics.error, "benchmark free-run decode token mismatch",
+            "the free-run decode-token class names no step"
         );
         assert_eq!(
             payload.metrics.first_failing_case.as_deref(),
@@ -6505,7 +6525,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("benchmark free-run decode token mismatch at step 1"),
+                .contains("benchmark free-run decode token mismatch"),
             "{}",
             payload.metrics.error
         );
@@ -6835,7 +6855,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("benchmark free-run decode token mismatch at step 5"),
+                .contains("benchmark free-run decode token mismatch"),
             "{}",
             payload.metrics.error
         );
@@ -6967,7 +6987,7 @@ mod tests {
         let error = &payload.metrics.error;
         assert!(error.contains(SERIAL_CONTROL_LEG_FAILED), "{error}");
         assert!(
-            error.contains("benchmark free-run decode token mismatch at step 3"),
+            error.contains("benchmark free-run decode token mismatch"),
             "{error}"
         );
         assert_eq!(candidate_spawns.get(), 0, "the candidate leg never opens");
