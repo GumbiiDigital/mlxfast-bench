@@ -4,10 +4,10 @@
 //! A track fixture may declare
 //!
 //! ```json
-//! "live_golden": "botany",
-//! "live_golden_rotation": {"mode": "per_job_random", "pool": ["botany", ...]},
-//! "calibration_prompt": "botany",
-//! "speculative_oracles": {"botany": {"mtp1": {"r2_path": ..., "sha256": ..., "bytes": ...}, ...}}
+//! "live_golden": "alpha",
+//! "live_golden_rotation": {"mode": "per_job_random", "pool": ["alpha", ...]},
+//! "calibration_prompt": "alpha",
+//! "speculative_oracles": {"alpha": {"mtp1": {"r2_path": ..., "sha256": ..., "bytes": ...}, ...}}
 //! ```
 //!
 //! The trusted workflow draws one pool name per job (from `/dev/urandom`, never from anything a
@@ -279,7 +279,7 @@ mod tests {
     fn fixture(pool: &[&str], pinned: &[&str]) -> Value {
         let mut timed = Vec::new();
         let mut oracles = serde_json::Map::new();
-        for (i, name) in ["botany", "beagle", "travel"].iter().enumerate() {
+        for (i, name) in ["alpha", "bravo", "charlie"].iter().enumerate() {
             let mut e = pin('a', 100 + i as u64);
             e["r2_path"] = json!(format!("p/{name}.golden.json"));
             timed.push(e);
@@ -294,7 +294,7 @@ mod tests {
             }
         }
         json!({
-            "live_golden": "botany",
+            "live_golden": "alpha",
             "live_golden_rotation": {"mode": "per_job_random", "pool": pool},
             "timed_prompt_pool": timed,
             "speculative_oracles": oracles,
@@ -308,77 +308,77 @@ mod tests {
 
     #[test]
     fn no_rotation_key_is_no_rotation() {
-        let mut v = fixture(&["botany"], &["botany"]);
+        let mut v = fixture(&["alpha"], &["alpha"]);
         v.as_object_mut().unwrap().remove("live_golden_rotation");
         assert_eq!(load(&v).unwrap(), None);
     }
 
     #[test]
     fn resolves_each_pool_prompt_per_depth() {
-        let r = load(&fixture(&["botany", "beagle"], &["botany", "beagle"]))
+        let r = load(&fixture(&["alpha", "bravo"], &["alpha", "bravo"]))
             .unwrap()
             .unwrap();
-        assert_eq!(r.calibration_prompt, "botany");
-        let serial = r.resolve("beagle", 0).unwrap();
-        assert_eq!(serial.name, "beagle");
+        assert_eq!(r.calibration_prompt, "alpha");
+        let serial = r.resolve("bravo", 0).unwrap();
+        assert_eq!(serial.name, "bravo");
         assert_eq!(serial.serial.bytes, 101);
         assert_eq!(serial.oracle, serial.serial);
-        let mtp2 = r.resolve("beagle", 2).unwrap();
+        let mtp2 = r.resolve("bravo", 2).unwrap();
         assert_eq!(mtp2.serial.bytes, 101);
         assert_eq!(mtp2.oracle.bytes, 2002);
         assert_eq!(mtp2.oracle.sha256, "2".repeat(64));
-        assert_eq!(r.resolve("botany", 3).unwrap().oracle.bytes, 1003);
+        assert_eq!(r.resolve("alpha", 3).unwrap().oracle.bytes, 1003);
     }
 
     #[test]
     fn refuses_a_name_outside_the_pool_and_an_unpermitted_depth() {
-        let r = load(&fixture(&["botany"], &["botany", "beagle"]))
+        let r = load(&fixture(&["alpha"], &["alpha", "bravo"]))
             .unwrap()
             .unwrap();
-        let e = r.resolve("beagle", 1).unwrap_err();
+        let e = r.resolve("bravo", 1).unwrap_err();
         assert!(
             e.contains("not in the contract's live_golden_rotation.pool"),
             "{e}"
         );
-        let e = r.resolve("botany", 4).unwrap_err();
+        let e = r.resolve("alpha", 4).unwrap_err();
         assert!(e.contains("no timed oracle at draft depth 4"), "{e}");
     }
 
     #[test]
     fn refuses_a_pool_prompt_without_its_oracles() {
-        let e = load(&fixture(&["botany", "beagle"], &["botany"])).unwrap_err();
+        let e = load(&fixture(&["alpha", "bravo"], &["alpha"])).unwrap_err();
         assert!(
-            e.contains("\"beagle\" has no per-depth oracle speculative_oracles.beagle.mtp1"),
+            e.contains("\"bravo\" has no per-depth oracle speculative_oracles.bravo.mtp1"),
             "{e}"
         );
     }
 
     #[test]
     fn refuses_a_pool_prompt_missing_one_depth() {
-        let mut v = fixture(&["botany", "beagle"], &["botany", "beagle"]);
-        v["speculative_oracles"]["beagle"]
+        let mut v = fixture(&["alpha", "bravo"], &["alpha", "bravo"]);
+        v["speculative_oracles"]["bravo"]
             .as_object_mut()
             .unwrap()
             .remove("mtp3");
         let e = load(&v).unwrap_err();
-        assert!(e.contains("speculative_oracles.beagle.mtp3"), "{e}");
+        assert!(e.contains("speculative_oracles.bravo.mtp3"), "{e}");
     }
 
     #[test]
     fn refuses_an_unpinned_oracle_or_serial() {
-        let mut v = fixture(&["botany", "beagle"], &["botany", "beagle"]);
-        v["speculative_oracles"]["beagle"]["mtp2"]["sha256"] = json!("");
+        let mut v = fixture(&["alpha", "bravo"], &["alpha", "bravo"]);
+        v["speculative_oracles"]["bravo"]["mtp2"]["sha256"] = json!("");
         assert!(load(&v).unwrap_err().contains("unpinned or malformed"));
-        let mut v = fixture(&["botany", "beagle"], &["botany", "beagle"]);
+        let mut v = fixture(&["alpha", "bravo"], &["alpha", "bravo"]);
         v["timed_prompt_pool"][1]["bytes"] = json!(0);
         assert!(load(&v)
             .unwrap_err()
-            .contains("timed_prompt_pool[beagle.golden.json]"));
+            .contains("timed_prompt_pool[bravo.golden.json]"));
     }
 
     #[test]
     fn refuses_a_pool_prompt_without_a_serial_golden() {
-        let e = load(&fixture(&["botany", "nosuch"], &["botany"])).unwrap_err();
+        let e = load(&fixture(&["alpha", "nosuch"], &["alpha"])).unwrap_err();
         assert!(
             e.contains("\"nosuch\" has no timed_prompt_pool entry"),
             "{e}"
@@ -387,27 +387,27 @@ mod tests {
 
     #[test]
     fn refuses_an_oracle_borrowed_from_another_prompt() {
-        let mut v = fixture(&["botany", "beagle"], &["botany", "beagle"]);
-        v["speculative_oracles"]["beagle"] = v["speculative_oracles"]["botany"].clone();
+        let mut v = fixture(&["alpha", "bravo"], &["alpha", "bravo"]);
+        v["speculative_oracles"]["bravo"] = v["speculative_oracles"]["alpha"].clone();
         assert!(load(&v)
             .unwrap_err()
-            .contains("not .../beagle.mtp1.golden.json"));
+            .contains("not .../bravo.mtp1.golden.json"));
     }
 
     #[test]
     fn refuses_malformed_rotation_shapes() {
-        let mut v = fixture(&["botany"], &["botany"]);
+        let mut v = fixture(&["alpha"], &["alpha"]);
         v["live_golden_rotation"]["mode"] = json!("round_robin");
         assert!(load(&v).unwrap_err().contains("only \"per_job_random\""));
-        let v = fixture(&[], &["botany"]);
+        let v = fixture(&[], &["alpha"]);
         assert!(load(&v).unwrap_err().contains("pool is empty"));
-        let v = fixture(&["botany", "botany"], &["botany"]);
+        let v = fixture(&["alpha", "alpha"], &["alpha"]);
         assert!(load(&v).unwrap_err().contains("twice"));
-        let v = fixture(&["beagle"], &["beagle"]);
+        let v = fixture(&["bravo"], &["bravo"]);
         assert!(load(&v)
             .unwrap_err()
             .contains("is not in live_golden_rotation.pool"));
-        let mut v = fixture(&["botany"], &["botany"]);
+        let mut v = fixture(&["alpha"], &["alpha"]);
         v["calibration_prompt"] = json!("nosuch");
         assert!(load(&v).unwrap_err().contains("calibration_prompt"));
     }
