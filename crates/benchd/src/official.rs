@@ -1236,7 +1236,13 @@ where
         // Tokens equal to the golden's oracle have no mismatch, and no replay runs for them. The
         // counts of any other pair stay unset until [`judge_candidate_tokens`] replays it.
         let exact = timing.emitted_tokens == oracle_tokens(benchmark, timing.decode_steps);
-        let exact_count = exact.then_some(0);
+        // UNDER A REPLAY POLICY no per-pair count is sealed, exact or deferred: a 0 on one row and
+        // a null on another would be a per-pair divergence bit. The replay's verdict is the run's.
+        let exact_count = if replay.is_some() {
+            None
+        } else {
+            exact.then_some(0)
+        };
         records.push(PairedLegRecord {
             pair: pair as i64,
             prompt_sha256: golden.sha256.clone(),
@@ -1322,21 +1328,33 @@ where
                 &deferred,
                 &policy,
             ),
-            None => Err("a timed divergence was deferred without a replay policy".to_string()),
+            None => Err((
+                deferred[0].0,
+                "a timed divergence was deferred without a replay policy".to_string(),
+            )),
         };
         match verdict {
             Ok(summary) => eprintln!("benchd official: {summary}"),
-            Err(e) => {
-                // Named after the first deferred pair's goldens (the replay names the pair).
-                let mut failed = paired_refusal(
-                    goldens[(deferred[0].0 - 1) % goldens.len()],
+            Err((pair, e)) => {
+                // Named after the pair that FAILED (1-based): its golden is the one sealed, and
+                // its control leg is the one that passed the band, as on the tolerance path.
+                let failing_goldens = goldens[(pair - 1) % goldens.len()];
+                let record = &records[pair - 1];
+                let control_leg = (
+                    record.control_prefill_seconds_per_token,
+                    record.control_decode_seconds_per_token,
+                );
+                let mut failed = official_failed(
+                    failing_goldens.candidate,
                     digests,
                     commit,
                     format!("TIMED-REPLAY-REJECTED: {e}"),
-                    seal,
-                    Some((control_prefill, control_decode)),
                     ScoringInputs::no_denominator(floors, weights),
                 );
+                let mut seal = seal;
+                seal.band_passed = true;
+                seal.leg = Some(control_leg);
+                seal_paired_baseline(&mut failed.metrics, &seal, &failing_goldens.control.sha256);
                 failed.metrics.paired_legs = records;
                 return failed;
             }
@@ -1418,7 +1436,7 @@ fn replay_deferred_divergences<T, L, LB, FB>(
     benchmarks: &[&bench_core::golden::BenchmarkGolden],
     deferred: &[(usize, bench_runner::timing::DeferredDivergence)],
     policy: &bench_core::timed_replay::TimedReplayPolicy,
-) -> Result<String, String>
+) -> Result<String, (usize, String)>
 where
     T: LineTransport,
     LB: FnMut(usize) -> Result<L, String>,
@@ -1439,56 +1457,68 @@ where
     // golden the leg's per-spawn sandbox plan denies.
     let benchmark_of = |pair: usize| benchmarks[(pair - 1) % benchmarks.len()];
     let first_pair = deferred.first().map_or(1, |(p, _)| *p);
-    let guard = open_baseline_leg((first_pair - 1) % benchmarks.len())
-        .map_err(|e| format!("the reference engine for the replay did not come up: {e}"))?;
-    let mut session = spawn_baseline()
-        .map_err(|e| format!("the reference worker for the replay did not start: {e}"))?;
+    let guard = open_baseline_leg((first_pair - 1) % benchmarks.len()).map_err(|e| {
+        (
+            first_pair,
+            format!("the reference engine for the replay did not come up: {e}"),
+        )
+    })?;
+    let mut session = spawn_baseline().map_err(|e| {
+        (
+            first_pair,
+            format!("the reference worker for the replay did not start: {e}"),
+        )
+    })?;
     let mut summary = Vec::new();
     for (pair, d) in deferred {
-        let benchmark = benchmark_of(*pair);
+        let pair = *pair;
+        let fail = |e: String| (pair, e);
+        let benchmark = benchmark_of(pair);
         if let Some(token) = d.prefill_token {
             session.begin_phase();
             let resp = session
                 .correctness_begin(&benchmark.prefill_prompt_tokens)
-                .map_err(|e| format!("pair {pair}: prefill replay: {e}"))?;
-            let j = judge_position(&top_of(&resp)?, token, policy).map_err(|e| {
+                .map_err(|e| fail(format!("pair {pair}: prefill replay: {e}")))?;
+            let top = top_of(&resp).map_err(fail)?;
+            let j = judge_position(&top, token, policy).map_err(|e| {
                 log(format!("pair {pair}: prefill token {token}: {e}"));
-                format!("pair {pair}: timed prefill: {e}")
+                fail(format!("pair {pair}: timed prefill: {e}"))
             })?;
             if j.off_argmax {
                 log(format!("pair {pair}: prefill token {token} is off-argmax"));
-                return Err(format!(
+                return Err(fail(format!(
                     "pair {pair}: the timed prefill token is off-argmax for the reference"
-                ));
+                )));
             }
             session
                 .close_phase()
-                .map_err(|e| format!("pair {pair}: prefill replay barrier: {e}"))?;
+                .map_err(|e| fail(format!("pair {pair}: prefill replay barrier: {e}")))?;
             summary.push(format!("pair {pair} prefill token {token} accepted"));
         }
         if let Some((first, stream)) = &d.stream {
             session.begin_phase();
             let mut resp = session
                 .correctness_begin(&benchmark.decode_seed_tokens)
-                .map_err(|e| format!("pair {pair}: decode replay: {e}"))?;
+                .map_err(|e| fail(format!("pair {pair}: decode replay: {e}")))?;
             let mut off_argmax = 0usize;
             let mut worst_gap = 0.0f64;
             for (p, &token) in stream.iter().enumerate() {
                 if p > 0 {
                     resp = session.correctness_step(stream[p - 1]).map_err(|e| {
                         log(format!("pair {pair}: decode replay failed at position {p}"));
-                        format!("pair {pair}: decode replay: {e}")
+                        fail(format!("pair {pair}: decode replay: {e}"))
                     })?;
                 }
                 if p < *first {
                     continue;
                 }
-                let j = judge_position(&top_of(&resp)?, token, policy).map_err(|e| {
+                let top = top_of(&resp).map_err(fail)?;
+                let j = judge_position(&top, token, policy).map_err(|e| {
                     log(format!(
                         "pair {pair}: timed decode position {p} (0 = the seed token), token \
                          {token}: {e}"
                     ));
-                    format!("pair {pair}: timed decode: {e}")
+                    fail(format!("pair {pair}: timed decode: {e}"))
                 })?;
                 if j.off_argmax {
                     off_argmax += 1;
@@ -1497,17 +1527,17 @@ where
             }
             session
                 .close_phase()
-                .map_err(|e| format!("pair {pair}: decode replay barrier: {e}"))?;
+                .map_err(|e| fail(format!("pair {pair}: decode replay barrier: {e}")))?;
             let budget = policy.off_argmax_budget(stream.len());
             if off_argmax > budget {
                 log(format!(
                     "pair {pair}: {off_argmax} off-argmax positions from position {first}"
                 ));
-                return Err(format!(
+                return Err(fail(format!(
                     "pair {pair}: more of the timed window's {} positions are off-argmax for the \
                      reference than the budget of {budget}",
                     stream.len()
-                ));
+                )));
             }
             summary.push(format!(
                 "pair {pair} decode diverged at position {first}, replayed {} positions, \
@@ -6691,6 +6721,101 @@ mod tests {
         )
     }
 
+    /// UNDER OUR REPLAY POLICY a rejected replay is labelled with the pair that FAILED (its
+    /// golden, its control leg, the band it passed), and no pair row seals a mismatch count, exact
+    /// or deferred.
+    #[test]
+    fn a_rejected_replay_names_the_failing_pair_and_seals_no_per_pair_count() {
+        let golden = official_golden(None);
+        let decode = golden
+            .benchmark
+            .as_ref()
+            .unwrap()
+            .expected_decode_tokens
+            .clone();
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let payload = official_core_paired(
+            &[PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || Session::connect(reference_engine(&decode, 1)).map(|(s, _)| s),
+                // Pair 1 exact; pair 2 commits one token outside the reference's top eight.
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    let changed: &[usize] = if candidate_spawns.get() <= 1 {
+                        &[]
+                    } else {
+                        &[7]
+                    };
+                    Session::connect(candidate_with_changes(
+                        &oracle_decode_tokens(),
+                        changed,
+                        false,
+                    ))
+                    .map(|(s, _)| s)
+                },
+            },
+            PairedWindow {
+                pairs: 2,
+                window: WindowShape {
+                    timed_divergence_replay: true,
+                    ..test_window()
+                },
+                replay: Some(bench_core::timed_replay::TimedReplayPolicy {
+                    max_logit_gap: 2.0,
+                    off_argmax_per_thousand: 0,
+                }),
+                // A mock's wall clock is noise: no floor may end the run before the replay.
+                floors: SpeedupFloors {
+                    decode: 0.0,
+                    prefill: 0.0,
+                },
+                bands: AcceptanceBands {
+                    prefill_up_tolerance: 1e9,
+                    prefill_down_tolerance: 1e9,
+                    decode_up_tolerance: 1e9,
+                    decode_down_tolerance: 1e9,
+                    decode_down_enabled: false,
+                    prefill_down_enabled: false,
+                },
+                ..paired_window_for_test(|_phase: &str| Ok(()))
+            },
+        );
+        let m = &payload.metrics;
+        assert!(!payload.passed);
+        assert!(
+            m.error.starts_with("TIMED-REPLAY-REJECTED: pair 2:"),
+            "{}",
+            m.error
+        );
+        assert_eq!(m.golden_hash, golden.sha256);
+        assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(
+            m.baseline_leg_decode_seconds_per_token,
+            Some(m.paired_legs[1].control_decode_seconds_per_token)
+        );
+        let json = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for row in v["metrics"]["paired_legs"].as_array().unwrap() {
+            assert!(row["token_mismatch_count"].is_null(), "{json}");
+            assert!(
+                row["token_mismatch_second_choice_count"].is_null(),
+                "{json}"
+            );
+        }
+        assert!(v["metrics"].get("token_mismatch_count").is_none(), "{json}");
+    }
+
     /// ABSENT TOLERANCE: one different decode token stops the candidate leg, exactly as before,
     /// and no replay runs.
     #[test]
@@ -7194,6 +7319,10 @@ mod tests {
                 )],
                 &POLICY,
             )
+            .map_err(|(pair, e)| {
+                assert_eq!(pair, 1, "the refusal names the pair that failed");
+                e
+            })
         }
 
         #[test]
