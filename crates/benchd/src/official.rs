@@ -46,7 +46,7 @@ use crate::iterate::{
     first_conformance_failure, FailedAudit, FailureReport, Mode, RunDigests, ScoringInputs,
     SessionEngine,
 };
-use crate::score::{ScoreMetrics, ScorePayload};
+use crate::score::{sealed_gap, ScoreMetrics, ScorePayload};
 
 /// Seal the BOARD-facing `metrics.per_prompt` record for the ONE timed prompt this official run
 /// measured (the challenge board's MTP column and per-prompt decode readout).
@@ -1275,7 +1275,8 @@ where
                 digests,
                 commit,
                 error,
-                record.token_mismatch_first_step,
+                // The failing step is the candidate's choice: logged, never sealed.
+                None,
                 ScoringInputs {
                     baseline_prefill_spt: control_leg.0,
                     baseline_decode_spt: control_leg.1,
@@ -1568,19 +1569,27 @@ where
                     let failed = if t != c.second {
                         "the token is not the reference engine's second choice".to_string()
                     } else if c.second_gap > gap_limit {
-                        format!("the gap {} is above the limit", c.second_gap)
+                        // Sealed at 2 decimals: the exact gap is logged below.
+                        format!("the gap {} is above the limit", sealed_gap(c.second_gap))
                     } else {
                         near_ties += 1;
                         continue;
                     };
                     if not_a_near_tie.is_none() {
+                        eprintln!(
+                            "benchd: {TIMED_DIVERGENCE_NOT_A_NEAR_TIE}: pair {}: position {step}, \
+                             gap {}",
+                            p + 1,
+                            c.second_gap
+                        );
+                        // The refusal is sealed, so it names neither the position nor the exact
+                        // gap: both are the candidate's choice.
                         not_a_near_tie = Some((
                             p,
                             format!(
-                                "{TIMED_DIVERGENCE_NOT_A_NEAR_TIE}: pair {} of {}: the timed \
-                                 token at position {step} differs from the reference engine's \
-                                 choice and is not a near tie under the limit {gap_limit}: \
-                                 {failed}",
+                                "{TIMED_DIVERGENCE_NOT_A_NEAR_TIE}: pair {} of {}: a timed \
+                                 token differs from the reference engine's choice and is not a \
+                                 near tie under the limit {gap_limit}: {failed}",
                                 p + 1,
                                 records.len(),
                             ),
@@ -1601,22 +1610,35 @@ where
     for count in &verdict.per_stream {
         records[count.slot].token_mismatch_count = Some(count.mismatches as i64);
     }
+    // The sealed record carries these only coarsened (`PairedLegRecord::sealed`): log them exact.
+    for r in records.iter() {
+        eprintln!(
+            "benchd: pair {} timed tokens: mismatches {:?}, first step {:?}, near ties {:?}, \
+             second choices {:?}, max second-choice gap {:?}",
+            r.pair,
+            r.token_mismatch_count,
+            r.token_mismatch_first_step,
+            r.token_mismatch_near_tie_count,
+            r.token_mismatch_second_choice_count,
+            r.token_mismatch_second_choice_max_relative_gap,
+        );
+    }
     if let Some(refusal) = not_a_near_tie {
         return Err(refusal);
     }
+    // The refusal is sealed, so it states the allowance benchd computed from the fixture, not
+    // the candidate's count (logged above).
     match verdict.first_failing {
         Some(f) => Err((
             f.slot,
             format!(
-                "{TIMED_DIVERGENCE_OVER_TOLERANCE}: pair {} of {}: {} of the candidate's {} timed \
-                 tokens differ from the reference engine's choice for the same prefix; the track \
-                 fixture allows at most {limit} per thousand ({} * 1000 > {limit} * {})",
+                "{TIMED_DIVERGENCE_OVER_TOLERANCE}: pair {} of {}: more of the candidate's {} timed \
+                 tokens differ from the reference engine's choice for the same prefix than the \
+                 track fixture allows: at most {} ({limit} per thousand)",
                 f.slot + 1,
                 records.len(),
-                f.mismatches,
                 f.committed_len,
-                f.mismatches,
-                f.committed_len,
+                f.committed_len as u64 * limit as u64 / 1000,
             ),
         )),
         None => Ok(()),
@@ -6156,7 +6178,7 @@ mod tests {
     }
 
     /// OVER THE LIMIT: 13 of 129 tokens is over 100 per thousand. The run is refused by name,
-    /// with the pair, the count and the limit, and seals no score.
+    /// with the pair and the allowance (not the candidate's count or step), and seals no score.
     #[test]
     fn one_mismatch_over_the_limit_refuses_by_name() {
         let golden = official_golden(None);
@@ -6175,14 +6197,18 @@ mod tests {
         let error = &payload.metrics.error;
         assert!(error.contains(TIMED_DIVERGENCE_OVER_TOLERANCE), "{error}");
         assert!(error.contains("pair 1 of 1"), "{error}");
-        assert!(error.contains("13 of the candidate's 129"), "{error}");
-        assert!(error.contains("at most 100 per thousand"), "{error}");
+        assert!(
+            error.contains("the candidate's 129 timed tokens"),
+            "{error}"
+        );
+        assert!(error.contains("at most 12 (100 per thousand)"), "{error}");
+        assert!(!error.contains("13"), "{error}");
         assert_eq!(
             payload.metrics.paired_legs[0].token_mismatch_count,
             Some(13)
         );
         assert_eq!(payload.metrics.token_mismatch_count, Some(13));
-        assert_eq!(payload.metrics.first_failing_step, Some(11));
+        assert_eq!(payload.metrics.first_failing_step, None);
         assert_eq!(payload.metrics.baseline_band_passed, Some(true));
     }
 
@@ -6359,7 +6385,7 @@ mod tests {
         let error = &payload.metrics.error;
         assert!(error.contains(TIMED_DIVERGENCE_NOT_A_NEAR_TIE), "{error}");
         assert!(error.contains("pair 1 of 1"), "{error}");
-        assert!(error.contains("position 11"), "{error}");
+        assert!(!error.contains("position"), "{error}");
         assert!(error.contains("under the limit 0.09"), "{error}");
         assert!(error.contains("the gap 0.1 is above the limit"), "{error}");
         assert_eq!(payload.metrics.paired_legs[0].token_mismatch_count, Some(1));

@@ -404,7 +404,8 @@ pub struct ScoreMetrics {
 }
 
 /// One measured pair of the paired official run: the serial-control leg and the candidate leg on
-/// the same box and prompt, as measured (never coarsened — this is the audit trail).
+/// the same box and prompt, as measured. The sealed form coarsens only the token counts
+/// ([`PairedLegRecord::sealed`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairedLegRecord {
     pub pair: i64,
@@ -453,6 +454,43 @@ pub struct PairedLegRecord {
     /// no such position. No decision reads it.
     #[serde(default)]
     pub token_mismatch_second_choice_max_relative_gap: Option<f64>,
+}
+
+impl PairedLegRecord {
+    /// This record as SEALED: the token counts bucketed ([`sealed_count_bucket`]), the first
+    /// mismatch step dropped, the gap at 2 decimals ([`sealed_gap`]). The leg times are carried
+    /// as measured.
+    pub fn sealed(&self) -> PairedLegRecord {
+        PairedLegRecord {
+            token_mismatch_count: self.token_mismatch_count.map(sealed_count_bucket),
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: self
+                .token_mismatch_near_tie_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_count: self
+                .token_mismatch_second_choice_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_max_relative_gap: self
+                .token_mismatch_second_choice_max_relative_gap
+                .map(sealed_gap),
+            ..self.clone()
+        }
+    }
+}
+
+/// The SEALED form of a candidate-chosen count: `0` stays `0`, anything else rounds UP to the next
+/// power of two (1, 2, 4, 8, ...), so a sealed count says "at most this many" and no more.
+pub fn sealed_count_bucket(n: i64) -> i64 {
+    if n <= 0 {
+        n
+    } else {
+        (n as u64).next_power_of_two() as i64
+    }
+}
+
+/// The SEALED form of a candidate-influenced gap: 2 decimals.
+pub fn sealed_gap(gap: f64) -> f64 {
+    (gap * 100.0).round() / 100.0
 }
 
 /// One timed prompt's board-facing record, sealed in [`ScoreMetrics::per_prompt`].
@@ -639,17 +677,28 @@ impl ScoreMetrics {
                 .baseline_leg_seed_prefill_window_seconds_per_token,
             candidate_leg_seed_prefill_window_seconds_per_token: self
                 .candidate_leg_seed_prefill_window_seconds_per_token,
-            // The token tolerance and its counts are carried VERBATIM: they are counts, a limit
-            // and one ratio that states a fact about the replay.
+            // The fixture's limits are carried VERBATIM. The token counts are the candidate's
+            // choice (it picked which tokens to commit, having seen the prompt), so they are
+            // sealed only bucketed, the first mismatch step not at all, and the gap at 2
+            // decimals ([`PairedLegRecord::sealed`]). benchd logs the exact values.
             timed_token_tolerance_per_thousand: self.timed_token_tolerance_per_thousand,
             timed_token_near_tie_relative_gap: self.timed_token_near_tie_relative_gap,
-            token_mismatch_count: self.token_mismatch_count,
-            token_mismatch_first_step: self.token_mismatch_first_step,
-            token_mismatch_near_tie_count: self.token_mismatch_near_tie_count,
-            token_mismatch_second_choice_count: self.token_mismatch_second_choice_count,
+            token_mismatch_count: self.token_mismatch_count.map(sealed_count_bucket),
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: self
+                .token_mismatch_near_tie_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_count: self
+                .token_mismatch_second_choice_count
+                .map(sealed_count_bucket),
             token_mismatch_second_choice_max_relative_gap: self
-                .token_mismatch_second_choice_max_relative_gap,
-            paired_legs: self.paired_legs.clone(),
+                .token_mismatch_second_choice_max_relative_gap
+                .map(sealed_gap),
+            paired_legs: self
+                .paired_legs
+                .iter()
+                .map(PairedLegRecord::sealed)
+                .collect(),
             // The GATE LOG is carried VERBATIM: a wait in seconds and a temperature the gate
             // actually read are facts about the run, not diagnostics to round.
             gates: self.gates.clone(),
@@ -909,7 +958,7 @@ mod tests {
         "timed_token_near_tie_relative_gap",
         "timed_token_tolerance_per_thousand",
         "token_mismatch_count",
-        "token_mismatch_first_step",
+        // `token_mismatch_first_step` is never sealed on the flat metrics.
         "token_mismatch_near_tie_count",
         "token_mismatch_second_choice_count",
         "token_mismatch_second_choice_max_relative_gap",
@@ -1094,6 +1143,66 @@ mod tests {
             metrics.per_prompt,
             "per_prompt mirrors the ranking fields: never coarsened"
         );
+    }
+
+    /// THE TOKEN COUNTS ARE THE CANDIDATE'S CHOICE, and the sealed record goes back to the
+    /// participant whose engine saw the prompt. It carries them only bucketed (0 stays 0, else
+    /// the next power of two), never the first mismatch step, and the gap at 2 decimals — on the
+    /// flat metrics and on every `paired_legs` row. In memory they stay exact.
+    #[test]
+    fn the_sealed_record_holds_no_exact_token_counts() {
+        let record = PairedLegRecord {
+            pair: 1,
+            prompt_sha256: "ab".repeat(32),
+            control_prefill_seconds_per_token: 0.001,
+            control_decode_seconds_per_token: 0.03,
+            candidate_prefill_seconds_per_token: 0.001,
+            candidate_decode_seconds_per_token: 0.02,
+            control_seed_prefill_window_seconds_per_token: None,
+            control_decode_window_seconds_per_token: None,
+            candidate_seed_prefill_window_seconds_per_token: None,
+            candidate_decode_window_seconds_per_token: None,
+            token_mismatch_count: Some(13),
+            token_mismatch_first_step: Some(45),
+            token_mismatch_near_tie_count: Some(13),
+            token_mismatch_second_choice_count: Some(13),
+            token_mismatch_second_choice_max_relative_gap: Some(0.123_456),
+        };
+        let payload = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                token_mismatch_count: Some(13),
+                token_mismatch_first_step: Some(45),
+                token_mismatch_near_tie_count: Some(13),
+                token_mismatch_second_choice_count: Some(13),
+                token_mismatch_second_choice_max_relative_gap: Some(0.123_456),
+                paired_legs: vec![record],
+                ..zero_metrics()
+            },
+        };
+        let json = payload.to_sealed_json().unwrap();
+        for raw in ["13", "45", "0.123"] {
+            assert!(!json.contains(raw), "{raw} sealed: {json}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let m = &v["metrics"];
+        let row = &m["paired_legs"][0];
+        for sealed in [m, row] {
+            assert_eq!(sealed["token_mismatch_count"], 16);
+            assert_eq!(sealed["token_mismatch_near_tie_count"], 16);
+            assert_eq!(sealed["token_mismatch_second_choice_count"], 16);
+            assert_eq!(
+                sealed["token_mismatch_second_choice_max_relative_gap"],
+                0.12
+            );
+        }
+        assert!(m.get("token_mismatch_first_step").is_none());
+        assert!(row["token_mismatch_first_step"].is_null());
+        assert_eq!(payload.metrics.token_mismatch_count, Some(13));
+        for (n, b) in [(0, 0), (1, 1), (2, 2), (3, 4), (13, 16), (129, 256)] {
+            assert_eq!(sealed_count_bucket(n), b, "{n}");
+        }
     }
 }
 
@@ -1590,10 +1699,10 @@ mod sealed_key_pin_tests {
         "control_prefill_seconds_per_token": 2.5,
         "pair": 1,
         "prompt_sha256": "v140",
-        "token_mismatch_count": 141,
-        "token_mismatch_first_step": 143,
-        "token_mismatch_near_tie_count": 159,
-        "token_mismatch_second_choice_count": 145,
+        "token_mismatch_count": 256,
+        "token_mismatch_first_step": null,
+        "token_mismatch_near_tie_count": 256,
+        "token_mismatch_second_choice_count": 256,
         "token_mismatch_second_choice_max_relative_gap": 147.5
       }
     ],
@@ -1641,10 +1750,9 @@ mod sealed_key_pin_tests {
     "timed_token_near_tie_relative_gap": 0.25,
     "timed_token_tolerance_per_thousand": 149,
     "timestamp": "v57",
-    "token_mismatch_count": 151,
-    "token_mismatch_first_step": 153,
-    "token_mismatch_near_tie_count": 161,
-    "token_mismatch_second_choice_count": 155,
+    "token_mismatch_count": 256,
+    "token_mismatch_near_tie_count": 256,
+    "token_mismatch_second_choice_count": 256,
     "token_mismatch_second_choice_max_relative_gap": 157.5,
     "weights_byte_count": 60,
     "weights_file_count": 61,
