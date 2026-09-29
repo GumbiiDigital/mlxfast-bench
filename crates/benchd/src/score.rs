@@ -367,6 +367,35 @@ pub struct ScoreMetrics {
     pub baseline_leg_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_leg_seed_prefill_window_seconds_per_token: Option<f64>,
+    /// ADDITIVE — the timed token tolerance the paired run applied, in tokens per thousand
+    /// (`timed_token_tolerance_per_thousand` in the track fixture). Absent when the fixture
+    /// declares none: then one different token fails the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed_token_tolerance_per_thousand: Option<u32>,
+    /// ADDITIVE — the near-tie limit the paired run applied (`timed_token_near_tie_relative_gap`
+    /// in the track fixture). Absent when the fixture declares none: then every different token
+    /// counts against the tolerance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed_token_near_tie_relative_gap: Option<f64>,
+    /// ADDITIVE — the SCORED pair's [`PairedLegRecord::token_mismatch_count`]. Absent on a path
+    /// with no paired legs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mismatch_count: Option<i64>,
+    /// ADDITIVE — the SCORED pair's [`PairedLegRecord::token_mismatch_first_step`]. Absent when
+    /// that pair has no mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mismatch_first_step: Option<i64>,
+    /// ADDITIVE — the SCORED pair's [`PairedLegRecord::token_mismatch_near_tie_count`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mismatch_near_tie_count: Option<i64>,
+    /// ADDITIVE, REPORT-ONLY — the SCORED pair's
+    /// [`PairedLegRecord::token_mismatch_second_choice_count`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mismatch_second_choice_count: Option<i64>,
+    /// ADDITIVE, REPORT-ONLY — the SCORED pair's
+    /// [`PairedLegRecord::token_mismatch_second_choice_max_relative_gap`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mismatch_second_choice_max_relative_gap: Option<f64>,
     /// PAIRED PATH audit trail (David 2026-09-09, `official_pairs` in the track fixture): every
     /// pair this run measured, in order, both legs' per-token times as measured. The enforced
     /// `baseline_leg_*` / `candidate_leg_*` fields above are ONE of these rows — the pair whose
@@ -394,6 +423,10 @@ pub struct ScoreMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairedLegRecord {
     pub pair: i64,
+    /// The sha256 of the candidate golden this pair measured. Both legs of a pair measure the same
+    /// prompt. `default` lets this benchd read a score sealed before the key existed.
+    #[serde(default)]
+    pub prompt_sha256: String,
     pub control_prefill_seconds_per_token: f64,
     pub control_decode_seconds_per_token: f64,
     pub candidate_prefill_seconds_per_token: f64,
@@ -411,6 +444,68 @@ pub struct PairedLegRecord {
     pub candidate_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_decode_window_seconds_per_token: Option<f64>,
+    /// The candidate leg's timed tokens (the seed token, then the decode tokens) that differ from
+    /// the reference engine's choice for the same prefix. `0` when the tokens equal the golden's
+    /// oracle. `null` only when the replay that counts them did not complete.
+    #[serde(default)]
+    pub token_mismatch_count: Option<i64>,
+    /// The position of the first such token: `0` is the seed token, `i` is decode token `i - 1`.
+    /// `null` when there is no mismatch.
+    #[serde(default)]
+    pub token_mismatch_first_step: Option<i64>,
+    /// How many of the mismatches are NEAR TIES under the fixture's
+    /// `timed_token_near_tie_relative_gap`: the candidate's token is the reference engine's second
+    /// choice, and the relative gap between its first and second choice is at most the limit.
+    /// `null` when the fixture declares no limit, or when the replay did not complete.
+    #[serde(default)]
+    pub token_mismatch_near_tie_count: Option<i64>,
+    /// REPORT-ONLY — how many of the mismatches are positions where the candidate's token is the
+    /// reference engine's second choice. No decision reads it.
+    #[serde(default)]
+    pub token_mismatch_second_choice_count: Option<i64>,
+    /// REPORT-ONLY — the largest relative gap between the reference engine's first and second
+    /// choice over those positions (`bench_core::near_tie::relative_gap`). `null` when there is
+    /// no such position. No decision reads it.
+    #[serde(default)]
+    pub token_mismatch_second_choice_max_relative_gap: Option<f64>,
+}
+
+/// The SEALED form of a candidate-chosen count: `0` stays `0`, anything else rounds UP to the next
+/// power of two (1, 2, 4, 8, …), so a sealed count says "at most this many" and no more. The same
+/// power-of-two bucketing as `bench_runner::seal_byte_len`, kept numeric so the key keeps its type.
+pub fn sealed_count_bucket(n: i64) -> i64 {
+    if n <= 0 {
+        n
+    } else {
+        (n as u64).next_power_of_two() as i64
+    }
+}
+
+/// The SEALED form of a candidate-influenced gap: 2 decimals.
+pub fn sealed_gap(gap: f64) -> f64 {
+    (gap * 100.0).round() / 100.0
+}
+
+impl PairedLegRecord {
+    /// This record as SEALED: the token counts bucketed ([`sealed_count_bucket`]), the first
+    /// mismatch step dropped, the gap at 2 decimals. The leg times and `prompt_sha256` (the
+    /// organizer's golden digest, which the engine cannot choose) are carried as measured.
+    pub fn seal_token_counts_coarse(&self) -> PairedLegRecord {
+        PairedLegRecord {
+            token_mismatch_count: self.token_mismatch_count.map(sealed_count_bucket),
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: self
+                .token_mismatch_near_tie_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_count: self
+                .token_mismatch_second_choice_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_max_relative_gap: self
+                .token_mismatch_second_choice_max_relative_gap
+                .map(sealed_gap),
+            ..self.clone()
+        }
+    }
 }
 
 /// One timed prompt's board-facing record, sealed in [`ScoreMetrics::per_prompt`].
@@ -555,7 +650,8 @@ impl ScoreMetrics {
             first_failing_layer: self.first_failing_layer,
             first_failing_case: self.first_failing_case.clone(),
             first_failing_step: self.first_failing_step,
-            expected_token: self.expected_token,
+            // The golden's token is never published. The case and the step locate the failure.
+            expected_token: None,
             actual_token: self.actual_token,
             max_abs_diff: r(self.max_abs_diff),
             golden_hash: self.golden_hash.clone(),
@@ -620,7 +716,28 @@ impl ScoreMetrics {
                 .baseline_leg_seed_prefill_window_seconds_per_token,
             candidate_leg_seed_prefill_window_seconds_per_token: self
                 .candidate_leg_seed_prefill_window_seconds_per_token,
-            paired_legs: self.paired_legs.clone(),
+            // The fixture's limits are carried VERBATIM. The token COUNTS are the candidate's
+            // choice (it picked which tokens to commit), so they are sealed only as a bucket, the
+            // first mismatch step not at all, and the gap at 2 decimals
+            // ([`PairedLegRecord::seal_token_counts_coarse`]). Pass/fail is the run's own `passed` + named error.
+            timed_token_tolerance_per_thousand: self.timed_token_tolerance_per_thousand,
+            timed_token_near_tie_relative_gap: self.timed_token_near_tie_relative_gap,
+            token_mismatch_count: self.token_mismatch_count.map(sealed_count_bucket),
+            token_mismatch_first_step: None,
+            token_mismatch_near_tie_count: self
+                .token_mismatch_near_tie_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_count: self
+                .token_mismatch_second_choice_count
+                .map(sealed_count_bucket),
+            token_mismatch_second_choice_max_relative_gap: self
+                .token_mismatch_second_choice_max_relative_gap
+                .map(sealed_gap),
+            paired_legs: self
+                .paired_legs
+                .iter()
+                .map(PairedLegRecord::seal_token_counts_coarse)
+                .collect(),
             // The GATE LOG is carried VERBATIM: a wait in seconds and a temperature the gate
             // actually read are facts about the run, not diagnostics to round.
             gates: self.gates.clone(),
@@ -850,7 +967,8 @@ mod tests {
 
     /// The ONE sanctioned ADDITIVE key set — `per_prompt` plus the speculative-decode seal and the
     /// engine identity (backend/device/protocol version, the loaded-head digest, the runner
-    /// identity, and the resident-process identity). Every entry is omitted-when-unset, so a run that does not produce it seals
+    /// identity, and the resident-process identity), and the timed token tolerance with its counts.
+    /// Every entry is omitted-when-unset, so a run that does not produce it seals
     /// byte-identically to before it existed.
     const ADDITIVE_METRICS_KEYS: &[&str] = &[
         "acceptance_lengths",
@@ -876,6 +994,13 @@ mod tests {
         "spec_serial_verification_rounds",
         "spec_verification_mode",
         "spec_verify_replay_disagreements",
+        "timed_token_near_tie_relative_gap",
+        "timed_token_tolerance_per_thousand",
+        "token_mismatch_count",
+        // `token_mismatch_first_step` is never sealed: the candidate chose where its stream went.
+        "token_mismatch_near_tie_count",
+        "token_mismatch_second_choice_count",
+        "token_mismatch_second_choice_max_relative_gap",
     ];
 
     /// KEY-SET SNAPSHOT. The 56 pre-existing keys are UNCHANGED — none renamed, dropped or
@@ -928,6 +1053,13 @@ mod tests {
             runner_build: Some("c4089870".to_string()),
             resident_pid: Some(4242),
             resident_load_epoch: Some(1_756_944_000),
+            timed_token_tolerance_per_thousand: Some(100),
+            timed_token_near_tie_relative_gap: Some(0.05),
+            token_mismatch_count: Some(3),
+            token_mismatch_first_step: Some(17),
+            token_mismatch_near_tie_count: Some(2),
+            token_mismatch_second_choice_count: Some(2),
+            token_mismatch_second_choice_max_relative_gap: Some(0.0125),
             ..zero_metrics()
         };
         let after = sealed_metrics_keys(populated);
@@ -935,6 +1067,66 @@ mod tests {
         let removed: Vec<String> = before.difference(&after).cloned().collect();
         assert_eq!(added, ADDITIVE_METRICS_KEYS, "the additive set, exactly");
         assert!(removed.is_empty(), "existing keys removed: {removed:?}");
+    }
+
+    /// THE TOKEN COUNTS ARE THE CANDIDATE'S CHOICE: the sealed record carries them only bucketed
+    /// (0 stays 0, else the next power of two), never the first mismatch step, and the gap at 2
+    /// decimals — on the flat metrics and on every `paired_legs` row. In memory they stay exact.
+    #[test]
+    fn the_sealed_record_holds_no_exact_token_counts() {
+        let record = PairedLegRecord {
+            pair: 1,
+            prompt_sha256: "ab".repeat(32),
+            control_prefill_seconds_per_token: 0.001,
+            control_decode_seconds_per_token: 0.03,
+            candidate_prefill_seconds_per_token: 0.001,
+            candidate_decode_seconds_per_token: 0.02,
+            control_seed_prefill_window_seconds_per_token: None,
+            control_decode_window_seconds_per_token: None,
+            candidate_seed_prefill_window_seconds_per_token: None,
+            candidate_decode_window_seconds_per_token: None,
+            token_mismatch_count: Some(13),
+            token_mismatch_first_step: Some(77),
+            token_mismatch_near_tie_count: Some(5),
+            token_mismatch_second_choice_count: Some(0),
+            token_mismatch_second_choice_max_relative_gap: Some(0.012_345),
+        };
+        let payload = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                token_mismatch_count: Some(13),
+                token_mismatch_first_step: Some(77),
+                token_mismatch_near_tie_count: Some(5),
+                token_mismatch_second_choice_count: Some(0),
+                token_mismatch_second_choice_max_relative_gap: Some(0.012_345),
+                paired_legs: vec![record],
+                ..zero_metrics()
+            },
+        };
+        let json = payload.to_sealed_json().unwrap();
+        for raw in ["13", "77", "0.012345", "0.0123"] {
+            assert!(!json.contains(raw), "{raw} sealed: {json}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let m = &v["metrics"];
+        assert_eq!(m["token_mismatch_count"], 16);
+        assert_eq!(m["token_mismatch_near_tie_count"], 8);
+        assert_eq!(m["token_mismatch_second_choice_count"], 0);
+        assert_eq!(m["token_mismatch_second_choice_max_relative_gap"], 0.01);
+        assert!(m.get("token_mismatch_first_step").is_none());
+        let row = &m["paired_legs"][0];
+        assert_eq!(row["token_mismatch_count"], 16);
+        assert!(row["token_mismatch_first_step"].is_null());
+        assert_eq!(row["token_mismatch_near_tie_count"], 8);
+        assert_eq!(row["token_mismatch_second_choice_max_relative_gap"], 0.01);
+        // The organizer's golden digest is not the engine's choice: carried as is.
+        assert_eq!(row["prompt_sha256"], "ab".repeat(32));
+        // In memory the exact values remain for the judge and the log.
+        assert_eq!(payload.metrics.token_mismatch_count, Some(13));
+        for (n, b) in [(0, 0), (1, 1), (2, 2), (3, 4), (13, 16), (129, 256)] {
+            assert_eq!(sealed_count_bucket(n), b, "{n}");
+        }
     }
 
     /// The per-prompt entry keeps its historical THREE keys when the run drafted nothing and the
@@ -1255,6 +1447,7 @@ mod sealed_key_pin_tests {
     fn fully_populated_paired_leg() -> PairedLegRecord {
         PairedLegRecord {
             pair: 1,
+            prompt_sha256: "v140".to_string(),
             control_prefill_seconds_per_token: 2.5,
             control_decode_seconds_per_token: 3.5,
             candidate_prefill_seconds_per_token: 4.5,
@@ -1263,6 +1456,11 @@ mod sealed_key_pin_tests {
             control_decode_window_seconds_per_token: None,
             candidate_seed_prefill_window_seconds_per_token: None,
             candidate_decode_window_seconds_per_token: None,
+            token_mismatch_count: Some(141),
+            token_mismatch_first_step: Some(143),
+            token_mismatch_near_tie_count: Some(159),
+            token_mismatch_second_choice_count: Some(145),
+            token_mismatch_second_choice_max_relative_gap: Some(147.5),
         }
     }
 
@@ -1405,6 +1603,13 @@ mod sealed_key_pin_tests {
                 candidate_leg_decode_window_seconds_per_token: None,
                 baseline_leg_seed_prefill_window_seconds_per_token: None,
                 candidate_leg_seed_prefill_window_seconds_per_token: None,
+                timed_token_tolerance_per_thousand: Some(149),
+                timed_token_near_tie_relative_gap: Some(0.25),
+                token_mismatch_count: Some(151),
+                token_mismatch_first_step: Some(153),
+                token_mismatch_near_tie_count: Some(161),
+                token_mismatch_second_choice_count: Some(155),
+                token_mismatch_second_choice_max_relative_gap: Some(157.5),
             },
         }
     }
@@ -1476,7 +1681,7 @@ mod sealed_key_pin_tests {
     "engine_device": "v88",
     "engine_protocol_version": 90,
     "error": "v55",
-    "expected_token": 47,
+    "expected_token": null,
     "expert_bytes_read": 36,
     "expert_cache_evictions": 35,
     "expert_cache_hits": 33,
@@ -1532,7 +1737,13 @@ mod sealed_key_pin_tests {
         "candidate_prefill_seconds_per_token": 4.5,
         "control_decode_seconds_per_token": 3.5,
         "control_prefill_seconds_per_token": 2.5,
-        "pair": 1
+        "pair": 1,
+        "prompt_sha256": "v140",
+        "token_mismatch_count": 256,
+        "token_mismatch_first_step": null,
+        "token_mismatch_near_tie_count": 256,
+        "token_mismatch_second_choice_count": 256,
+        "token_mismatch_second_choice_max_relative_gap": 147.5
       }
     ],
     "partial_result": true,
@@ -1576,7 +1787,13 @@ mod sealed_key_pin_tests {
     "spec_verification_mode": "v79",
     "spec_verify_replay_disagreements": 77,
     "timed_benchmark_seconds": 16.0,
+    "timed_token_near_tie_relative_gap": 0.25,
+    "timed_token_tolerance_per_thousand": 149,
     "timestamp": "v57",
+    "token_mismatch_count": 256,
+    "token_mismatch_near_tie_count": 256,
+    "token_mismatch_second_choice_count": 256,
+    "token_mismatch_second_choice_max_relative_gap": 157.5,
     "weights_byte_count": 60,
     "weights_file_count": 61,
     "weights_hash": "v59"

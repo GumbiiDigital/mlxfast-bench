@@ -15,8 +15,9 @@ no pair in a golden. A ranked run measures its own denominator (David ruling,
 
 A ranked run measures the number of PAIRS the track fixture declares in
 `official_pairs` — 2 on both platforms (David ruling, 2026-09-09) — on ONE box
-in ONE job, on the one fixed prompt the fixture's live golden carries. Every
-pair is the same two legs in the same order:
+in ONE job. The run is given N goldens, and pair k (1-based) measures golden
+(k - 1) mod N. Every pair is the same two legs in the same order, on the same
+prompt:
 
 1. The SERIAL-CONTROL leg, on the organizer-staged reference tree. No
    speculation.
@@ -125,29 +126,37 @@ per axis and no flag can relax it.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "track_id": "qwen3.8-125b-a6b-mlx-v1",
   "box": "m5-max-128gb-4-qwen38-125b-a6b-mlx",
   "reference_commit": "<40 hex>",
-  "prompt": "botany",
-  "passes": 4,
-  "prefill_seconds_per_token_mean": 0.0006282488193359375,
-  "decode_seconds_per_token_mean": 0.0329116748046875,
-  "prefill_cv": 0.004,
-  "decode_cv": 0.002,
-  "prefill_band_low": 0.95,
-  "prefill_band_high": 1.05,
-  "decode_band_low": 0.97,
-  "decode_band_high": 1.03,
   "captured_at": "2026-09-08T00:00:00Z",
-  "benchd_source_commit": "<40 hex>"
+  "benchd_source_commit": "<40 hex>",
+  "prompts": [
+    {
+      "prompt": "botany",
+      "passes": 4,
+      "prefill_seconds_per_token_mean": 0.0006282488193359375,
+      "decode_seconds_per_token_mean": 0.0329116748046875,
+      "prefill_cv": 0.004,
+      "decode_cv": 0.002,
+      "prefill_band_low": 0.95,
+      "prefill_band_high": 1.05,
+      "decode_band_low": 0.97,
+      "decode_band_high": 1.03
+    }
+  ]
 }
 ```
 
-`box` must equal the runner name the ranked job runs under, and `prompt` must
-equal the name of the golden the ranked run measures (the file name minus
-`.golden.json`). A band describes the leg it was measured from, so a file
-captured on another box or another prompt is refused. benchd reads the band from
+`prompts` holds one entry for each `--golden` the calibration measured.
+`calibrate-baseline` takes `--golden` more than once, and writes the entries in
+the order given. `box` must equal the runner name the ranked job runs under, and
+each golden the ranked run measures must have an entry whose `prompt` equals its
+name (the file name minus `.golden.json`). A band describes the leg it was
+measured from, so a file captured on another box, or with no entry for a prompt,
+is refused. benchd still reads a version 1 file (the fields of one entry at the
+top level, with `prompt`) as a file with one entry. benchd reads the band from
 the file; the values above are the defaults the calibrator writes. Previously
 captured files retain their stored bands, including the old 0.98/1.02 decode
 band. The CV fields are fractions: `0.004` is 0.4 %.
@@ -174,13 +183,58 @@ line.
 Leg 1 is serial, so it verifies its decode tokens against the SERIAL tape. On a
 track that ships one oracle tape per draft depth, give leg 1 its own golden with
 `--control-golden <PATH>`: pass the serial live golden there and keep the
-depth-N golden on `--golden`. Pin it with `--control-golden-sha256` and
+depth-N golden on `--golden`. With several goldens, give one `--control-golden`
+for each `--golden`, in the same order. Pin it with `--control-golden-sha256` and
 `--control-golden-bytes`, which work exactly like the `--golden` pin flags: give
-both or neither. Without the flag, leg 1 verifies against `--golden`, which is
+both or neither, once for each golden. Without the flag, leg 1 verifies against `--golden`, which is
 correct only when the depth-N tape is byte-identical to the serial tape. The
 control golden must name the SAME prompt as `--golden`, and a run that measures
 no control leg refuses the flag by name. The digest of the golden leg 1 used is
 sealed as `metrics.baseline_golden_sha256`.
+
+Leg 2 verifies its timed tokens against `--golden`. By default one different
+token fails the run. When the track fixture declares
+`timed_token_tolerance_per_thousand` (N), the rule is different:
+
+* Leg 2 does not stop at a different token. It runs its whole decode window, and
+  benchd keeps the seed token and the decode tokens it emitted. The timing of the
+  leg does not change. The prefill token check and every other check stay.
+* A pair whose tokens equal the golden's oracle has 0 mismatches and is not
+  replayed.
+* After the last pair, benchd boots the reference tree's engine the way leg 1
+  boots it, and ONE reference worker replays each other pair's tokens
+  teacher-forced: `correctness_begin` on the decode seed, then
+  `correctness_step` on each emitted token. A position where the candidate's
+  token is not the reference engine's argmax for that prefix is one mismatch. The
+  replay is not timed.
+* A pair passes when `mismatches * 1000 <= N * tokens`. One pair over the limit
+  refuses the whole run as `TIMED-DIVERGENCE-OVER-TOLERANCE`, with the pair, the
+  count and the limit. A replay that does not complete refuses the run as
+  `TIMED-REPLAY-FAILED`.
+* Leg 1 stays exact in every mode: the reference tree must reproduce its own
+  golden.
+
+The cost of the rule: with a tolerance, a ranked run does not prove that the
+candidate's output is the reference output. It proves that at most N per
+thousand of its tokens differ from what the reference engine chooses for the
+same prefix.
+
+The fixture selects one of two rules:
+
+* **Plain rule:** `timed_token_tolerance_per_thousand` only. Every different
+  token counts against N.
+* **Near-tie rule:** `timed_token_tolerance_per_thousand` and
+  `timed_token_near_tie_relative_gap` (G, at least 0 and below 1). A different
+  token is a NEAR TIE when the candidate's token is the reference engine's second
+  choice at that position, and the relative gap
+  `(top1 - second) / max(1, |top1|)` between the reference's first and second
+  choice there is at most G. Any mismatch that is not a near tie refuses the
+  run as `TIMED-DIVERGENCE-NOT-A-NEAR-TIE`, before the count rule and whatever
+  the count. The message names the pair, the position, G and the condition
+  that failed. Near ties still count against N.
+
+A fixture that declares G without N is refused at parse. The cost of the
+near-tie rule: it forgives a change of winner between two tokens that the reference engine scores almost the same, and nothing else.
 
 ## 7. The per-leg resident engine (both platforms)
 
@@ -244,13 +298,16 @@ inherited socket is used as before.
 | `BASELINE-ENGINE-NOT-ROOT-RELATIVE` | the candidate engine is not addressable from the workspace root, or its re-rooted path leaves the reference tree |
 | `BASELINE-WEIGHTS-NOT-ROOT-RELATIVE` | the candidate weights' re-rooted path leaves the reference tree |
 | `BASELINE-CALIBRATION-MISSING` | no calibration file was named, or it could not be read |
-| `BASELINE-CALIBRATION-INVALID` | the file is not a valid version-1 calibration |
+| `BASELINE-CALIBRATION-INVALID` | the file is not a valid calibration |
 | `BASELINE-CALIBRATION-TRACK-MISMATCH` | the file names another track |
 | `BASELINE-CALIBRATION-BOX-MISMATCH` | the file was captured on another box |
-| `BASELINE-CALIBRATION-PROMPT-MISMATCH` | the file was captured on another prompt than the golden this run measures |
+| `BASELINE-CALIBRATION-PROMPT-MISMATCH` | the file has no entry for the prompt of a golden this run measures |
 | `BASELINE-BOX-UNRESOLVED` | neither `RUNNER_NAME` nor `--box` names this box |
 | `CONTROL-GOLDEN-PROMPT-MISMATCH` | `--control-golden` names another prompt than `--golden` |
 | `CONTROL-GOLDEN-WITHOUT-PAIRED-PATH` | `--control-golden` was given on a run that measures no control leg |
+| `GOLDEN-COUNT-MISMATCH` | a pin flag, `--control-golden` or `--prompt` was not given once for each `--golden` |
+| `MULTIPLE-GOLDENS-WITHOUT-PAIRED-PATH` | more than one `--golden` was given on a run that measures no control leg |
+| `OFFICIAL-PAIRS-NOT-A-MULTIPLE-OF-GOLDENS` | `official_pairs` is not a multiple of the number of goldens |
 | `SERIAL-CONTROL-LEG-FAILED` | the control leg did not complete |
 | `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is slower than this box's band ceiling |
 | `GOLDEN-CARRIES-STORED-BASELINE` | the golden still declares a baseline pair |
@@ -259,6 +316,9 @@ inherited socket is used as before.
 | `LEG-SERVE-SCRIPT-MISSING` | a leg's tree holds no `tools/serve-up.sh` |
 | `LEG-SERVE-BOOT-FAILED` | a leg's resident did not boot |
 | `LEG-SERVE-INHERITED-SOCKET` | a resident socket was inherited instead of booted per leg |
+| `TIMED-DIVERGENCE-OVER-TOLERANCE` | a pair's candidate tokens differ from the reference engine's choice on more than the fixture's timed token tolerance |
+| `TIMED-DIVERGENCE-NOT-A-NEAR-TIE` | under the near-tie rule, a pair's candidate token differs from the reference engine's choice and is not a near tie |
+| `TIMED-REPLAY-FAILED` | the reference engine's replay of a pair's candidate tokens did not complete |
 
 ## 9. Local runs
 
@@ -277,6 +337,11 @@ and `--mode local-submit` therefore keep working on these tracks:
 
 Half the inputs is not the paired path. One leg cannot be checked against a band
 that is not there, so a run with only one of the two takes the unscored branch.
+
+The unscored branch has no reference tree, so it cannot replay a different
+token. It judges every timed token exactly. When the fixture declares a timed
+token tolerance, its refusal says that the ranked run tolerates up to N per
+thousand and that a local run without a reference tree cannot apply that rule.
 
 ## 10. What the run seals
 
@@ -297,7 +362,24 @@ A ranked paired run seals these fields in `score.json` `metrics`:
   `candidate_prefill_seconds_per_token`, `candidate_decode_seconds_per_token`,
   as measured. The track fixture's `official_pairs` sets the row count (2 on
   both platforms, David ruling 2026-09-09). A run that stops early keeps the
-  pairs it measured in this list and seals no score.
+  pairs it measured in this list and seals no score. Each row also carries
+  `token_mismatch_count` (the candidate tokens that differ from the reference
+  engine's choice; 0 when the tokens equal the oracle),
+  `token_mismatch_first_step` (the position of the first one, 0 is the seed
+  token; null when there is none), and two report-only figures:
+  `token_mismatch_second_choice_count` (the mismatches where the candidate's
+  token is the reference engine's second choice) and
+  `token_mismatch_second_choice_max_relative_gap` (the largest relative gap
+  between the reference's first and second choice over those positions). No
+  decision reads the two report-only figures. Under the near-tie rule the row
+  also carries `token_mismatch_near_tie_count` (the mismatches that are near
+  ties; null under the plain rule). No token id is sealed.
+- `timed_token_tolerance_per_thousand` and `timed_token_near_tie_relative_gap` —
+  the tolerance and the near-tie limit the run applied, when the fixture
+  declares them. `token_mismatch_count`, `token_mismatch_first_step`,
+  `token_mismatch_near_tie_count`,
+  `token_mismatch_second_choice_count` and
+  `token_mismatch_second_choice_max_relative_gap` carry the scored pair's values.
 
 - `decode_speedup_floor`, `prefill_speedup_floor` — the two floors this run
   enforced, from the track fixture's `decode_speedup_floor` and

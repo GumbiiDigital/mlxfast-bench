@@ -260,6 +260,8 @@ fields, the paired-run fields and the two speedup floors are each declared on th
 | paired run | `official_pairs` | The number of pairs one ranked run measures. |
 | paired run | `scores_against_live_control_leg` | Whether the track measures its own denominator. |
 | paired run | `paired_flow_retired` | Whether the `measure-job` seam is closed for this track. |
+| paired run | `timed_token_tolerance_per_thousand` | The timed token tolerance, 0 to 1000. Absent: one different timed token fails the run. |
+| paired run | `timed_token_near_tie_relative_gap` | The near-tie limit of that tolerance, at least 0 and below 1. Needs the tolerance. Present: only near ties are tolerated. |
 | scored regime | `scored_batch_size` | The batch size of the scored point. |
 | scored regime | `prefill_gain_exponent` | The exponent of the prefill gain in the composite. |
 | scored regime | `decode_gain_exponent` | The exponent of the decode gain in the composite. |

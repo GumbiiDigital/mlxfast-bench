@@ -3120,6 +3120,7 @@ mod tests {
             free_run_audit: None,
             deferred_divergence: None,
             phase_window: None,
+            emitted_tokens: Vec::new(),
         };
 
         let payload = local_iterate_score(
@@ -3170,6 +3171,7 @@ mod tests {
             free_run_audit: None,
             deferred_divergence: None,
             phase_window: None,
+            emitted_tokens: Vec::new(),
         };
         let payload = local_iterate_score(
             Mode::LocalIterate,
@@ -3222,6 +3224,7 @@ mod tests {
                 free_run_audit: None,
                 deferred_divergence: None,
                 phase_window: None,
+                emitted_tokens: Vec::new(),
             };
             let payload = local_iterate_score(
                 mode,

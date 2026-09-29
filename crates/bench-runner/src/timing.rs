@@ -120,6 +120,11 @@ pub enum VerifyMode {
     Verify,
     /// Teacher-force the oracle tokens and measure wall-clock; do NOT abort on a mismatch.
     TimeOnly,
+    /// Compare the prefill token to the oracle and abort on a mismatch, as `Verify` does. Do NOT
+    /// abort on a different decode seed token or decode token: keep the tokens the engine emitted
+    /// ([`TimingResult::emitted_tokens`]) so the caller can judge them. The paired path uses it for
+    /// the candidate leg of a track that declares a timed token tolerance.
+    PrefillOnly,
 }
 
 impl TimingParams {
@@ -261,6 +266,9 @@ pub struct TimingResult {
     /// ([`TimingParams::defer_divergence_to_replay`]). `None` means the timed window matched the
     /// golden exactly (or the run did not defer). `Some` is UNVERIFIED until the caller replays it.
     pub deferred_divergence: Option<DeferredDivergence>,
+    /// The tokens the free-run decode window emitted: the seed token, then the N decode tokens.
+    /// Empty on the teacher-forced v1 decode path.
+    pub emitted_tokens: Vec<i64>,
 }
 
 impl TimingResult {
@@ -348,6 +356,7 @@ pub fn run_timed_benchmark<T: LineTransport>(
             prefill_token: Some(t),
             stream: None,
         }),
+        emitted_tokens: Vec::new(),
     })
 }
 
@@ -1030,6 +1039,7 @@ where
                 stream: m.deferred_stream,
             },
         ),
+        emitted_tokens: m.emitted_tokens,
     })
 }
 
@@ -1080,7 +1090,7 @@ fn measure_prefill<T: LineTransport>(
         // `comparePrefillToken` → `requireBenchmarkMatch`). An engine returning fast
         // garbage is rejected here instead of being credited with a prefill speedup.
         // TimeOnly tolerates the mismatch (correctness is judged separately upstream).
-        if verify == VerifyMode::Verify && token != expected_prefill_token {
+        if verify != VerifyMode::TimeOnly && token != expected_prefill_token {
             // DEFERRED (a candidate under a replay policy): record the token for the caller's
             // reference replay. Every pass must agree on it: an engine whose prefill token moves
             // between passes of the same prompt is not resolving a tie, it is faulty.
@@ -1272,6 +1282,8 @@ fn measure_decode<T: LineTransport>(
 ///   token to force back) — it purely skips benchd's mismatch-abort. The scored `elapsed` /
 ///   `seconds_per_token`, the §2.4 count invariant, the audit assembly and the §2.6 phase-close
 ///   barrier are IDENTICAL across both modes: the mode touches the abort branch and nothing else.
+/// * [`VerifyMode::PrefillOnly`] — the same as `TimeOnly` here: no abort on a different seed token
+///   or decode token. The caller judges the emitted tokens.
 fn measure_free_run_decode<T: LineTransport>(
     session: &mut Session<T>,
     params: &TimingParams,
@@ -1458,6 +1470,7 @@ fn measure_free_run_decode<T: LineTransport>(
         audit,
         effective_spec,
         deferred_stream,
+        emitted_tokens: std::iter::once(seed_token).chain(tokens).collect(),
     })
 }
 
@@ -1481,6 +1494,8 @@ struct FreeRunDecodeMeasurement {
     /// The first divergent position and the whole committed stream, when the run deferred a
     /// divergence to a reference replay.
     deferred_stream: Option<(usize, Vec<i64>)>,
+    /// The seed token, then the N committed decode tokens.
+    emitted_tokens: Vec<i64>,
 }
 
 /// v1.2 BATCHED free-run decode phase — [`measure_free_run_decode`] generalized to the cohort.
@@ -2172,6 +2187,46 @@ mod tests {
         // The SAME worker is left healthy and drained (issued_steps reset), ready for correctness.
         assert!(!session.is_discarded());
         assert_eq!(session.issued_steps(), 0);
+    }
+
+    /// `PrefillOnly` runs the whole decode window past a different seed token and a different
+    /// decode token and keeps what the engine emitted. It still stops at a different prefill
+    /// token.
+    #[test]
+    fn prefill_only_keeps_the_emitted_tokens_and_still_checks_the_prefill_token() {
+        let mut committed = oracle_decode_tokens(8);
+        committed[3] += 1;
+        let engine = MockEngine::new()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN + 1, committed.clone())
+            .free_run_capable();
+        let (mut session, _hello) = Session::connect(engine).unwrap();
+        let mut gate = |_: &str| Ok(());
+        let r = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut gate,
+            &params(8),
+            VerifyMode::PrefillOnly,
+        )
+        .expect("a different decode token does not stop a PrefillOnly leg");
+        let mut expected = vec![SEED_TOKEN + 1];
+        expected.extend(committed);
+        assert_eq!(r.emitted_tokens, expected);
+
+        let engine = MockEngine::new()
+            .oracle_tokens(PREFILL_TOKEN + 1, SEED_TOKEN, oracle_decode_tokens(8))
+            .free_run_capable();
+        let (mut session, _hello) = Session::connect(engine).unwrap();
+        let err = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut gate,
+            &params(8),
+            VerifyMode::PrefillOnly,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunnerError::TokenMismatch { ref label, .. } if label == "benchmark prefill token"),
+            "{err:?}"
+        );
     }
 
     #[test]

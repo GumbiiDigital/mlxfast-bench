@@ -118,8 +118,10 @@ pub fn judge_position(
     let gap = max - logit;
     if gap > policy.max_logit_gap {
         return Err(format!(
-            "token {token} is {gap:.4} logits below the reference's top logit, above the declared \
-             {} maximum",
+            // No token id and a 2-decimal gap: this text reaches the sealed record, and both the
+            // token and the exact gap are the candidate's choice.
+            "the committed choice is {gap:.2} logits below the reference's top logit, above the \
+             declared {} maximum",
             policy.max_logit_gap
         ));
     }

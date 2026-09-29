@@ -111,6 +111,9 @@ struct Args {
     /// `--track` / `MLXFAST_QWEN_MTP_TRACK_ID` — never a compile-time default.
     identity: bench_core::constants::TrackModelIdentity,
     steps: usize,
+    /// The tokens that end an answer (`--stop-token`). A case stops at the first of them, and
+    /// `steps` is then the maximum length. Empty: every case is exactly `steps` long.
+    stop_tokens: Vec<i64>,
     /// When set, ALSO author the golden's `benchmark` block by driving the engine's FREE-RUN
     /// trajectory (`free_decode_begin` / `free_decode_run`) over `cases[0]`'s prompt — the
     /// author-with-what-you-replay fix (a8/David ruling): the TIMED leg replays free-run, so its
@@ -131,7 +134,7 @@ adapter GREEDY teacher-forced (temp=0) over one or more 1024-token prompts.
 USAGE:
     record-correctness-golden --worker-bin <PATH> --weights <TARGET_DIR> \\
         --prompt-tokens <FILE> --case-name <NAME> [--prompt-tokens <FILE> --case-name <NAME> ...] \\
-        [--steps 1024] [--benchmark-free-run [--benchmark-steps 128]] \\
+        [--steps 1024] [--stop-token <ID> ...] [--benchmark-free-run [--benchmark-steps 128]] \\
         --out <GOLDEN.json> [--backend live|mock] \\
         [--model-provenance-repo <REPO>] [--model-provenance-rev <40-HEX>]
 
@@ -144,7 +147,10 @@ FLAGS:
                           be paired with a --case-name.
     --case-name <NAME>    The golden case name for the preceding --prompt-tokens. Repeatable.
     --steps <N>           expected_tokens length per case (default 1024). Must be >= 64
-                          (CORRECTNESS_STEPS).
+                          (CORRECTNESS_STEPS). With --stop-token it is the MAXIMUM length.
+    --stop-token <ID>     A token that ends an answer. Repeatable. A case stops at the first stop
+                          token, which is kept as its last expected token. An answer that ends
+                          before CORRECTNESS_STEPS, or inside the free-run window, is refused.
     --benchmark-free-run  ALSO author the golden's `benchmark` block by driving the engine FREE-RUN
                           (free_decode_begin/free_decode_run) over cases[0]'s prompt, so the TIMED
                           leg's oracle matches the free-run it replays (author-with-what-you-replay).
@@ -168,6 +174,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut worker_bin = None;
     let mut weights = None;
     let mut steps = DEFAULT_STEPS;
+    let mut stop_tokens: Vec<i64> = Vec::new();
     let mut benchmark_free_run = false;
     let mut benchmark_steps = DEFAULT_BENCHMARK_STEPS;
     let mut track: Option<String> = None;
@@ -220,6 +227,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 case_files.push((name, prompt_path));
             }
             "--steps" => steps = value()?.parse().map_err(|e| format!("--steps: {e}"))?,
+            "--stop-token" => {
+                stop_tokens.push(value()?.parse().map_err(|e| format!("--stop-token: {e}"))?)
+            }
             "--benchmark-free-run" => benchmark_free_run = true,
             "--benchmark-steps" => {
                 benchmark_steps = value()?
@@ -294,6 +304,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         identity,
         weights,
         steps,
+        stop_tokens,
         benchmark_free_run,
         benchmark_steps,
         provenance_repo,
@@ -352,11 +363,16 @@ fn read_prompt_tokens_file(path: &Path, seed_tokens: usize) -> Result<Vec<i64>, 
 /// `expected_tokens[0]` is `correctness_begin(prompt)`'s argmax (the seed token = the first emitted
 /// token); each subsequent `correctness_step(prev)` appends the next greedy pick. Producing `steps`
 /// tokens is therefore one begin + `steps - 1` steps.
+///
+/// With `stop_tokens`, the case ends at the first stop token, which is its last expected token,
+/// and `steps` is the maximum length. An answer shorter than [`CORRECTNESS_STEPS`] is refused: the
+/// loader needs that many tokens.
 fn record_case<T, F>(
     spawn: &mut F,
     name: &str,
     prompt: &[i64],
     steps: usize,
+    stop_tokens: &[i64],
 ) -> Result<GoldenCase, String>
 where
     T: LineTransport,
@@ -380,6 +396,9 @@ where
     let mut prev = seed_token;
     // steps - 1 further teacher-forced steps: expected_tokens[0] is already the seed argmax.
     for step in 0..steps - 1 {
+        if stop_tokens.contains(&prev) {
+            break;
+        }
         let resp = engine
             .correctness_step(prev)
             .map_err(|e| format!("case {name:?}: correctness_step {step}: {e}"))?;
@@ -392,6 +411,13 @@ where
     engine
         .close_phase()
         .map_err(|e| format!("case {name:?}: phase close barrier: {e}"))?;
+    if expected_tokens.len() < CORRECTNESS_STEPS {
+        return Err(format!(
+            "case {name:?}: the answer ends after {} tokens, and the loader needs at least \
+             {CORRECTNESS_STEPS} (CORRECTNESS_STEPS)",
+            expected_tokens.len()
+        ));
+    }
 
     Ok(GoldenCase {
         name: name.to_string(),
@@ -610,7 +636,7 @@ fn run() -> Result<(), String> {
                 let (session, _hello) = Session::connect(transport)?;
                 Ok(session)
             };
-            let cases = record_all(&mut spawn, &args.cases, args.steps)?;
+            let cases = record_all(&mut spawn, &args.cases, args.steps, &args.stop_tokens)?;
             let benchmark = author_benchmark(&mut spawn, &args, &cases)?;
             (cases, benchmark)
         }
@@ -622,7 +648,7 @@ fn run() -> Result<(), String> {
                 let (session, _hello) = Session::connect(MockEngine::new().free_run_capable())?;
                 Ok(session)
             };
-            let cases = record_all(&mut spawn, &args.cases, args.steps)?;
+            let cases = record_all(&mut spawn, &args.cases, args.steps, &args.stop_tokens)?;
             let benchmark = author_benchmark(&mut spawn, &args, &cases)?;
             (cases, benchmark)
         }
@@ -670,6 +696,17 @@ where
     if !args.benchmark_free_run {
         return Ok(None);
     }
+    let answer = &cases[0].expected_tokens;
+    let ended = answer.last().is_some_and(|t| args.stop_tokens.contains(t));
+    if ended && answer.len() <= args.benchmark_steps {
+        return Err(format!(
+            "case {:?}: the answer ends after {} tokens, inside the free-run window of {} tokens; \
+             the window would time tokens that are not part of the answer",
+            cases[0].name,
+            answer.len(),
+            args.benchmark_steps
+        ));
+    }
     let seed_prompt = &cases[0].prompt_tokens;
     let benchmark = record_benchmark_free_run(spawn, seed_prompt, args.benchmark_steps)?;
     Ok(Some(benchmark))
@@ -681,6 +718,7 @@ fn record_all<T, F>(
     spawn: &mut F,
     cases: &[CaseInput],
     steps: usize,
+    stop_tokens: &[i64],
 ) -> Result<Vec<GoldenCase>, String>
 where
     T: LineTransport,
@@ -692,7 +730,13 @@ where
         if !seen.insert(case.name.clone()) {
             return Err(format!("duplicate --case-name {:?}", case.name));
         }
-        out.push(record_case(spawn, &case.name, &case.prompt_tokens, steps)?);
+        out.push(record_case(
+            spawn,
+            &case.name,
+            &case.prompt_tokens,
+            steps,
+            stop_tokens,
+        )?);
     }
     Ok(out)
 }
@@ -758,7 +802,7 @@ mod tests {
         }];
 
         let mut spawn1 = mock_spawn();
-        let recorded1 = record_all(&mut spawn1, &cases, STEPS).expect("record 1");
+        let recorded1 = record_all(&mut spawn1, &cases, STEPS, &[]).expect("record 1");
         let doc1 = build_document(
             recorded1,
             DEFAULT_PROVENANCE_REPO,
@@ -804,7 +848,7 @@ mod tests {
 
         // A SECOND record on the same prompts is BYTE-IDENTICAL.
         let mut spawn2 = mock_spawn();
-        let recorded2 = record_all(&mut spawn2, &cases, STEPS).expect("record 2");
+        let recorded2 = record_all(&mut spawn2, &cases, STEPS, &[]).expect("record 2");
         let doc2 = build_document(
             recorded2,
             DEFAULT_PROVENANCE_REPO,
@@ -829,7 +873,7 @@ mod tests {
         // The mock returns `5000 + req.id` for correctness_begin/step; the begin is the first
         // request of a cold session, so seed == 5000 + <begin id>. We assert the STRUCTURE
         // (length + that [0] equals a standalone begin's token), not the exact id.
-        let case = record_case(&mut spawn, "c", &prompt, CORRECTNESS_STEPS).expect("record");
+        let case = record_case(&mut spawn, "c", &prompt, CORRECTNESS_STEPS, &[]).expect("record");
         assert_eq!(case.expected_tokens.len(), CORRECTNESS_STEPS);
 
         let mut spawn2 = mock_spawn();
@@ -837,6 +881,31 @@ mod tests {
         engine.begin_phase();
         let begin = engine.correctness_begin(&prompt).expect("begin");
         assert_eq!(case.expected_tokens[0], begin.token.expect("begin token"));
+    }
+
+    /// A stop token ends the case. It is the last expected token, and `steps` is the maximum.
+    #[test]
+    fn a_stop_token_ends_the_case_and_steps_is_the_maximum() {
+        let prompt = prompt_1024();
+        let full = record_case(&mut mock_spawn(), "c", &prompt, 200, &[]).expect("record");
+        assert_eq!(full.expected_tokens.len(), 200);
+
+        let stop = full.expected_tokens[99];
+        let ended = record_case(&mut mock_spawn(), "c", &prompt, 200, &[stop]).expect("record");
+        assert_eq!(ended.expected_tokens, full.expected_tokens[..100]);
+
+        let absent = record_case(&mut mock_spawn(), "c", &prompt, 200, &[-1]).expect("record");
+        assert_eq!(absent.expected_tokens.len(), 200);
+    }
+
+    /// An answer that ends before the loader's minimum is refused by name.
+    #[test]
+    fn an_answer_shorter_than_the_correctness_steps_is_refused() {
+        let prompt = prompt_1024();
+        let full = record_case(&mut mock_spawn(), "c", &prompt, 200, &[]).expect("record");
+        let stop = full.expected_tokens[CORRECTNESS_STEPS - 2];
+        let err = record_case(&mut mock_spawn(), "c", &prompt, 200, &[stop]).unwrap_err();
+        assert!(err.contains("the answer ends after"), "{err}");
     }
 
     /// Two cases record independently (each a fresh engine) and both land in the document in order.
@@ -853,7 +922,7 @@ mod tests {
             },
         ];
         let mut spawn = mock_spawn();
-        let recorded = record_all(&mut spawn, &cases, CORRECTNESS_STEPS).expect("record");
+        let recorded = record_all(&mut spawn, &cases, CORRECTNESS_STEPS, &[]).expect("record");
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].name, "case-a");
         assert_eq!(recorded[1].name, "case-b");
@@ -888,7 +957,7 @@ mod tests {
             },
         ];
         let mut spawn = mock_spawn();
-        let err = record_all(&mut spawn, &cases, CORRECTNESS_STEPS).unwrap_err();
+        let err = record_all(&mut spawn, &cases, CORRECTNESS_STEPS, &[]).unwrap_err();
         assert!(err.contains("duplicate --case-name"), "{err}");
     }
 
@@ -913,6 +982,7 @@ mod tests {
             weights: None,
             cases: cases_input,
             steps: CORRECTNESS_STEPS,
+            stop_tokens: Vec::new(),
             benchmark_free_run: true,
             benchmark_steps: BENCHMARK_DECODE_STEPS,
             provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
@@ -921,7 +991,7 @@ mod tests {
         };
 
         let mut spawn1 = mock_spawn_free_run();
-        let cases1 = record_all(&mut spawn1, &args.cases, args.steps).expect("record cases 1");
+        let cases1 = record_all(&mut spawn1, &args.cases, args.steps, &[]).expect("record cases 1");
         let benchmark1 = author_benchmark(&mut spawn1, &args, &cases1)
             .expect("author benchmark 1")
             .expect("--benchmark-free-run authors a Some(benchmark)");
@@ -977,7 +1047,7 @@ mod tests {
 
         // A SECOND record on the same prompt is BYTE-IDENTICAL (greedy + serialize determinism).
         let mut spawn2 = mock_spawn_free_run();
-        let cases2 = record_all(&mut spawn2, &args.cases, args.steps).expect("record cases 2");
+        let cases2 = record_all(&mut spawn2, &args.cases, args.steps, &[]).expect("record cases 2");
         let benchmark2 = author_benchmark(&mut spawn2, &args, &cases2)
             .expect("author benchmark 2")
             .expect("Some");
@@ -1010,6 +1080,7 @@ mod tests {
             weights: None,
             cases: cases_input,
             steps: CORRECTNESS_STEPS,
+            stop_tokens: Vec::new(),
             benchmark_free_run: false,
             benchmark_steps: BENCHMARK_DECODE_STEPS,
             provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
@@ -1017,12 +1088,43 @@ mod tests {
             out: PathBuf::from("unused"),
         };
         let mut spawn = mock_spawn_free_run();
-        let cases = record_all(&mut spawn, &args.cases, args.steps).expect("record");
+        let cases = record_all(&mut spawn, &args.cases, args.steps, &[]).expect("record");
         let benchmark = author_benchmark(&mut spawn, &args, &cases).expect("author");
         assert!(
             benchmark.is_none(),
             "no --benchmark-free-run ⇒ benchmark: None"
         );
+    }
+
+    /// An answer that ends inside the free-run window is refused: the window would time tokens
+    /// that are not part of the answer.
+    #[test]
+    fn an_answer_that_ends_inside_the_free_run_window_is_refused() {
+        let prompt = prompt_1024();
+        let full = record_case(&mut mock_spawn(), "c", &prompt, 200, &[]).expect("record");
+        let args = Args {
+            identity: identity_125b(),
+            backend: Backend::Mock,
+            worker_bin: None,
+            weights: None,
+            cases: vec![CaseInput {
+                name: "c".to_string(),
+                prompt_tokens: prompt,
+            }],
+            steps: 200,
+            stop_tokens: vec![full.expected_tokens[99]],
+            benchmark_free_run: true,
+            benchmark_steps: BENCHMARK_DECODE_STEPS,
+            provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
+            provenance_rev: DEFAULT_PROVENANCE_REV.to_string(),
+            out: PathBuf::from("unused"),
+        };
+        let mut spawn = mock_spawn_free_run();
+        let cases =
+            record_all(&mut spawn, &args.cases, args.steps, &args.stop_tokens).expect("record");
+        assert_eq!(cases[0].expected_tokens.len(), 100);
+        let err = author_benchmark(&mut spawn, &args, &cases).unwrap_err();
+        assert!(err.contains("inside the free-run window"), "{err}");
     }
 
     /// Build a `parse_args` argv that carries a real prompt file (required before the floor check)

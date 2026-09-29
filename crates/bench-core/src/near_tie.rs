@@ -90,6 +90,13 @@ use std::fmt;
 /// how close the runner-up was. Sealed on every seal so a reader never has to assume it.
 pub const NEAR_TIE_GAP_INDEX: usize = 1;
 
+/// The engine's relative gap of one logit from the top-1 logit, as the module header defines it:
+/// `(top1_logit - logit) / max(1, |top1_logit|)`. The single-stream paired path reads the
+/// `top_logits` of the correctness verbs and computes the gap here, with the same formula.
+pub fn relative_gap(top1_logit: f64, logit: f64) -> f64 {
+    (top1_logit - logit) / top1_logit.abs().max(1.0)
+}
+
 /// One replayed position's gap readout, extracted from the oracle report by the caller.
 ///
 /// All four fields are REQUIRED here: the caller is responsible for turning the protocol's

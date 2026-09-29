@@ -261,12 +261,12 @@ impl RunnerError {
             RunnerError::TokenMismatch {
                 label,
                 step,
-                expected,
+                expected: _,
                 actual,
                 ..
             } => write!(
                 f,
-                "{label} mismatch at step {step}: expected oracle token {expected}, engine returned {actual}"
+                "{label} mismatch at step {step}: the engine returned token {actual}, which is not the token the golden expects at this step"
             ),
             RunnerError::SessionDiscarded => {
                 write!(f, "session discarded by a prior error; no further requests permitted")
@@ -526,7 +526,7 @@ mod tests {
             assert!(!sealed.contains("1234"), "{sealed}");
             assert!(e.diagnostic().contains("1234567"), "{}", e.diagnostic());
         }
-        // A plain oracle mismatch keeps benchd's expected token and the step.
+        // A plain oracle mismatch keeps the step and never names the golden's expected token.
         let plain = RunnerError::TokenMismatch {
             label: "benchmark free-run decode token".to_string(),
             step: 5,
@@ -535,8 +535,8 @@ mod tests {
             expected_from_engine: false,
         };
         assert!(!plain.carries_engine_data());
-        assert!(plain
-            .to_string()
-            .contains("step 5: expected oracle token 42"));
+        let sealed = plain.to_string();
+        assert!(sealed.contains("step 5"), "{sealed}");
+        assert!(!sealed.contains("42"), "{sealed}");
     }
 }
