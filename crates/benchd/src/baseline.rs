@@ -381,21 +381,29 @@ impl BaselineCalibration {
             ),
         ] {
             if !(measured.is_finite() && measured > 0.0) {
+                eprintln!(
+                    "benchd: serial-control {axis} leg outside band (non-finite): prompt={prompt:?} \
+                     measured={measured} mean={mean} ceiling={} multiplier={high} box={:?}",
+                    mean * high,
+                    self.box_name
+                );
                 return Err(format!(
                     "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
-                     band: the {axis} leg measured {measured} seconds per token, which is not a \
-                     finite positive number"
+                     band on the {axis} axis; the measurement is not a finite positive number; \
+                     refusing to seal a score"
                 ));
             }
             let hi = mean * high;
             if measured > hi {
-                eprintln!("benchd: the {axis} leg on prompt {prompt:?} is outside its band");
+                eprintln!(
+                    "benchd: serial-control {axis} leg outside band: prompt={prompt:?} \
+                     measured={measured} mean={mean} ceiling={hi} multiplier={high} box={:?}",
+                    self.box_name
+                );
                 return Err(format!(
                     "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
-                     band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
-                     calibrated at {mean} with a ceiling of {hi} ({high} of the mean); the box is \
-                     slower than when it was calibrated; refusing to seal a score",
-                    self.box_name
+                     band on the {axis} axis; the box is slower than when it was calibrated; \
+                     refusing to seal a score"
                 ));
             }
         }
@@ -1347,14 +1355,27 @@ mod tests {
             let err = cal.check_band("botany", prefill, decode).unwrap_err();
             assert!(
                 err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND)
-                    && err.contains("serial-control leg outside this box's band"),
+                    && err.contains("serial-control leg outside this box's band on the"),
                 "{label} must refuse by name: {err}"
             );
-            assert!(err.contains(&cal.box_name), "{label}: {err}");
+            let after_class = err.split(SERIAL_CONTROL_LEG_OUTSIDE_BAND).nth(1).unwrap();
+            assert!(
+                !after_class.chars().any(|c| c.is_ascii_digit()),
+                "{label} must seal no timing digits: {err}"
+            );
         }
         // A non-finite or non-positive measurement is outside every band.
-        assert!(cal.check_band("botany", f64::NAN, d).is_err());
-        assert!(cal.check_band("botany", p, 0.0).is_err());
+        for err in [
+            cal.check_band("botany", f64::NAN, d).unwrap_err(),
+            cal.check_band("botany", p, 0.0).unwrap_err(),
+        ] {
+            assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+            let after_class = err.split(SERIAL_CONTROL_LEG_OUTSIDE_BAND).nth(1).unwrap();
+            assert!(
+                !after_class.chars().any(|c| c.is_ascii_digit()),
+                "non-finite refusal must seal no digits: {err}"
+            );
+        }
     }
 
     #[test]

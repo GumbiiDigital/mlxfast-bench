@@ -3077,10 +3077,8 @@ mod tests {
              below the reference's top logit, above the declared 2 maximum"
                 .to_string(),
             format!(
-                "{}: serial-control leg outside this box's band: the decode leg measured 0.02 \
-                 seconds per token, and box \"spark-1\" is calibrated at 0.01 with a ceiling of \
-                 0.0103 (1.03 of the mean); the box is slower than when it was calibrated; \
-                 refusing to seal a score",
+                "{}: serial-control leg outside this box's band on the decode axis; the box is \
+                 slower than when it was calibrated; refusing to seal a score",
                 crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND
             ),
         ] {
@@ -6313,7 +6311,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("serial-control leg outside this box's band"),
+                .contains("serial-control leg outside this box's band on the"),
             "{}",
             payload.metrics.error
         );
@@ -6323,6 +6321,17 @@ mod tests {
                 .error
                 .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
             "{}",
+            payload.metrics.error
+        );
+        let after_class = payload
+            .metrics
+            .error
+            .split(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND)
+            .nth(1)
+            .expect("refusal class");
+        assert!(
+            !after_class.chars().any(|c| c.is_ascii_digit()),
+            "sealed out-of-band error must not leak timing digits after the class: {}",
             payload.metrics.error
         );
         assert_eq!(
