@@ -840,19 +840,22 @@ pub fn seal_paired_baseline(
     control_golden_sha256: &str,
 ) {
     metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
+    // Box identity is public metadata; it is sealed even when the band gate refuses.
     metrics.baseline_box = Some(seal.box_name.to_string());
     metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
     metrics.baseline_golden_sha256 = Some(control_golden_sha256.to_string());
     metrics.baseline_reference_commit = Some(seal.reference_commit.to_string());
     metrics.baseline_band_passed = Some(seal.band_passed);
-    if let Some((prefill, decode)) = seal.leg {
-        metrics.baseline_leg_prefill_seconds_per_token = Some(prefill);
-        metrics.baseline_leg_decode_seconds_per_token = Some(decode);
+    if seal.band_passed {
+        if let Some((prefill, decode)) = seal.leg {
+            metrics.baseline_leg_prefill_seconds_per_token = Some(prefill);
+            metrics.baseline_leg_decode_seconds_per_token = Some(decode);
+        }
+        metrics.candidate_leg_prefill_seconds_per_token =
+            finite_positive(metrics.prefill_seconds_per_token);
+        metrics.candidate_leg_decode_seconds_per_token =
+            finite_positive(metrics.decode_seconds_per_token);
     }
-    metrics.candidate_leg_prefill_seconds_per_token =
-        finite_positive(metrics.prefill_seconds_per_token);
-    metrics.candidate_leg_decode_seconds_per_token =
-        finite_positive(metrics.decode_seconds_per_token);
 }
 
 /// `Some(v)` for a finite, strictly-positive measurement; `None` for the zero placeholder a
@@ -1181,7 +1184,7 @@ where
                     commit,
                     e,
                     seal,
-                    measured_leg,
+                    None,
                     ScoringInputs::no_denominator(floors, weights),
                 ),
                 records,
@@ -6270,13 +6273,63 @@ mod tests {
         assert_eq!(payload.metrics.paired_legs[0].pair, 1);
     }
 
+    /// Out-of-band refusals seal the refusal string and box identity only — no leg seconds-per-token.
+    fn assert_sealed_out_of_band_refusal(payload: &ScorePayload, expected_error: &str) {
+        assert_eq!(payload.metrics.error, expected_error);
+        let sealed: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        assert_eq!(sealed["metrics"]["error"].as_str(), Some(expected_error));
+        assert!(
+            sealed["metrics"]["baseline_box"].is_string(),
+            "box identity stays public: {sealed}"
+        );
+        let m = sealed["metrics"].as_object().expect("metrics object");
+        for key in [
+            "baseline_leg_prefill_seconds_per_token",
+            "baseline_leg_decode_seconds_per_token",
+            "baseline_leg_decode_window_seconds_per_token",
+            "baseline_leg_seed_prefill_window_seconds_per_token",
+            "candidate_leg_prefill_seconds_per_token",
+            "candidate_leg_decode_seconds_per_token",
+            "candidate_leg_decode_window_seconds_per_token",
+            "candidate_leg_seed_prefill_window_seconds_per_token",
+        ] {
+            assert!(
+                !m.contains_key(key),
+                "out-of-band refusal must not seal {key}: {sealed}"
+            );
+        }
+    }
+
+    fn expected_out_of_band_refusal(
+        calibration: &crate::baseline::BaselineCalibration,
+        prompt: &str,
+    ) -> String {
+        let golden = official_golden(None);
+        let control = run_serial_control_leg(
+            &golden,
+            &test_window(),
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .expect("control leg measures");
+        calibration
+            .check_band(
+                prompt,
+                control.prefill_seconds_per_token,
+                control.decode_seconds_per_token,
+            )
+            .unwrap_err()
+    }
+
     /// LEG 1 OUTSIDE THE BAND: the run dies BY NAME, seals no score, and leg 2 never opens — not
-    /// its engine and not its worker. The seal still states which box and which calibration, and
-    /// records the leg it measured.
+    /// its engine and not its worker. The seal still states which box and which calibration; leg
+    /// timings stay on stderr only.
     #[test]
     fn a_control_leg_outside_the_box_band_seals_no_score_and_never_opens_leg_two() {
         let golden = official_golden(None);
         let calibration = narrow_calibration();
+        let expected_error = expected_out_of_band_refusal(&calibration, "botany");
         let candidate_spawns = Cell::new(0usize);
         let candidate_engine_ups = Cell::new(0usize);
 
@@ -6307,33 +6360,7 @@ mod tests {
 
         assert!(!payload.passed);
         assert!(payload.score.is_none(), "a refused run seals no score");
-        assert!(
-            payload
-                .metrics
-                .error
-                .contains("serial-control leg outside this box's band on the"),
-            "{}",
-            payload.metrics.error
-        );
-        assert!(
-            payload
-                .metrics
-                .error
-                .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
-            "{}",
-            payload.metrics.error
-        );
-        let after_class = payload
-            .metrics
-            .error
-            .split(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND)
-            .nth(1)
-            .expect("refusal class");
-        assert!(
-            !after_class.chars().any(|c| c.is_ascii_digit()),
-            "sealed out-of-band error must not leak timing digits after the class: {}",
-            payload.metrics.error
-        );
+        assert_sealed_out_of_band_refusal(&payload, &expected_error);
         assert_eq!(
             candidate_engine_ups.get(),
             0,
@@ -6345,19 +6372,57 @@ mod tests {
             payload.metrics.baseline_source.as_deref(),
             Some("serial-control-leg")
         );
-        assert!(payload
-            .metrics
-            .baseline_leg_prefill_seconds_per_token
-            .is_some());
-        // No candidate leg ran, so no candidate number is invented.
+        assert_eq!(payload.metrics.baseline_leg_prefill_seconds_per_token, None);
         assert_eq!(
             payload.metrics.candidate_leg_prefill_seconds_per_token,
             None
         );
         assert_eq!(payload.metrics.candidate_leg_decode_seconds_per_token, None);
-        // And NO denominator was established: the enforced fields stay at their placeholders.
         assert_eq!(payload.metrics.baseline_prefill_seconds_per_token, 0.0);
         assert_eq!(payload.metrics.baseline_decode_seconds_per_token, 0.0);
+
+        // Multi-pair: pair 1 passes the band; pair 2 refuses with a pair prefix. Pair 1 may stay
+        // in `paired_legs`, but the sealed top-level leg fields still carry no seconds-per-token.
+        let (first, second) = two_goldens();
+        let calibration = crate::baseline::BaselineCalibration {
+            prompts: vec![
+                wide_prompt_calibration("botany"),
+                narrow_prompt_calibration("kelp"),
+            ],
+            ..wide_calibration()
+        };
+        let inner = expected_out_of_band_refusal(&calibration, "kelp");
+        let expected_pair_two = format!("pair 2 of 2: {inner}");
+        let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+        window.pairs = 2;
+        let payload = official_core_paired(
+            &[
+                PairedGoldens {
+                    candidate: &first,
+                    control: &first,
+                    prompt: "botany",
+                },
+                PairedGoldens {
+                    candidate: &second,
+                    control: &second,
+                    prompt: "kelp",
+                },
+            ],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        );
+        assert!(payload.score.is_none());
+        assert_sealed_out_of_band_refusal(&payload, &expected_pair_two);
+        assert_eq!(payload.metrics.paired_legs.len(), 1);
     }
 
     /// A LEG-1 ENGINE that will not come up stops the run before anything is measured, and the
