@@ -21,7 +21,8 @@
 //! * the MLX (Apple-silicon) engine's Swift
 //!   `Sources/MLXFastTrustedHarness/QwenRuntimePreflight.swift` — `QwenRuntime.harnessHashRoots`,
 //!   `QwenRuntime.harnessHashRootFiles(baseDirectory:)` and `QwenRuntime.harnessHash()`;
-//! * the CUDA engine's equivalent, over that engine's own roster surface (`harness/`, `vllm/`).
+//! * the CUDA engine's equivalent, over that engine's own roster surface (`harness/`, `vllm/`,
+//!   and for the Bonsai track `llama.cpp/`).
 //!
 //! Both compute the SAME algorithm over the roots that EXIST in their respective trees. This port is
 //! byte-compatible with each: the same bytes go into SHA256, in the same order, so a benchd-computed
@@ -62,7 +63,8 @@
 //!    unconditionally, with no regular-file check, and the content read follows the link.
 //! 8. **A MISSING root is LOGGED and SKIPPED, never a refusal.** The roster spans BOTH engine
 //!    surfaces (MLX and CUDA), and neither engine has every root: the MLX tree has no `harness/` or
-//!    `vllm/`, the CUDA tree has no `Package.swift`/`Sources`/`Tests`. Per David's ruling the hash
+//!    `vllm/` or `llama.cpp/`, the CUDA tree has no `Package.swift`/`Sources`/`Tests`. Per David's
+//!    ruling the hash
 //!    is computed over what EXISTS — a root absent from disk contributes zero files (exactly as if
 //!    it were an empty directory) and is noted on stderr so an operator can see what was covered.
 //!    The SAME roster therefore serves both engines, and each hashes over its own surface.
@@ -77,12 +79,12 @@ use crate::hash::hex_lower;
 /// The FIXED root set the harness hash covers, spanning BOTH engine surfaces.
 ///
 /// The first nine roots are the MLX engine's `QwenRuntime.harnessHashRoots`, transcribed in ORDER;
-/// `harness` and `vllm` are the CUDA engine's own harness surface, appended. The order does NOT
+/// `harness`, `vllm`, and `llama.cpp` are CUDA engine harness surfaces, appended. The order does NOT
 /// affect the digest (the collected paths are sorted globally before hashing), but it is pinned so
 /// a root add/remove/reorder is a deliberate, reviewed act. A root that is absent on a given engine
 /// is logged and skipped ([`harness_hash_root_files`]), so the same roster covers both engines and
 /// each hashes over exactly the roots it actually has.
-pub const HARNESS_HASH_ROOTS: [&str; 11] = [
+pub const HARNESS_HASH_ROOTS: [&str; 12] = [
     "Package.swift",
     "Sources",
     "Tests",
@@ -94,6 +96,7 @@ pub const HARNESS_HASH_ROOTS: [&str; 11] = [
     "TASK.md",
     "harness",
     "vllm",
+    "llama.cpp",
 ];
 
 /// Collect the regular files under [`HARNESS_HASH_ROOTS`], resolved against `workspace_root`, as
@@ -400,10 +403,10 @@ mod tests {
         );
     }
 
-    /// The eleven roots, in the pinned order: the nine MLX roots (with `benchmark.sh` at index 4,
-    /// the property the engine's own `HarnessHashRootSetTests.swift` pins) followed by the two CUDA
-    /// roots. A root added, removed or reordered here changes what benchd hashes and must be a
-    /// deliberate, reviewed act.
+    /// The twelve roots, in the pinned order: the nine MLX roots (with `benchmark.sh` at index 4,
+    /// the property the engine's own `HarnessHashRootSetTests.swift` pins) followed by the CUDA
+    /// engine roots. A root added, removed or reordered here changes what benchd hashes and must be
+    /// a deliberate, reviewed act.
     #[test]
     fn the_root_set_is_the_two_engine_roster_in_order() {
         assert_eq!(
@@ -420,12 +423,14 @@ mod tests {
                 "TASK.md",
                 "harness",
                 "vllm",
+                "llama.cpp",
             ]
         );
         assert_eq!(HARNESS_HASH_ROOTS[4], "benchmark.sh");
         assert_eq!(HARNESS_HASH_ROOTS[9], "harness");
         assert_eq!(HARNESS_HASH_ROOTS[10], "vllm");
-        assert_eq!(HARNESS_HASH_ROOTS.len(), 11);
+        assert_eq!(HARNESS_HASH_ROOTS[11], "llama.cpp");
+        assert_eq!(HARNESS_HASH_ROOTS.len(), 12);
     }
 
     // -----------------------------------------------------------------------
@@ -609,7 +614,7 @@ mod tests {
             );
             // A root that was PRESENT and carried files must move the digest when dropped; an
             // already-absent CUDA root leaves the digest unchanged.
-            if ["harness", "vllm"].contains(&root_name) {
+            if ["harness", "vllm", "llama.cpp"].contains(&root_name) {
                 assert_eq!(
                     got, full,
                     "dropping an already-absent CUDA root cannot change the digest: {root_name}"
@@ -656,10 +661,18 @@ mod tests {
         assert!(is_well_formed_harness_hash(&mlx));
         fs::create_dir_all(root.join("harness")).expect("mkdir harness");
         fs::create_dir_all(root.join("vllm")).expect("mkdir vllm");
+        fs::create_dir_all(root.join("llama.cpp")).expect("mkdir llama.cpp");
         assert_eq!(
             mlx,
             harness_hash(&root),
-            "empty harness/ and vllm/ roots contribute no files and must not move the digest"
+            "empty harness/, vllm/, and llama.cpp/ roots contribute no files and must not move the digest"
+        );
+
+        write(&root.join("llama.cpp/CMakeLists.txt"), "cmake\n");
+        assert_ne!(
+            mlx,
+            harness_hash(&root),
+            "a populated llama.cpp/ root must move the digest"
         );
         let _ = fs::remove_dir_all(&root);
     }
