@@ -6,7 +6,7 @@
 //!
 //! Semantics match benchmark.sh exactly, except the gate temperature (see below):
 //! - gate temp: the run platform's cool-gate temperature
-//!   ([`bench_core::constants::Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 60 C.
+//!   ([`bench_core::constants::Platform::cool_gate_temp_c`]) — Mac/MLX 50 C, GB10/CUDA 60 C.
 //!   Finding R21 originally froze this at a single non-parameterizable 40 C constant; David
 //!   2026-08-30 ("no adversarial hardening") ruled that rigidity out of scope, because the GB10
 //!   GPU idles at 40–43 C and a 40 C gate would refuse forever. The threshold is now a trusted
@@ -108,7 +108,7 @@ where
 /// logical counter incremented by the poll interval, exactly as the shell tracks it).
 ///
 /// `gate_temp` is the run platform's trusted per-platform threshold
-/// ([`Platform::cool_gate_temp_c`]) — Mac/MLX 40 C, GB10/CUDA 60 C. Finding R21 froze this at a
+/// ([`Platform::cool_gate_temp_c`]) — Mac/MLX 50 C, GB10/CUDA 60 C. Finding R21 froze this at a
 /// non-parameterizable 40 C; David 2026-08-30 ("no adversarial hardening") lifted that rigidity so
 /// the GB10 idle (40–43 C) does not refuse forever against a 40 C gate. It is a per-platform
 /// value, NOT a contract/candidate input: the loop still ABORTS a genuinely hot GPU above
@@ -589,8 +589,8 @@ impl CoolGateRecord {
 /// loop), never `Ok`. The disabled / no-reader SKIP is the only path that returns without
 /// enforcing, and it is recorded as `SkippedNoReader` rather than silently "passed".
 ///
-/// `platform` keys the gate temperature ([`Platform::cool_gate_temp_c`]): Mac/MLX 40 C,
-/// GB10/CUDA 60 C (R21 lift, David 2026-08-30). It is the run's resolved platform, never a
+/// `platform` keys the gate temperature ([`Platform::cool_gate_temp_c`]): Mac/MLX 50 C,
+/// GB10/CUDA 60 C (the per-platform keying is the R21 lift, David 2026-08-30). It is the run's resolved platform, never a
 /// contract/candidate value.
 pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<CoolGateRecord, RunnerError> {
     let gate_temp = platform.cool_gate_temp_c();
@@ -677,7 +677,7 @@ mod tests {
 
     // The two platform gate temperatures, so the tests bind to the real per-platform constants.
     fn mlx() -> f64 {
-        Platform::Mlx.cool_gate_temp_c() // 40 C
+        Platform::Mlx.cool_gate_temp_c() // 50 C
     }
     fn cuda() -> f64 {
         Platform::Cuda.cool_gate_temp_c() // 60 C
@@ -685,8 +685,28 @@ mod tests {
 
     #[test]
     fn progress_reports_samples_without_changing_the_gate() {
+        // Above the MLX gate: a temperature rise keeps the earlier minimum.
+        let mut rise_samples = Vec::new();
+        let rise_temps = vec![Some(60.0), Some(55.0), Some(56.0), Some(50.0)];
+        let rise_result = cool_gate_loop_with_progress(
+            mlx(),
+            seq(rise_temps.clone()),
+            |_| {},
+            |waited, temp, min| rise_samples.push((waited, temp, min)),
+        );
+        assert_eq!(rise_result, cool_gate_loop(mlx(), seq(rise_temps), |_| {}));
+        assert_eq!(
+            rise_samples,
+            vec![
+                (0, 60.0, 60.0),
+                (10, 55.0, 55.0),
+                (20, 56.0, 55.0),
+                (30, 50.0, 50.0),
+            ],
+        );
+
         let mut samples = Vec::new();
-        let temperatures = vec![Some(50.0), Some(45.0), Some(46.0), Some(40.0)];
+        let temperatures = vec![Some(55.0), Some(52.0), Some(51.0), Some(49.0)];
         let result = cool_gate_loop_with_progress(
             mlx(),
             seq(temperatures.clone()),
@@ -697,10 +717,10 @@ mod tests {
         assert_eq!(
             samples,
             vec![
-                (0, 50.0, 50.0),
-                (10, 45.0, 45.0),
-                (20, 46.0, 45.0),
-                (30, 40.0, 40.0)
+                (0, 55.0, 55.0),
+                (10, 52.0, 52.0),
+                (20, 51.0, 51.0),
+                (30, 49.0, 49.0)
             ],
         );
     }
@@ -710,12 +730,12 @@ mod tests {
         let mut samples = Vec::new();
         let result = cool_gate_loop_with_progress(
             mlx(),
-            seq(vec![Some(50.0)]),
+            seq(vec![Some(55.0)]),
             |_| {},
             |waited, temp, _| samples.push((waited, temp)),
         );
         assert!(result.unwrap_err().contains("not cooling down"));
-        assert_eq!(samples.last(), Some(&(180, 50.0)));
+        assert_eq!(samples.last(), Some(&(180, 55.0)));
     }
 
     #[test]
@@ -732,19 +752,19 @@ mod tests {
 
     #[test]
     fn waits_then_passes_as_gpu_cools() {
-        // 50 -> 45 -> 41 (all hot) -> 39 (<=40): 3 polls of 10s = waited 30.
+        // 55 -> 52 -> 51 (all hot) -> 49 (<=50): 3 polls of 10s = waited 30.
         let slept = Rc::new(RefCell::new(0u64));
         let s = slept.clone();
         let r = cool_gate_loop(
             mlx(),
-            seq(vec![Some(50.0), Some(45.0), Some(41.0), Some(39.0)]),
+            seq(vec![Some(55.0), Some(52.0), Some(51.0), Some(49.0)]),
             move |secs| *s.borrow_mut() += secs,
         );
         assert_eq!(
             r,
             Ok(CoolGateOutcome::Passed {
                 waited: 30,
-                temp_c: 39.0
+                temp_c: 49.0
             })
         );
         assert_eq!(*slept.borrow(), 30);
@@ -752,15 +772,15 @@ mod tests {
 
     #[test]
     fn aborts_on_stall_hot_and_not_cooling() {
-        // Always 50C: min set at waited 0; at waited>=180 and no progress for >=90 -> abort.
-        let r = cool_gate_loop(mlx(), seq(vec![Some(50.0)]), |_| {});
+        // Always 55C (above the 50C gate): min set at waited 0; at waited>=180 and no progress for >=90 -> abort.
+        let r = cool_gate_loop(mlx(), seq(vec![Some(55.0)]), |_| {});
         assert!(matches!(r, Err(ref m) if m.contains("not cooling down")));
     }
 
     #[test]
     fn aborts_on_ceiling_even_while_slowly_cooling() {
         // Cools by >=EPSILON every poll (always progress, so the stall path never fires) but
-        // never reaches 40 within 900s -> hard ceiling abort. Start high enough to stay >40.
+        // never reaches 50 within 900s -> hard ceiling abort. Start high enough to stay >50.
         let mut t = 1000.0_f64;
         let reader = move || {
             t -= 0.3; // > EPSILON (0.25) each poll => always "progress", never stalls
@@ -796,18 +816,18 @@ mod tests {
     /// stall/ceiling arithmetic is byte-identical while the GPU idles seconds less.
     #[test]
     fn fine_poll_keeps_waited_in_ten_second_units() {
-        // 40.5 C is 0.5 C above the 40 C Mac gate → the tick polls per second, and the sub-sample
+        // 50.5 C is 0.5 C above the 50 C Mac gate → the tick polls per second, and the sub-sample
         // at +1 s passes. `waited` reports the whole tick (10), while only 1 s was actually slept.
         let slept = Rc::new(RefCell::new(0u64));
         let s = slept.clone();
-        let r = cool_gate_loop(mlx(), seq(vec![Some(40.5), Some(39.0)]), move |secs| {
+        let r = cool_gate_loop(mlx(), seq(vec![Some(50.5), Some(49.0)]), move |secs| {
             *s.borrow_mut() += secs
         });
         assert_eq!(
             r,
             Ok(CoolGateOutcome::Passed {
                 waited: 10,
-                temp_c: 39.0
+                temp_c: 49.0
             })
         );
         assert_eq!(
@@ -820,14 +840,14 @@ mod tests {
         // sleeps the flat 10 s — the coarse path is untouched.
         let slept = Rc::new(RefCell::new(0u64));
         let s = slept.clone();
-        let r = cool_gate_loop(mlx(), seq(vec![Some(41.0), Some(39.0)]), move |secs| {
+        let r = cool_gate_loop(mlx(), seq(vec![Some(51.0), Some(49.0)]), move |secs| {
             *s.borrow_mut() += secs
         });
         assert_eq!(
             r,
             Ok(CoolGateOutcome::Passed {
                 waited: 10,
-                temp_c: 39.0
+                temp_c: 49.0
             })
         );
         assert_eq!(*slept.borrow(), 10);
@@ -837,12 +857,12 @@ mod tests {
         // wall time slept is the same 180 s a coarse tick would have taken.
         let slept = Rc::new(RefCell::new(0u64));
         let s = slept.clone();
-        let r = cool_gate_loop(mlx(), seq(vec![Some(40.5)]), move |secs| {
+        let r = cool_gate_loop(mlx(), seq(vec![Some(50.5)]), move |secs| {
             *s.borrow_mut() += secs
         });
         assert_eq!(
             r,
-            Err("GPU is hot and not cooling down (current 40.5C, min seen 40.5C, target <=40C, waited 180s); something else is loading the GPU".to_string()),
+            Err("GPU is hot and not cooling down (current 50.5C, min seen 50.5C, target <=50C, waited 180s); something else is loading the GPU".to_string()),
         );
         assert_eq!(
             *slept.borrow(),
@@ -916,19 +936,20 @@ mod tests {
     // Finding R21 previously FROZE the gate at a single, non-parameterizable 40 C constant and a
     // test asserted "no contract/env override can raise it". David ruled that rigidity out of
     // scope: on GB10 the GPU IDLES at 40–43 C (throttle T.Limit 55 C), so a 40 C gate refuses
-    // forever. The threshold is now a trusted PER-PLATFORM value (Mac/MLX 40 C, GB10/CUDA 60 C).
-    // The tests below prove the change only RE-SITES the threshold (40→60 for GB10) — it does NOT
+    // forever. The threshold is now a trusted PER-PLATFORM value (Mac/MLX 50 C, GB10/CUDA 60 C).
+    // The tests below prove that the R21 lift only RE-SITED the threshold (40→60 for GB10) — it does NOT
     // defang the gate: a genuinely hot box above the platform gate still aborts, and an unreadable
-    // reader still fails closed (never a silent pass).
+    // reader still fails closed (never a silent pass). A separate, later change raised the Mac gate
+    // from 40 C to 50 C (an M5 Max idled at 44–46 C with fans at 0 rpm); it is not part of R21.
 
     #[test]
-    fn gate_temp_is_per_platform_mac_40_gb10_60_r21_lift() {
-        // 41 C: HOT for Mac (40 gate) → aborts; COOL for GB10 (60 gate) → passes immediately.
-        // This is exactly the case R21's frozen 40 C gate made unusable on GB10.
+    fn gate_temp_is_per_platform_mac_50_gb10_60() {
+        // 51 C: HOT for Mac (50 gate) → aborts; COOL for GB10 (60 gate) → passes immediately.
+        // The GB10 half (41 C below) is the R21 case: a frozen 40 C gate made 41 C unusable on GB10.
         assert_eq!(
-            cool_gate_loop(mlx(), seq(vec![Some(41.0)]), |_| {}),
-            Err("GPU is hot and not cooling down (current 41.0C, min seen 41.0C, target <=40C, waited 180s); something else is loading the GPU".to_string()),
-            "41C is above the 40C Mac gate → still aborts (Mac behavior unchanged)"
+            cool_gate_loop(mlx(), seq(vec![Some(51.0)]), |_| {}),
+            Err("GPU is hot and not cooling down (current 51.0C, min seen 51.0C, target <=50C, waited 180s); something else is loading the GPU".to_string()),
+            "51C is above the 50C Mac gate → still aborts"
         );
         assert_eq!(
             cool_gate_loop(cuda(), seq(vec![Some(41.0)]), |_| {}),
@@ -940,10 +961,10 @@ mod tests {
         );
         // Boundary: each platform passes AT its own gate temperature (inclusive).
         assert_eq!(
-            cool_gate_loop(mlx(), seq(vec![Some(40.0)]), |_| {}),
+            cool_gate_loop(mlx(), seq(vec![Some(50.0)]), |_| {}),
             Ok(CoolGateOutcome::Passed {
                 waited: 0,
-                temp_c: 40.0
+                temp_c: 50.0
             })
         );
         assert_eq!(

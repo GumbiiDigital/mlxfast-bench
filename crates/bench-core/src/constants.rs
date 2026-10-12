@@ -147,9 +147,10 @@ pub const PLATFORM_KEY_MLX: &str = "mlx";
 /// The track-id token for [`Platform::Cuda`].
 pub const PLATFORM_KEY_CUDA: &str = "cuda";
 
-/// The MLX (Mac) track's local pre-timing cool-gate temperature (C). A Mac idles well below
-/// this, so the gate blocks only a genuinely warm GPU.
-pub const COOL_GATE_TEMP_C_MLX: f64 = 40.0;
+/// The MLX (Mac) track's local pre-timing cool-gate temperature (C): 50 C, raised from 40 C. One
+/// M5 Max idled at 44–46 C with its fans at 0 rpm (2026-10-08/09), so a 40 C gate refused idle
+/// runs. With its fans fixed near 80% the same box idles near 32 C.
+pub const COOL_GATE_TEMP_C_MLX: f64 = 50.0;
 /// The CUDA (GB10) track's local pre-timing cool-gate temperature (C): 60 C, raised from 50 C
 /// (GumbiiDigital measurement for the Nemotron 3.5 Lightning track, 2026-09-26; ported to main
 /// 2026-10-07).
@@ -216,7 +217,8 @@ impl Platform {
     /// rigidity out of scope under his "no adversarial hardening" stance (the GB10 idle of
     /// 40–43 C against a 40 C gate makes the gate unusable). The threshold is therefore now a
     /// trusted PER-PLATFORM value keyed here — like every other platform fact — never a
-    /// contract/candidate-supplied input. See [`COOL_GATE_TEMP_C_MLX`] / [`COOL_GATE_TEMP_C_CUDA`].
+    /// contract/candidate-supplied input. A separate, later change (not R21) raised the Mac gate
+    /// from 40 C to 50 C: one M5 Max idled at 44–46 C with fans at 0 rpm. See [`COOL_GATE_TEMP_C_MLX`] / [`COOL_GATE_TEMP_C_CUDA`].
     pub fn cool_gate_temp_c(self) -> f64 {
         match self {
             Platform::Mlx => COOL_GATE_TEMP_C_MLX,
@@ -754,11 +756,12 @@ mod tests {
     }
 
     #[test]
-    fn cool_gate_temp_is_per_platform_mac_40_gb10_60() {
+    fn cool_gate_temp_is_per_platform_mac_50_gb10_60() {
         // R21 lift (David 2026-08-30): the gate temperature is a trusted per-platform value, not a
-        // frozen 40 C constant. Mac/MLX idles cool → 40 C. GB10/CUDA: a loaded resident holds the
-        // die at 49–52 C in P0, so the gate is re-sited to 60 C (see the constant).
-        assert_eq!(Platform::Mlx.cool_gate_temp_c(), 40.0);
+        // frozen 40 C constant. GB10/CUDA: a loaded resident holds the die at 49–52 C in P0, so the
+        // gate is re-sited to 60 C (see the constant). Separately (not R21), the Mac/MLX gate is 50 C:
+        // one M5 Max idled at 44–46 C with fans at 0 rpm.
+        assert_eq!(Platform::Mlx.cool_gate_temp_c(), 50.0);
         assert_eq!(Platform::Cuda.cool_gate_temp_c(), 60.0);
         assert!(
             Platform::Cuda.cool_gate_temp_c() > Platform::Mlx.cool_gate_temp_c(),

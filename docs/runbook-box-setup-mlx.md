@@ -233,5 +233,5 @@ running the gate. A successful local measurement without a baseline still has
 
 While cooling, benchd prints the phase, current and minimum GPU temperature,
 target, wall-clock elapsed time, and logical gate wait on each usable sample.
-The MLX threshold remains 40 C, with the existing polling, stall-abort, and maximum
+The MLX threshold is 50 C, with the existing polling, stall-abort, and maximum
 wait rules. Progress output does not relax or bypass the gate.

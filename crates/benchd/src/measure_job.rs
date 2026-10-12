@@ -2365,11 +2365,15 @@ pub use bench_core::contract::PromptPoolEntry;
 /// The thermal thresholds a run uses. Finding R21 — the live thermal thresholds are READONLY
 /// WRAPPER CONSTANTS (`live-measure-qwen-mtp-job.sh` W:422-429: `readonly GATE_TEMP=40`, `readonly
 /// COOL_TIMEOUT=900`, `MIN_FREQ_SERIAL/MTP=1100`, `STALL_P50_FACTOR=4`) — "FIXED, NOT OVERRIDABLE"
-/// by the contract or env; the live track fixture carries NO threshold fields. So the cool gate
-/// ALWAYS enforces the fixed 40 °C constant and the contract `calibration` is NOT consulted (the
-/// R5 contract-override path is reverted). The constants are still recorded in `results.json` for
-/// provenance, each stamped with an HONEST wrapper source (`wrapper-constant-40` / …) so a consumer
-/// can never mistake a fixed constant for a contract/env value.
+/// by the contract or env; the live track fixture carries NO threshold fields. The script still
+/// cites 40 °C; on the MLX measure-job path the enforced cool gate is
+/// [`bench_core::constants::Platform::cool_gate_temp_c()`] (50 °C via
+/// [`bench_core::constants::COOL_GATE_TEMP_C_MLX`]), not
+/// the contract `calibration` (the R5 contract-override path is reverted).
+/// [`thermal_thresholds()`] only records those values in `results.json` for provenance, each stamped
+/// with an HONEST source (`bench-core-COOL_GATE_TEMP_C_MLX` for the gate, which is no longer a
+/// wrapper constant; `wrapper-constant-1100` for the clock floor) so a consumer can never mistake a
+/// fixed constant for a contract/env value.
 ///
 /// FREE FUNCTION, and deliberately so: it took `&self` on the retired shadow contract and never
 /// read a field of it, which is exactly the shape that made "the fixture can move the gate" look
@@ -2378,13 +2382,14 @@ pub use bench_core::contract::PromptPoolEntry;
 ///
 /// R14 — `loaded_util` is the ONE thermal field that IS env-driven (`GPU_LOADED_UTIL`, default
 /// 0.70, W:403); the caller resolves it via [`resolve_loaded_util`] and passes it in with its
-/// honest source. `cool_gate_c` / `clock_floor_mhz` stay FIXED wrapper constants (R21).
+/// honest source. `clock_floor_mhz` stays a FIXED wrapper constant (R21). `cool_gate_c` is the fixed
+/// bench-core constant `COOL_GATE_TEMP_C_MLX`, stamped `bench-core-COOL_GATE_TEMP_C_MLX`.
 pub fn thermal_thresholds(loaded_util: f64, loaded_util_source: &'static str) -> ThermalThresholds {
     ThermalThresholds {
-        cool_gate_c: 40.0,
+        cool_gate_c: bench_core::constants::COOL_GATE_TEMP_C_MLX,
         clock_floor_mhz: 1100.0,
         loaded_util,
-        cool_gate_c_source: "wrapper-constant-40",
+        cool_gate_c_source: "bench-core-COOL_GATE_TEMP_C_MLX",
         clock_floor_mhz_source: "wrapper-constant-1100",
         loaded_util_source,
     }
@@ -2463,8 +2468,11 @@ pub fn resolve_track_name(
 }
 
 /// The thermal thresholds actually used, with per-field provenance (findings 8 / R21). Recorded in
-/// `results.json`; finding R21 — these are FIXED readonly wrapper constants (never a contract/env
-/// value), each stamped with an honest `wrapper-*` source so the seal cannot claim a false origin.
+/// `results.json`. Finding R21: `cool_gate_c` and `clock_floor_mhz` are FIXED values (never a
+/// contract/env value); `loaded_util` is env-driven (R14). Each is stamped with an honest source so
+/// the seal cannot claim a false origin: `cool_gate_c` from the bench-core constant
+/// (`bench-core-COOL_GATE_TEMP_C_MLX`), `clock_floor_mhz` from the wrapper (`wrapper-constant-1100`),
+/// and `loaded_util` from the env (`env-GPU_LOADED_UTIL*`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ThermalThresholds {
     pub cool_gate_c: f64,
@@ -9555,8 +9563,9 @@ mod tests {
 
     #[test]
     fn contract_parse_reads_pool_but_thermal_is_fixed_wrapper_constants_r21() {
-        // finding R21 — the live thermal thresholds are READONLY WRAPPER CONSTANTS (GATE_TEMP=40,
-        // MIN_FREQ=1100), FIXED and NOT overridable: a contract that carries a `calibration` block
+        // finding R21 — the live thermal thresholds are READONLY WRAPPER CONSTANTS (the script's
+        // GATE_TEMP=40; benchd uses COOL_GATE_TEMP_C_MLX = 50 °C, MIN_FREQ=1100), FIXED and NOT
+        // overridable: a contract that carries a `calibration` block
         // with a different cool_gate_c is IGNORED (the fixture is supposed to carry no threshold
         // fields at all). The pool no-op refs still parse; only the thermal override is reverted.
         let contract_bytes = serde_json::to_vec(&json!({
@@ -9575,14 +9584,15 @@ mod tests {
             (contract.timed_prompt_pool[0].noop_decode_speedup.unwrap() - 0.9940390645).abs()
                 < 1e-12
         );
-        // The contract's 42.0 is IGNORED — the gate enforces the fixed 40, stamped honestly. It
-        // cannot do otherwise: `thermal_thresholds` takes no fixture at all.
+        // The contract's 42.0 is IGNORED — the gate enforces COOL_GATE_TEMP_C_MLX, stamped honestly.
+        // It cannot do otherwise: `thermal_thresholds` takes no fixture at all.
         let th = thermal_thresholds(0.70, "env-GPU_LOADED_UTIL-default-0.70");
         assert_eq!(
-            th.cool_gate_c, 40.0,
-            "the fixed wrapper constant, never the contract's 42"
+            th.cool_gate_c,
+            bench_core::constants::COOL_GATE_TEMP_C_MLX,
+            "the fixed bench-core constant, never the contract's 42"
         );
-        assert_eq!(th.cool_gate_c_source, "wrapper-constant-40");
+        assert_eq!(th.cool_gate_c_source, "bench-core-COOL_GATE_TEMP_C_MLX");
         assert_eq!(th.clock_floor_mhz, 1100.0);
         assert_eq!(th.clock_floor_mhz_source, "wrapper-constant-1100");
         // R14 — loaded_util is env-driven (GPU_LOADED_UTIL, default 0.70), never the contract's 0.9.
@@ -10776,7 +10786,7 @@ mod tests {
         assert_eq!(v["provenance"]["baseline_executable"], json!("base-ws"));
         assert_eq!(
             v["provenance"]["thermal"]["cool_gate_c_source"],
-            json!("wrapper-constant-40")
+            json!("bench-core-COOL_GATE_TEMP_C_MLX")
         );
     }
 

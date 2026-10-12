@@ -3524,7 +3524,8 @@ mod tests {
 
     #[test]
     fn official_timed_phases_pass_through_the_cool_gate_in_order() {
-        // David 2026-09-06: the 40 C per-phase contract applies to the single-leg path. The
+        // David 2026-09-06: the per-phase cool-gate contract applies to the single-leg path (the
+        // MLX threshold was 40 C then; COOL_GATE_TEMP_C_MLX is 50 C since bench #406). The
         // TIMED prefill and decode each call the gate, in that order; the unmeasured warmup leg
         // does not (it is what heats the GPU). A gate refusal fails the run closed.
         use std::cell::RefCell;

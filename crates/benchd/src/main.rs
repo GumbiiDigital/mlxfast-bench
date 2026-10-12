@@ -2364,8 +2364,9 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         bench_runner::ENGINE_WIRE_V1_SHA256,
     )
     .map_err(MeasureJobFailure::die8)?;
-    // R14 — `loaded_util` is env-driven (`GPU_LOADED_UTIL`, default 0.70, W:403); GATE_TEMP/COOL_TIMEOUT
-    // stay fixed wrapper constants (R21). Resolve the util (fail-closed on an invalid value) and thread
+    // R14 — `loaded_util` is env-driven (`GPU_LOADED_UTIL`, default 0.70, W:403); COOL_TIMEOUT stays a
+    // fixed wrapper constant (R21), and the gate temperature is the bench-core constant. Resolve
+    // the util (fail-closed on an invalid value) and thread
     // it + its honest source into the thermal thresholds.
     let (loaded_util, loaded_util_source) =
         measure_job::resolve_loaded_util(std::env::var("GPU_LOADED_UTIL").ok().as_deref())?;
@@ -2945,7 +2946,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     };
 
     // R15 — each leg is ONE `runtime-worker` invocation: ONE fresh sandboxed worker, ONE cool gate
-    // (finding R21: the FIXED wrapper constant 40 °C, W:422-429 — recorded in `provenance.thermal`),
+    // (finding R21: wrapper still cites 40 °C at W:422-429; live gate 50 °C — recorded in `provenance.thermal`),
     // then ONE timed decode window (the seed prefill INSIDE it, `prefill_component: "none"`). H1
     // (cycle-3): benchd's OWN parent wall clock is the scored `benchd_seconds_per_token`.
     //
@@ -5320,7 +5321,7 @@ enum RunBaselines {
 /// both gates on or off; there is no second knob.
 ///
 /// The gate temperature is keyed by the platform resolved from the track-id env, defaulting to
-/// the Mac/MLX 40 C gate (R21 lift, David 2026-08-30). The quiescence thresholds are fixed
+/// the Mac/MLX gate (50 C; the per-platform keying is the R21 lift, David 2026-08-30). The quiescence thresholds are fixed
 /// ([`quiescegate::LOAD_MAX`] / [`quiescegate::GPU_UTIL_MAX`]).
 fn local_cool_gate(enabled: bool) -> impl Fn(&str) -> Result<(), RunnerError> {
     move |phase: &str| {
@@ -5409,7 +5410,7 @@ fn official_cool_gate(
 /// track fixture, so the env is the ONE declaration; absent, the run refuses by name rather than
 /// guessing which platform's baseline to score against.
 /// Resolve the run platform for the cool gate from the workflow-declared track id
-/// (`MLXFAST_QWEN_MTP_TRACK_ID`), defaulting to MLX (the Mac 40 C gate) when no track id is set —
+/// (`MLXFAST_QWEN_MTP_TRACK_ID`), defaulting to MLX (the Mac 50 C gate) when no track id is set —
 /// a bare local run on a Mac. The SCORED measure-job path never uses this: it passes the platform
 /// it already resolved from the contract≡env track id. Only the local dev helpers
 /// (`--local-cool-gate-only`, `--mode local-iterate`) fall back to this env resolution, where a GB10

@@ -122,6 +122,12 @@ struct Args {
     /// The free-run oracle length N (`benchmark.expected_decode_tokens`). Defaults to
     /// [`DEFAULT_BENCHMARK_STEPS`]; must be `>= BENCHMARK_DECODE_STEPS` (the scored decode window).
     benchmark_steps: usize,
+    /// The speculative `spec` the free-run `benchmark` block is recorded UNDER
+    /// (`--benchmark-spec`). `None` sends no spec, which every engine serves serial: the serial
+    /// timed oracle. `Some(mtp:D)` records the per-depth oracle at draft depth D through
+    /// `free_decode_begin_spec`, for an engine that takes the decoder per request (the MLX
+    /// bench-worker). An engine whose spec is fixed at boot (the CUDA serve-up) needs no flag.
+    benchmark_spec: Option<bench_protocol::SpecConfig>,
     provenance_repo: String,
     provenance_rev: String,
     out: PathBuf,
@@ -134,7 +140,8 @@ adapter GREEDY teacher-forced (temp=0) over one or more 1024-token prompts.
 USAGE:
     record-correctness-golden --worker-bin <PATH> --weights <TARGET_DIR> \\
         --prompt-tokens <FILE> --case-name <NAME> [--prompt-tokens <FILE> --case-name <NAME> ...] \\
-        [--steps 1024] [--stop-token <ID> ...] [--benchmark-free-run [--benchmark-steps 128]] \\
+        [--steps 1024] [--stop-token <ID> ...] \\
+        [--benchmark-free-run [--benchmark-steps 128] [--benchmark-spec serial|mtp:<D>]] \\
         --out <GOLDEN.json> [--backend live|mock] \\
         [--model-provenance-repo <REPO>] [--model-provenance-rev <40-HEX>]
 
@@ -159,6 +166,10 @@ FLAGS:
                           denominator; equals LOCAL_ITERATE_BENCHMARK_DECODE_STEPS). Must be
                           >= BENCHMARK_DECODE_STEPS: an oracle shorter than the window it must verify
                           is invalid. Only meaningful with --benchmark-free-run.
+    --benchmark-spec <S>  the spec the free-run block is recorded under: `serial` (default; no spec
+                          is sent) or `mtp:<D>` (draft depth D >= 1), the per-depth oracle for an
+                          engine that takes the decoder per request. The echo must equal the
+                          request. Requires --benchmark-free-run. cases[] stay teacher-forced.
     --track <TRACK-ID>    The track this golden is recorded FOR. Its model identity — model_type,
                           vocabulary bound and seed length — is what the golden declares and is
                           validated against. Falls back to env MLXFAST_QWEN_MTP_TRACK_ID; an
@@ -169,6 +180,24 @@ FLAGS:
     --backend <live|mock> Engine driver (default live). `mock` uses the in-process mock (no GPU).
 ";
 
+/// `--benchmark-spec`: `serial` (no spec is sent) or `mtp:<D>` with D >= 1.
+fn parse_benchmark_spec(raw: &str) -> Result<Option<bench_protocol::SpecConfig>, String> {
+    if raw == "serial" {
+        return Ok(None);
+    }
+    let depth = raw
+        .strip_prefix("mtp:")
+        .ok_or_else(|| format!("--benchmark-spec must be serial or mtp:<D>, got {raw:?}"))?
+        .parse::<u32>()
+        .map_err(|e| format!("--benchmark-spec {raw:?}: depth: {e}"))?;
+    if depth == 0 {
+        return Err(format!(
+            "--benchmark-spec {raw:?}: an MTP depth is at least 1 (serial is `serial`)"
+        ));
+    }
+    Ok(Some(bench_protocol::SpecConfig::mtp(depth)))
+}
+
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut backend = Backend::Live;
     let mut worker_bin = None;
@@ -177,6 +206,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut stop_tokens: Vec<i64> = Vec::new();
     let mut benchmark_free_run = false;
     let mut benchmark_steps = DEFAULT_BENCHMARK_STEPS;
+    let mut benchmark_spec: Option<bench_protocol::SpecConfig> = None;
     let mut track: Option<String> = None;
     let mut contract: Option<PathBuf> = None;
     let mut provenance_repo = DEFAULT_PROVENANCE_REPO.to_string();
@@ -236,6 +266,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--benchmark-steps: {e}"))?
             }
+            "--benchmark-spec" => benchmark_spec = parse_benchmark_spec(&value()?)?,
             "--track" => track = Some(value()?),
             "--contract" => contract = Some(PathBuf::from(value()?)),
             "--model-provenance-repo" => provenance_repo = value()?,
@@ -263,6 +294,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     // TIMED decode window it verifies. The scored window FOR THIS TRACK is BENCHMARK_DECODE_STEPS
     // (128), so an oracle shorter than that could never gate the window benchd times — refuse it
     // here rather than emitting a golden the scoring loader (validate_benchmark_golden) rejects.
+    if benchmark_spec.is_some() && !benchmark_free_run {
+        return Err(
+            "--benchmark-spec needs --benchmark-free-run: the spec selects the decoder of the \
+             free-run benchmark block"
+                .to_string(),
+        );
+    }
     if benchmark_free_run && benchmark_steps < BENCHMARK_DECODE_STEPS {
         return Err(format!(
             "--benchmark-steps {benchmark_steps} is below the scored decode window \
@@ -307,6 +345,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         stop_tokens,
         benchmark_free_run,
         benchmark_steps,
+        benchmark_spec,
         provenance_repo,
         provenance_rev,
         out: out.ok_or("--out is required")?,
@@ -448,6 +487,7 @@ fn record_benchmark_free_run<T, F>(
     spawn: &mut F,
     seed_prompt: &[i64],
     steps: usize,
+    spec: Option<&bench_protocol::SpecConfig>,
 ) -> Result<BenchmarkGolden, String>
 where
     T: LineTransport,
@@ -469,7 +509,7 @@ where
     engine.begin_phase();
 
     let begin = engine
-        .free_decode_begin(seed_prompt)
+        .free_decode_begin_spec(seed_prompt, spec)
         .map_err(|e| format!("benchmark free-run: free_decode_begin (seed forward): {e}"))?;
     let seed_token = begin.seed_token.ok_or_else(|| {
         "benchmark free-run: free_decode_begin returned no seed_token".to_string()
@@ -708,7 +748,12 @@ where
         ));
     }
     let seed_prompt = &cases[0].prompt_tokens;
-    let benchmark = record_benchmark_free_run(spawn, seed_prompt, args.benchmark_steps)?;
+    let benchmark = record_benchmark_free_run(
+        spawn,
+        seed_prompt,
+        args.benchmark_steps,
+        args.benchmark_spec.as_ref(),
+    )?;
     Ok(Some(benchmark))
 }
 
@@ -985,6 +1030,7 @@ mod tests {
             stop_tokens: Vec::new(),
             benchmark_free_run: true,
             benchmark_steps: BENCHMARK_DECODE_STEPS,
+            benchmark_spec: None,
             provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
             provenance_rev: DEFAULT_PROVENANCE_REV.to_string(),
             out: PathBuf::from("unused"),
@@ -1083,6 +1129,7 @@ mod tests {
             stop_tokens: Vec::new(),
             benchmark_free_run: false,
             benchmark_steps: BENCHMARK_DECODE_STEPS,
+            benchmark_spec: None,
             provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
             provenance_rev: DEFAULT_PROVENANCE_REV.to_string(),
             out: PathBuf::from("unused"),
@@ -1115,6 +1162,7 @@ mod tests {
             stop_tokens: vec![full.expected_tokens[99]],
             benchmark_free_run: true,
             benchmark_steps: BENCHMARK_DECODE_STEPS,
+            benchmark_spec: None,
             provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
             provenance_rev: DEFAULT_PROVENANCE_REV.to_string(),
             out: PathBuf::from("unused"),
@@ -1185,5 +1233,85 @@ mod tests {
         let _ = std::fs::remove_file(&prompt_path);
         assert!(parsed.benchmark_free_run);
         assert_eq!(parsed.benchmark_steps, BENCHMARK_DECODE_STEPS);
+    }
+
+    /// PER-DEPTH ORACLE: `--benchmark-spec mtp:<D>` records the free-run block UNDER that spec.
+    /// The engine sees the spec on `free_decode_begin` (the session enforces the echo, so an
+    /// engine that ignored it would refuse), and the authored block loads like the serial one.
+    #[test]
+    fn benchmark_spec_records_the_free_run_block_under_the_requested_depth() {
+        let cases_input = vec![CaseInput {
+            name: "c".to_string(),
+            prompt_tokens: prompt_1024(),
+        }];
+        let mut args = Args {
+            identity: identity_125b(),
+            backend: Backend::Mock,
+            worker_bin: None,
+            weights: None,
+            cases: cases_input,
+            steps: CORRECTNESS_STEPS,
+            stop_tokens: Vec::new(),
+            benchmark_free_run: true,
+            benchmark_steps: BENCHMARK_DECODE_STEPS,
+            benchmark_spec: Some(bench_protocol::SpecConfig::mtp(3)),
+            provenance_repo: DEFAULT_PROVENANCE_REPO.to_string(),
+            provenance_rev: DEFAULT_PROVENANCE_REV.to_string(),
+            out: PathBuf::from("unused"),
+        };
+        let mut spawn = mock_spawn_free_run();
+        let cases = record_all(&mut spawn, &args.cases, args.steps, &[]).expect("record cases");
+        let benchmark = author_benchmark(&mut spawn, &args, &cases)
+            .expect("author benchmark under mtp:3")
+            .expect("Some(benchmark)");
+        assert_eq!(
+            benchmark.expected_decode_tokens.len(),
+            BENCHMARK_DECODE_STEPS
+        );
+
+        // A DIVERGENT echo (the engine ran another spec) is refused, never sealed as an oracle.
+        let mut divergent = || {
+            let (session, _hello) = Session::connect(
+                MockEngine::new()
+                    .free_run_capable()
+                    .diverge_spec_echo(bench_protocol::SpecConfig::mtp(1)),
+            )?;
+            Ok(session)
+        };
+        let err = author_benchmark(&mut divergent, &args, &cases)
+            .expect_err("a divergent spec echo must refuse the oracle");
+        assert!(err.contains("free_decode_begin"), "{err}");
+
+        // `serial` sends no spec: the serial block.
+        args.benchmark_spec = None;
+        let mut spawn = mock_spawn_free_run();
+        assert!(author_benchmark(&mut spawn, &args, &cases)
+            .expect("serial")
+            .is_some());
+    }
+
+    #[test]
+    fn benchmark_spec_parses_serial_and_mtp_depths_and_refuses_the_rest() {
+        assert_eq!(parse_benchmark_spec("serial").unwrap(), None);
+        assert_eq!(
+            parse_benchmark_spec("mtp:3").unwrap(),
+            Some(bench_protocol::SpecConfig::mtp(3))
+        );
+        for bad in ["mtp:0", "mtp", "mtp:x", "dflash:3", ""] {
+            assert!(parse_benchmark_spec(bad).is_err(), "{bad:?} must refuse");
+        }
+        // The spec selects the decoder of the free-run block, so it needs that block.
+        // Its own prompt file (floor_argv names the file by the step count, and tests run in
+        // parallel), so this case never removes another test's prompt.
+        let (mut argv, prompt_path) = floor_argv(BENCHMARK_DECODE_STEPS + 1);
+        argv.retain(|a| a != "--benchmark-free-run");
+        argv.push("--benchmark-spec".to_string());
+        argv.push("mtp:2".to_string());
+        let err = parse_args(&argv).expect_err("--benchmark-spec without --benchmark-free-run");
+        let _ = std::fs::remove_file(&prompt_path);
+        assert!(
+            err.contains("--benchmark-spec needs --benchmark-free-run"),
+            "{err}"
+        );
     }
 }
