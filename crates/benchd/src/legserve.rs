@@ -21,7 +21,7 @@
 //! ([`leg_serve_script`]):
 //!
 //! ```text
-//! <workspace>/<script> --boot --spec <serial|mtp> --draft-len <N> --socket-out <FILE>
+//! <workspace>/<script> --boot --spec <serial|mtp|dflash> --draft-len <N> --socket-out <FILE>
 //! <workspace>/<script> --stop --socket <PATH>
 //! ```
 //!
@@ -29,7 +29,8 @@
 //!   writes the resident's Unix-socket path as the FIRST LINE of `<FILE>`, and exits 0 leaving the
 //!   resident running. It owns its own health timeout; benchd waits for it.
 //! * `--spec serial --draft-len 0` is what LEG 1 always gets: the control leg is serial regardless
-//!   of what the submission declares. Leg 2 gets the run's declared spec.
+//!   of what the submission declares. Leg 2 gets the run's declared spec: its mode (`mtp` or
+//!   `dflash`) and that module's depth.
 //! * `--stop` tears that resident down and is IDEMPOTENT (a resident that is already gone is not
 //!   an error). benchd runs it when the leg's [`LegServe`] is dropped — after the leg, on success
 //!   and on failure alike — so a resident never outlives its leg and the two legs never hold GPU
@@ -137,10 +138,20 @@ impl Drop for LegServe {
 }
 
 /// The `--spec` / `--draft-len` pair for a leg, from the spec that leg requests. The CONTROL leg
-/// passes `None` and is booted serial; a `serial` spec is serial too.
+/// passes `None` and is booted serial; a `serial` spec is serial too. An `mtp` spec boots at its
+/// `mtp.depth` and a `dflash` spec at its `dflash.depth`, because the drafter a resident loads and
+/// the length it drafts are fixed when it boots. A spec that names no depth boots serial, and the
+/// worker then refuses the speculative request against a serial resident.
 pub fn spec_arguments(spec: Option<&SpecConfig>) -> (String, String) {
-    match spec.and_then(|s| s.mtp.as_ref()).and_then(|m| m.depth) {
-        Some(depth) if depth >= 1 => ("mtp".to_string(), depth.to_string()),
+    let mtp = spec
+        .and_then(|s| s.mtp.as_ref())
+        .and_then(|m| m.depth)
+        .map(|depth| ("mtp", depth));
+    let dflash = spec
+        .and_then(SpecConfig::dflash_depth)
+        .map(|depth| ("dflash", depth));
+    match mtp.or(dflash) {
+        Some((mode, depth)) if depth >= 1 => (mode.to_string(), depth.to_string()),
         _ => ("serial".to_string(), "0".to_string()),
     }
 }
@@ -404,6 +415,31 @@ mod tests {
             spec_arguments(Some(&SpecConfig::mtp(4))),
             ("mtp".to_string(), "4".to_string())
         );
+        // The DFlash drafter is loaded at boot too, at its own draft length.
+        assert_eq!(
+            spec_arguments(Some(&SpecConfig::dflash(7))),
+            ("dflash".to_string(), "7".to_string())
+        );
+        // A dflash spec that leaves the depth to the engine names nothing to boot.
+        let engine_decides: SpecConfig =
+            serde_json::from_str(r#"{"mode":"dflash","dflash":{}}"#).unwrap();
+        assert_eq!(
+            spec_arguments(Some(&engine_decides)),
+            ("serial".to_string(), "0".to_string())
+        );
+
+        // The candidate leg's boot command line carries the dflash mode and depth.
+        let dir = stub_workspace(Platform::Cuda, "/tmp/leg-dflash.sock");
+        let leg = boot_leg(
+            &dir,
+            Some(&SpecConfig::dflash(7)),
+            "candidate",
+            Platform::Cuda,
+        )
+        .unwrap();
+        assert!(calls(&dir)[0].starts_with("--boot --spec dflash --draft-len 7 --socket-out "));
+        drop(leg);
+        let _ = std::fs::remove_dir_all(&dir);
 
         // …and the control leg really does put `serial` on the boot command line, whatever the
         // candidate declares.

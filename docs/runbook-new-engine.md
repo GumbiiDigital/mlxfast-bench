@@ -9,7 +9,7 @@ This page covers the track. Do it once per track. A ranked run is paired, and th
 
 | thing | where | what it holds |
 |---|---|---|
-| a runner | the engine repo's `Runner/<Family>Runner.swift`, an editable copy that registers itself in the fork's `RunnerRegistry` and shadows the fork's built-in runner; the model implementation stays in the fork submodule | the model behind CBv2, and a static manifest: decoders, depth range, regimes |
+| a runner | `Vendor/mlx-swift-lm/Libraries/MLXRunners/<Family>Runner.swift` in the engine repo, registered in that tree's `RunnerRegistry` | the model behind CBv2, and a static manifest: decoders, depth range, regimes |
 | an engine repo | `{mlxfast\|cudafast}-{model}{ver}-{params}-engine` | `benchmark.json`, the track fixture, the fork pin, the benchd channel, `benchmark.yml` |
 | goldens | `correctness_prompts/<track_id>/` in the engine repo | the timed pool, the live golden, one oracle for each permitted draft depth |
 | per-box state | the runner service environment on the box | the track label, the built reference tree, this box's calibration file |
@@ -97,12 +97,14 @@ records per pass.
 
 ```mermaid
 flowchart LR
-  s1[1 · runner in the fork,<br/>copy in the engine repo] --> s2[2 · engine repo] --> s3[3 · box: label,<br/>reference tree, calibration] --> s4[4 · import, then open]
+  s1[1 · runner in the engine repo's<br/>vendored fork tree] --> s2[2 · engine repo] --> s3[3 · box: label,<br/>reference tree, calibration] --> s4[4 · import, then open]
 ```
 
-1. **Runner.** Add the runner file to the fork and register its `model_type`, then copy it into the
-   engine repo's `Runner/` directory, where the track's `track-bench-worker` registers it ahead of
-   the fork's built-in copy. Prove the wire, then merge to fork `main`:
+1. **Runner.** Add the runner file under the engine repo's vendored fork tree,
+   `Vendor/mlx-swift-lm/Libraries/MLXRunners/`, and register its `model_type` in that tree's
+   `RunnerRegistry`. The engine repo holds the fork as plain files, not as a submodule, and edits
+   them in place. That tree is the source of truth for the track. Do not push it to the fork, and do
+   not open a fork PR (David ruling 2026-09-16). Prove the wire:
 
    ```bash
    swift build -c release --product bench-worker
@@ -159,7 +161,7 @@ row. A depth-N declaration is one edited file: `mtp-head.manifest.json`.
 
 ## 4. Checklist
 
-- [ ] runner merged to fork `main`; `bench-worker manifest --digest` matches the hello
+- [ ] runner registered in the engine repo's vendored fork tree; `bench-worker manifest --digest` matches the hello
 - [ ] engine repo pushed; `tools/fetch-benchd.sh` resolves benchd from the channel
 - [ ] runner online with the label; timed pool and per-depth tapes staged and pinned
 - [ ] reference tree built at `baseline_reference_commit`, calibration written with CV at or under 2 %, both names exported, `tools/ranked-box-preflight.sh` passing

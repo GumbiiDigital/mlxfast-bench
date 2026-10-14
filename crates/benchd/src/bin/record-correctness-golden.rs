@@ -124,9 +124,10 @@ struct Args {
     benchmark_steps: usize,
     /// The speculative `spec` the free-run `benchmark` block is recorded UNDER
     /// (`--benchmark-spec`). `None` sends no spec, which every engine serves serial: the serial
-    /// timed oracle. `Some(mtp:D)` records the per-depth oracle at draft depth D through
-    /// `free_decode_begin_spec`, for an engine that takes the decoder per request (the MLX
-    /// bench-worker). An engine whose spec is fixed at boot (the CUDA serve-up) needs no flag.
+    /// timed oracle. `Some(mtp:D)` / `Some(dflash:D)` records the per-depth oracle at draft depth
+    /// D through `free_decode_begin_spec`: the engine runs that speculative decoder, so the oracle
+    /// is the stream the timed leg replays (on the CUDA serve-up, the resident booted at that
+    /// spec).
     benchmark_spec: Option<bench_protocol::SpecConfig>,
     provenance_repo: String,
     provenance_rev: String,
@@ -141,7 +142,7 @@ USAGE:
     record-correctness-golden --worker-bin <PATH> --weights <TARGET_DIR> \\
         --prompt-tokens <FILE> --case-name <NAME> [--prompt-tokens <FILE> --case-name <NAME> ...] \\
         [--steps 1024] [--stop-token <ID> ...] \\
-        [--benchmark-free-run [--benchmark-steps 128] [--benchmark-spec serial|mtp:<D>]] \\
+        [--benchmark-free-run [--benchmark-steps 128] [--benchmark-spec serial|mtp:<D>|dflash:<D>]] \\
         --out <GOLDEN.json> [--backend live|mock] \\
         [--model-provenance-repo <REPO>] [--model-provenance-rev <40-HEX>]
 
@@ -167,9 +168,9 @@ FLAGS:
                           >= BENCHMARK_DECODE_STEPS: an oracle shorter than the window it must verify
                           is invalid. Only meaningful with --benchmark-free-run.
     --benchmark-spec <S>  the spec the free-run block is recorded under: `serial` (default; no spec
-                          is sent) or `mtp:<D>` (draft depth D >= 1), the per-depth oracle for an
-                          engine that takes the decoder per request. The echo must equal the
-                          request. Requires --benchmark-free-run. cases[] stay teacher-forced.
+                          is sent), `mtp:<D>` or `dflash:<D>` (draft depth D >= 1), the per-depth
+                          oracle of that speculative decoder. The echo must honour the request.
+                          Requires --benchmark-free-run. cases[] stay teacher-forced.
     --track <TRACK-ID>    The track this golden is recorded FOR. Its model identity — model_type,
                           vocabulary bound and seed length — is what the golden declares and is
                           validated against. Falls back to env MLXFAST_QWEN_MTP_TRACK_ID; an
@@ -180,22 +181,30 @@ FLAGS:
     --backend <live|mock> Engine driver (default live). `mock` uses the in-process mock (no GPU).
 ";
 
-/// `--benchmark-spec`: `serial` (no spec is sent) or `mtp:<D>` with D >= 1.
+/// `--benchmark-spec`: `serial` (no spec is sent), `mtp:<D>` or `dflash:<D>` with D >= 1.
 fn parse_benchmark_spec(raw: &str) -> Result<Option<bench_protocol::SpecConfig>, String> {
     if raw == "serial" {
         return Ok(None);
     }
-    let depth = raw
-        .strip_prefix("mtp:")
-        .ok_or_else(|| format!("--benchmark-spec must be serial or mtp:<D>, got {raw:?}"))?
+    let (build, depth): (fn(u32) -> bench_protocol::SpecConfig, &str) =
+        if let Some(d) = raw.strip_prefix("mtp:") {
+            (bench_protocol::SpecConfig::mtp, d)
+        } else if let Some(d) = raw.strip_prefix("dflash:") {
+            (bench_protocol::SpecConfig::dflash, d)
+        } else {
+            return Err(format!(
+                "--benchmark-spec must be serial, mtp:<D> or dflash:<D>, got {raw:?}"
+            ));
+        };
+    let depth = depth
         .parse::<u32>()
         .map_err(|e| format!("--benchmark-spec {raw:?}: depth: {e}"))?;
     if depth == 0 {
         return Err(format!(
-            "--benchmark-spec {raw:?}: an MTP depth is at least 1 (serial is `serial`)"
+            "--benchmark-spec {raw:?}: a draft depth is at least 1 (serial is `serial`)"
         ));
     }
-    Ok(Some(bench_protocol::SpecConfig::mtp(depth)))
+    Ok(Some(build(depth)))
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -1283,6 +1292,23 @@ mod tests {
         assert!(err.contains("free_decode_begin"), "{err}");
 
         // `serial` sends no spec: the serial block.
+        // `dflash:<D>` records under the DFlash decoder, for an engine that runs it.
+        args.benchmark_spec = Some(bench_protocol::SpecConfig::dflash(7));
+        let mut dflash_engine = || {
+            let (session, _hello) = Session::connect(
+                MockEngine::new()
+                    .free_run_capable()
+                    .spec_modes(Some(vec!["serial".into(), "dflash".into()])),
+            )?;
+            Ok(session)
+        };
+        assert!(author_benchmark(&mut dflash_engine, &args, &cases)
+            .expect("author benchmark under dflash:7")
+            .is_some());
+        // An engine that does not run dflash refuses before the seed forward.
+        let mut spawn = mock_spawn_free_run();
+        assert!(author_benchmark(&mut spawn, &args, &cases).is_err());
+
         args.benchmark_spec = None;
         let mut spawn = mock_spawn_free_run();
         assert!(author_benchmark(&mut spawn, &args, &cases)
@@ -1291,13 +1317,19 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_spec_parses_serial_and_mtp_depths_and_refuses_the_rest() {
+    fn benchmark_spec_parses_serial_mtp_and_dflash_depths_and_refuses_the_rest() {
         assert_eq!(parse_benchmark_spec("serial").unwrap(), None);
         assert_eq!(
             parse_benchmark_spec("mtp:3").unwrap(),
             Some(bench_protocol::SpecConfig::mtp(3))
         );
-        for bad in ["mtp:0", "mtp", "mtp:x", "dflash:3", ""] {
+        assert_eq!(
+            parse_benchmark_spec("dflash:7").unwrap(),
+            Some(bench_protocol::SpecConfig::dflash(7))
+        );
+        for bad in [
+            "mtp:0", "mtp", "mtp:x", "dflash:0", "dflash", "dflash:x", "dspark:3", "",
+        ] {
             assert!(parse_benchmark_spec(bad).is_err(), "{bad:?} must refuse");
         }
         // The spec selects the decoder of the free-run block, so it needs that block.
