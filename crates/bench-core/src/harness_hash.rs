@@ -22,7 +22,7 @@
 //!   `Sources/MLXFastTrustedHarness/QwenRuntimePreflight.swift` — `QwenRuntime.harnessHashRoots`,
 //!   `QwenRuntime.harnessHashRootFiles(baseDirectory:)` and `QwenRuntime.harnessHash()`;
 //! * the CUDA engine's equivalent, over that engine's own roster surface (`harness/`, `vllm/`,
-//!   and for the Bonsai track `llama.cpp/`).
+//!   and `llama.cpp/` for a track that runs llama.cpp).
 //!
 //! Both compute the SAME algorithm over the roots that EXIST in their respective trees. This port is
 //! byte-compatible with each: the same bytes go into SHA256, in the same order, so a benchd-computed
