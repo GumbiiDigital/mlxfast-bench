@@ -4675,6 +4675,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             std::env::var(baseline::BASELINE_CALIBRATION_ENV)
                 .ok()
                 .as_deref(),
+            baseline::max_cv_percent_of_contract(declared_contract),
         )?;
         let box_name = baseline::resolve_box_name(
             args.box_name.as_deref(),
@@ -8075,7 +8076,12 @@ mod tests {
         assert!(parsed.box_name.is_none());
         let err = baseline::resolve_workspace(None, None).unwrap_err();
         assert!(err.contains(baseline::BASELINE_WORKSPACE_MISSING), "{err}");
-        let err = baseline::load_calibration(None, None).unwrap_err();
+        let err = baseline::load_calibration(
+            None,
+            None,
+            bench_core::constants::CALIBRATION_MAX_CV_PERCENT,
+        )
+        .unwrap_err();
         assert!(
             err.contains(baseline::BASELINE_CALIBRATION_MISSING),
             "{err}"

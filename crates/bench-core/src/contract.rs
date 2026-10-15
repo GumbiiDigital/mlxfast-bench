@@ -235,6 +235,11 @@ pub struct Contract {
     /// control leg is measured live and carries its own health band.
     #[serde(default)]
     pub prefill_band_down_enabled: Option<bool>,
+    /// The per-track MAXIMUM sample CV percent a calibration's legs may show on either axis.
+    /// Absent means the benchd default [`crate::constants::CALIBRATION_MAX_CV_PERCENT`]: a quiet
+    /// track keeps 2.0, while a noisier box fleet declares its own ceiling here.
+    #[serde(default)]
+    pub calibration_max_cv_percent: Option<f64>,
     /// The DECODE weight of the published composite ([`ScoringWeights::decode`], 0.75 on every
     /// track scored so far).
     ///
@@ -341,6 +346,7 @@ impl Contract {
         decode_band_down_tolerance: None,
         decode_band_down_enabled: None,
         prefill_band_down_enabled: None,
+        calibration_max_cv_percent: None,
         score_decode_weight: None,
         score_prefill_weight: None,
         correctness_steps: None,

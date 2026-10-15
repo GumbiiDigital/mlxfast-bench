@@ -254,10 +254,11 @@ fn is_commit_sha40(s: &str) -> bool {
 }
 
 impl BaselineCalibration {
-    /// Parse and VALIDATE one calibration file's bytes. A version 1 or 2 file refuses as
-    /// [`BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE`]; every other refusal names
+    /// Parse and VALIDATE one calibration file's bytes against the track's `max_cv_percent` (the
+    /// same ceiling the capture used, resolved by [`max_cv_percent_of_contract`]). A version 1 or
+    /// 2 file refuses as [`BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE`]; every other refusal names
     /// [`BASELINE_CALIBRATION_INVALID`] and the field that failed.
-    pub fn parse(bytes: &[u8]) -> Result<BaselineCalibration, String> {
+    pub fn parse(bytes: &[u8], max_cv_percent: f64) -> Result<BaselineCalibration, String> {
         let invalid = |e: serde_json::Error| format!("{BASELINE_CALIBRATION_INVALID}: {e}");
         let CalibrationVersion { version } = serde_json::from_slice(bytes).map_err(invalid)?;
         let calibration: BaselineCalibration = match version {
@@ -279,11 +280,11 @@ impl BaselineCalibration {
                 ))
             }
         };
-        calibration.validate()?;
+        calibration.validate(max_cv_percent)?;
         Ok(calibration)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, max_cv_percent: f64) -> Result<(), String> {
         let bad = |what: &str| Err(format!("{BASELINE_CALIBRATION_INVALID}: {what}"));
         if self.track_id.trim().is_empty() {
             return bad("track_id is empty");
@@ -316,7 +317,7 @@ impl BaselineCalibration {
                     entry.prompt
                 ));
             }
-            entry.validate()?;
+            entry.validate(max_cv_percent)?;
         }
         Ok(())
     }
@@ -420,8 +421,9 @@ impl BaselineCalibration {
 }
 
 impl PromptCalibration {
-    /// Every refusal names the prompt and the field that failed.
-    fn validate(&self) -> Result<(), String> {
+    /// Every refusal names the prompt and the field that failed. `max_cv_percent` is the track's
+    /// stored-pair admission ceiling, resolved by [`max_cv_percent_of_contract`].
+    fn validate(&self, max_cv_percent: f64) -> Result<(), String> {
         let bad = |what: &str| {
             Err(format!(
                 "{BASELINE_CALIBRATION_INVALID}: prompt {:?}: {what}",
@@ -451,7 +453,7 @@ impl PromptCalibration {
                 return bad(&format!("{name} is {value}, not a finite positive number"));
             }
         }
-        let max_cv = CALIBRATION_MAX_CV_PERCENT / 100.0;
+        let max_cv = max_cv_percent / 100.0;
         for (name, value) in [
             ("prefill_cv", self.prefill_cv),
             ("decode_cv", self.decode_cv),
@@ -464,7 +466,7 @@ impl PromptCalibration {
             if value > max_cv {
                 return Err(format!(
                     "{CALIBRATION_CV_EXCEEDED}: prompt {:?}: {name} is {value} \
-                     ({:.4}%), above the fixed maximum of {CALIBRATION_MAX_CV_PERCENT}%",
+                     ({:.4}%), above the track's maximum of {max_cv_percent}%",
                     self.prompt,
                     value * 100.0
                 ));
@@ -545,10 +547,13 @@ pub fn resolve_workspace(flag: Option<&Path>, env: Option<&str>) -> Result<PathB
 }
 
 /// Resolve, READ and validate the per-box calibration file from the flag, else
-/// [`BASELINE_CALIBRATION_ENV`]. Returns the parsed file with the digest of its bytes.
+/// [`BASELINE_CALIBRATION_ENV`]. Returns the parsed file with the digest of its bytes. The file is
+/// re-validated against the track's `max_cv_percent` — the same ceiling the capture used — so a
+/// file captured just under a raised track ceiling still loads on that track.
 pub fn load_calibration(
     flag: Option<&Path>,
     env: Option<&str>,
+    max_cv_percent: f64,
 ) -> Result<LoadedCalibration, String> {
     let path = match (flag, env.map(str::trim).filter(|s| !s.is_empty())) {
         (Some(p), _) => p.to_path_buf(),
@@ -567,7 +572,7 @@ pub fn load_calibration(
             path.display()
         )
     })?;
-    let calibration = BaselineCalibration::parse(&bytes)
+    let calibration = BaselineCalibration::parse(&bytes, max_cv_percent)
         .map_err(|e| format!("{e} (calibration file {})", path.display()))?;
     Ok(LoadedCalibration {
         calibration,
@@ -891,22 +896,39 @@ pub fn control_leg_seconds(legs: &[bench_runner::TimingResult]) -> (Vec<f64>, Ve
         .unzip()
 }
 
+/// The TRACK'S maximum sample CV percent, resolved from the fixture: the declared
+/// `calibration_max_cv_percent`, or the benchd default [`CALIBRATION_MAX_CV_PERCENT`] when the
+/// fixture is silent. ONE spelling, so the capture-time gate and the load-time re-validation read
+/// the same per-track value — a file captured just under a 3.0 track must still load on that track.
+pub fn max_cv_percent_of_contract(contract: &Contract) -> f64 {
+    contract
+        .calibration_max_cv_percent
+        .unwrap_or(CALIBRATION_MAX_CV_PERCENT)
+}
+
 /// Author the calibration file from the control legs `benchd calibrate-baseline` measured, one
 /// entry per prompt, in the order given.
 ///
-/// The gate is the SAME fixed one the stored-pair capture used: a per-axis SAMPLE coefficient of
-/// variation above [`CALIBRATION_MAX_CV_PERCENT`] refuses by name — a box whose legs spread that
-/// wide has no mean that describes it, so it has no band either. Each entry records `band`, which
-/// the caller resolves with [`HealthBand::of_contract`] from the same fixture the scored run reads.
+/// The gate is the SAME one the stored-pair capture used: a per-axis SAMPLE coefficient of
+/// variation above the track's `max_cv_percent` refuses by name — a box whose legs spread that
+/// wide has no mean that describes it, so it has no band either. The ceiling is the track's,
+/// resolved by [`max_cv_percent_of_contract`], and defaults to [`CALIBRATION_MAX_CV_PERCENT`].
+/// Each entry records `band`, which the caller resolves with [`HealthBand::of_contract`] from the
+/// same fixture the scored run reads.
 pub fn calibration_from_passes(
     identity: &CalibrationIdentity<'_>,
     prompts: &[PromptPasses<'_>],
     band: HealthBand,
     gates: Vec<crate::quiescegate::GateRecord>,
+    max_cv_percent: f64,
 ) -> Result<BaselineCalibration, String> {
     let mut entries = Vec::with_capacity(prompts.len());
     for passes in prompts {
-        entries.push(prompt_calibration_from_passes(passes, band)?);
+        entries.push(prompt_calibration_from_passes(
+            passes,
+            band,
+            max_cv_percent,
+        )?);
     }
     let calibration = BaselineCalibration {
         version: CALIBRATION_VERSION,
@@ -919,7 +941,7 @@ pub fn calibration_from_passes(
         gates,
     };
     // The file this run writes must be one this same benchd would accept.
-    calibration.validate()?;
+    calibration.validate(max_cv_percent)?;
     Ok(calibration)
 }
 
@@ -927,6 +949,7 @@ pub fn calibration_from_passes(
 fn prompt_calibration_from_passes(
     passes: &PromptPasses<'_>,
     band: HealthBand,
+    max_cv_percent: f64,
 ) -> Result<PromptCalibration, String> {
     let PromptPasses {
         prompt,
@@ -963,10 +986,10 @@ fn prompt_calibration_from_passes(
                  sample CV"
             )
         })?;
-        if cv > CALIBRATION_MAX_CV_PERCENT {
+        if cv > max_cv_percent {
             return Err(format!(
                 "{CALIBRATION_CV_EXCEEDED}: prompt {prompt:?}: the {axis} legs vary by {cv:.4}%, \
-                 above the fixed maximum of {CALIBRATION_MAX_CV_PERCENT}%; this box is not quiet \
+                 above the track's maximum of {max_cv_percent}%; this box is not quiet \
                  enough for a mean to describe it"
             ));
         }
@@ -1049,7 +1072,10 @@ mod tests {
     }
 
     fn parse(doc: &serde_json::Value) -> Result<BaselineCalibration, String> {
-        BaselineCalibration::parse(serde_json::to_vec(doc).unwrap().as_slice())
+        BaselineCalibration::parse(
+            serde_json::to_vec(doc).unwrap().as_slice(),
+            CALIBRATION_MAX_CV_PERCENT,
+        )
     }
 
     /// A track fixture that declares the band shape: `decode_up` is its decode up tolerance; the
@@ -1194,6 +1220,7 @@ mod tests {
                 }],
                 HealthBand::of_contract(&fixture),
                 Vec::new(),
+                CALIBRATION_MAX_CV_PERCENT,
             )
             .unwrap();
             let entry = &written.prompts[0];
@@ -1253,8 +1280,11 @@ mod tests {
         assert_eq!(entry.prefill_band_low, 0.95);
         assert_eq!(entry.decode_band_high, 1.02);
         // Round-trip: what this benchd writes is what it reads.
-        let round_tripped =
-            BaselineCalibration::parse(serde_json::to_string(&cal).unwrap().as_bytes()).unwrap();
+        let round_tripped = BaselineCalibration::parse(
+            serde_json::to_string(&cal).unwrap().as_bytes(),
+            CALIBRATION_MAX_CV_PERCENT,
+        )
+        .unwrap();
         assert_eq!(round_tripped, cal);
     }
 
@@ -1480,7 +1510,7 @@ mod tests {
         let err = parse(&doc).unwrap_err();
         assert!(err.contains("passes"), "{err}");
 
-        // A file whose recorded CV is above the fixed maximum is refused at READ time too, not
+        // A file whose recorded CV is above the track's maximum is refused at READ time too, not
         // only when it is written: the file is the only evidence a reader has.
         let mut doc = valid_document();
         doc["prompts"][0]["decode_cv"] = json!(0.021);
@@ -1773,6 +1803,7 @@ mod tests {
                     }],
                     HealthBand::DEFAULT,
                     Vec::new(),
+                    CALIBRATION_MAX_CV_PERCENT,
                 );
                 if cv < CALIBRATION_MAX_CV_PERCENT {
                     assert!(got.is_ok(), "{axis} at {cv}%: {:?}", got.err());
@@ -1793,6 +1824,87 @@ mod tests {
             assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
             assert!(err.contains(field), "{err}");
         }
+    }
+
+    /// The CV ceiling is a PER-TRACK contract field. A track that declares
+    /// `calibration_max_cv_percent: 3.0` ADMITS a per-axis CV of 2.5 % that the 2.0 default
+    /// REFUSES — on the capture path (`calibration_from_passes`) and on the load/parse path
+    /// (`BaselineCalibration::parse`), both reading the ceiling the fixture resolves through
+    /// `max_cv_percent_of_contract`. A silent fixture still resolves to the benchd default.
+    #[test]
+    fn a_track_may_raise_the_cv_ceiling_above_the_default_on_both_paths() {
+        // The resolver: a declared ceiling wins; silence keeps the benchd default.
+        let raised = Contract {
+            calibration_max_cv_percent: Some(3.0),
+            ..Contract::NONE_DECLARED
+        };
+        assert_eq!(max_cv_percent_of_contract(&raised), 3.0);
+        assert_eq!(
+            max_cv_percent_of_contract(&Contract::NONE_DECLARED),
+            CALIBRATION_MAX_CV_PERCENT
+        );
+        let default_ceiling = max_cv_percent_of_contract(&Contract::NONE_DECLARED);
+        let raised_ceiling = max_cv_percent_of_contract(&raised);
+
+        // Legs m(1-k), m(1-k), m(1+k), m(1+k) have a sample CV of 2k/sqrt(3).
+        fn legs(mean: f64, cv_percent: f64) -> Vec<f64> {
+            let k = cv_percent / 100.0 * 3f64.sqrt() / 2.0;
+            vec![
+                mean * (1.0 - k),
+                mean * (1.0 - k),
+                mean * (1.0 + k),
+                mean * (1.0 + k),
+            ]
+        }
+        let reference = "a".repeat(40);
+        let benchd = "b".repeat(40);
+        let identity = CalibrationIdentity {
+            track_id: "qwen3.8-125b-a6b-mlx-v1",
+            box_name: "test-box",
+            reference_commit: &reference,
+            benchd_source_commit: &benchd,
+            captured_at: "2026-10-09T00:00:00Z",
+        };
+        let prefill_legs = legs(0.001, 2.5);
+        let decode_legs = legs(0.030, 2.5);
+        let measured = crate::capture::sample_cv_percent(&decode_legs).unwrap();
+        assert!((measured - 2.5).abs() < 1e-9, "{measured} != 2.5");
+        let passes = [PromptPasses {
+            prompt: "p1",
+            prefill_legs: &prefill_legs,
+            decode_legs: &decode_legs,
+        }];
+
+        // CAPTURE PATH: the default refuses 2.5 %, the raised ceiling admits it.
+        let refused = calibration_from_passes(
+            &identity,
+            &passes,
+            HealthBand::DEFAULT,
+            Vec::new(),
+            default_ceiling,
+        )
+        .unwrap_err();
+        assert!(refused.contains(CALIBRATION_CV_EXCEEDED), "{refused}");
+        let admitted = calibration_from_passes(
+            &identity,
+            &passes,
+            HealthBand::DEFAULT,
+            Vec::new(),
+            raised_ceiling,
+        )
+        .expect("a 3.0 track admits a 2.5% capture");
+
+        // LOAD/PARSE PATH: the same file the 3.0 track wrote re-validates under 3.0 and refuses
+        // under the 2.0 default — the capture-time and load-time gates read the same ceiling.
+        let bytes = serde_json::to_vec(&admitted).unwrap();
+        let reload_refused = BaselineCalibration::parse(&bytes, default_ceiling).unwrap_err();
+        assert!(
+            reload_refused.contains(CALIBRATION_CV_EXCEEDED),
+            "{reload_refused}"
+        );
+        let reloaded = BaselineCalibration::parse(&bytes, raised_ceiling)
+            .expect("a file captured under 3.0 re-validates under 3.0");
+        assert_eq!(reloaded, admitted);
     }
 
     #[test]
@@ -1819,6 +1931,7 @@ mod tests {
             )],
             HealthBand::DEFAULT,
             Vec::new(),
+            CALIBRATION_MAX_CV_PERCENT,
         )
         .unwrap();
         let entry = &cal.prompts[0];
@@ -1838,6 +1951,7 @@ mod tests {
             )],
             HealthBand::DEFAULT,
             Vec::new(),
+            CALIBRATION_MAX_CV_PERCENT,
         )
         .unwrap_err();
         assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
@@ -1851,7 +1965,7 @@ mod tests {
         let out = dir.join("baseline-calibration.json");
         let sha = write_calibration(&out, &cal).unwrap();
         assert_eq!(sha.len(), 64, "{sha}");
-        let loaded = load_calibration(Some(&out), None).unwrap();
+        let loaded = load_calibration(Some(&out), None, CALIBRATION_MAX_CV_PERCENT).unwrap();
         assert_eq!(loaded.calibration, cal);
         assert_eq!(loaded.sha256, sha);
         assert_eq!(
@@ -1873,6 +1987,7 @@ mod tests {
             &[passes(&[0.001], &[0.030])],
             HealthBand::DEFAULT,
             Vec::new(),
+            CALIBRATION_MAX_CV_PERCENT,
         )
         .unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
@@ -1908,6 +2023,7 @@ mod tests {
                 }],
                 HealthBand::DEFAULT,
                 Vec::new(),
+                CALIBRATION_MAX_CV_PERCENT,
             )
             .unwrap();
             serde_json::to_string(&cal).unwrap()
@@ -1916,7 +2032,7 @@ mod tests {
         for seeds in [[0.40, 0.40, 0.40], [0.01, 2.0, 7.5]] {
             assert_eq!(author(seeds), base, "seeds {seeds:?} moved the calibration");
         }
-        let cal = BaselineCalibration::parse(base.as_bytes()).unwrap();
+        let cal = BaselineCalibration::parse(base.as_bytes(), CALIBRATION_MAX_CV_PERCENT).unwrap();
         let mean = cal.prompts[0].decode_seconds_per_token_mean;
         let expected = windows.iter().sum::<f64>()
             / 3.0
@@ -1973,6 +2089,7 @@ mod tests {
             ],
             HealthBand::DEFAULT,
             Vec::new(),
+            CALIBRATION_MAX_CV_PERCENT,
         )
         .unwrap();
         let prompts: Vec<&str> = cal.prompts.iter().map(|e| e.prompt.as_str()).collect();
@@ -1990,7 +2107,12 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(sealed["version"], CALIBRATION_VERSION);
         assert_eq!(sealed["prompts"][1]["prompt"], "kelp");
-        assert_eq!(load_calibration(Some(&out), None).unwrap().calibration, cal);
+        assert_eq!(
+            load_calibration(Some(&out), None, CALIBRATION_MAX_CV_PERCENT)
+                .unwrap()
+                .calibration,
+            cal
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2038,8 +2160,14 @@ mod tests {
             point(2, "prefill", 30),
             point(2, "decode", 45),
         ];
-        let cal = calibration_from_passes(&identity, &prompts, HealthBand::DEFAULT, gates.clone())
-            .unwrap();
+        let cal = calibration_from_passes(
+            &identity,
+            &prompts,
+            HealthBand::DEFAULT,
+            gates.clone(),
+            CALIBRATION_MAX_CV_PERCENT,
+        )
+        .unwrap();
         assert_eq!(cal.gates, gates);
 
         let dir = std::env::temp_dir().join(format!(
@@ -2049,7 +2177,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("baseline-calibration.json");
         write_calibration(&out, &cal).unwrap();
-        let loaded = load_calibration(Some(&out), None).unwrap();
+        let loaded = load_calibration(Some(&out), None, CALIBRATION_MAX_CV_PERCENT).unwrap();
         assert_eq!(
             loaded.calibration.gates, gates,
             "the file keeps every point"
@@ -2064,19 +2192,27 @@ mod tests {
 
         // NO gate points (the gates were off): the key is omitted, so the file's key set is the
         // one every calibration file before this change had.
-        let ungated =
-            calibration_from_passes(&identity, &prompts, HealthBand::DEFAULT, Vec::new()).unwrap();
+        let ungated = calibration_from_passes(
+            &identity,
+            &prompts,
+            HealthBand::DEFAULT,
+            Vec::new(),
+            CALIBRATION_MAX_CV_PERCENT,
+        )
+        .unwrap();
         let out = dir.join("ungated.json");
         write_calibration(&out, &ungated).unwrap();
         let sealed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         assert!(sealed.get("gates").is_none());
         // ...and this benchd still reads it.
-        assert!(load_calibration(Some(&out), None)
-            .unwrap()
-            .calibration
-            .gates
-            .is_empty());
+        assert!(
+            load_calibration(Some(&out), None, CALIBRATION_MAX_CV_PERCENT)
+                .unwrap()
+                .calibration
+                .gates
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
