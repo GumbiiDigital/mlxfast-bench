@@ -804,6 +804,7 @@ SUBCOMMANDS:
     correctness     Run the correctness gate end-to-end; exit 0 = pass, 1 = fail
     validate-golden Integrity-pin + load-validate a golden (no engine); exit 0 if accepted
     validate-weights Preflight the transformed-weights dir + size cap (no engine); exit 0 if accepted
+    validate-calibration  Parse + validate a per-box calibration against the track's CV ceiling (no engine); exit 0 if accepted
     parity-diff     Diff two score.json (benchd vs swift); exit 0 = PARITY: PASS
     prefill-decompose  Fit prefill elapsed_ms = c + m*n across sizes (M-5 residual attribution)
     measure-job     Option-A seam 2: PAIRED timing over candidate/baseline workspaces → results.json
@@ -928,6 +929,25 @@ engine, resolves no baseline, and writes no artifact.
 Exit 0 = printed; non-zero with the reason on stderr on a bad flag or IO error.
 ";
 
+const VALIDATE_CALIBRATION_USAGE: &str = "\
+benchd validate-calibration — preflight a per-box calibration file (no engine spawned)
+
+USAGE:
+    benchd validate-calibration --calibration <PATH> [--contract <PATH>]
+
+Parses the calibration file and re-validates it with the SAME `baseline::load_calibration` the
+ranked path runs — version, identity, bands, and the per-axis sample CV ceiling. The ceiling is
+the TRACK'S, resolved from `--contract` by `baseline::max_cv_percent_of_contract`: the fixture's
+`calibration_max_cv_percent` when it declares one (CUDA sets 3.0), else the benchd default of
+2.0. There is ONE resolver and ONE ceiling, so a box preflight can call this instead of carrying
+its own copy of the CV gate — a file captured just under a raised track ceiling loads here too.
+
+Omitting `--contract` resolves against the benchd default (2.0), the same stand-in a run given no
+fixture uses.
+
+Exit 0 = accepted, 1 = rejected (with the reason on stderr), 2 = usage / unreadable contract.
+";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = match args.first() {
@@ -946,6 +966,11 @@ fn main() -> ExitCode {
         // #90 item 3: the WEIGHTS-half preflight (Swift `BenchmarkPreflight` weights checks +
         // `MLXFAST_MAX_WEIGHTS_BYTES`). `validate-golden` covers only the golden half.
         "validate-weights" => run_validate_weights(&args[1..]),
+        // The CALIBRATION-file preflight: parse + validate a per-box calibration against the
+        // track's `calibration_max_cv_percent` ceiling, resolved from `--contract` by the SAME
+        // `baseline::max_cv_percent_of_contract` the capture and the ranked load read. ONE number,
+        // ONE resolver, so the box preflight can no longer keep its own copy of the CV gate.
+        "validate-calibration" => run_validate_calibration(&args[1..]),
         // §T: the parity verdict tool (Rust port of scripts/parity-diff.py). Shares the real
         // ScoreMetrics type; the bucket roster is pinned to the schema by a cargo test.
         "parity-diff" => parity::run(&args[1..]),
@@ -6288,6 +6313,87 @@ fn execute_validate_weights(args: &ValidateWeightsArgs) -> Result<u8, (u8, Strin
     }
 }
 
+/// The `validate-calibration` command line. [`VALIDATE_CALIBRATION_USAGE`] is its prose; this is
+/// its grammar.
+static VALIDATE_CALIBRATION_FLAGS: &[FlagSpec] = &[
+    FlagSpec::value(&["--calibration"]).required(),
+    // OPTIONAL: the track fixture that DECLARES the CV ceiling. Absent ⇒ the benchd default,
+    // exactly as `contract::declared(None)` resolves a run given no fixture.
+    FlagSpec::value(&["--contract"]),
+];
+
+/// The `validate-calibration` arguments, built out of [`VALIDATE_CALIBRATION_FLAGS`].
+struct ValidateCalibrationArgs {
+    calibration: PathBuf,
+    contract: Option<PathBuf>,
+}
+
+/// The `validate-calibration` subcommand: its name, its usage prose, its flag table and its parse.
+static VALIDATE_CALIBRATION_CLI: CliSpec<ValidateCalibrationArgs> = CliSpec {
+    name: "validate-calibration",
+    usage: VALIDATE_CALIBRATION_USAGE,
+    flags: VALIDATE_CALIBRATION_FLAGS,
+    parse: parse_validate_calibration_args,
+};
+
+fn parse_validate_calibration_args(
+    args: &[String],
+) -> Result<Option<ValidateCalibrationArgs>, String> {
+    let Some(flags) = parse_flags(args, VALIDATE_CALIBRATION_CLI.flags)? else {
+        // `-h`/`--help`.
+        return Ok(None);
+    };
+    build_validate_calibration_args(&flags).map(Some)
+}
+
+fn build_validate_calibration_args(flags: &ParsedFlags) -> Result<ValidateCalibrationArgs, String> {
+    Ok(ValidateCalibrationArgs {
+        calibration: flags
+            .path("--calibration")
+            .ok_or_else(|| flags.missing_required("--calibration"))?,
+        contract: flags.path("--contract"),
+    })
+}
+
+/// `validate-calibration`: the per-box calibration-file preflight. The CV ceiling is resolved from
+/// the contract by the SAME [`baseline::max_cv_percent_of_contract`] the capture and the ranked
+/// load use, so no caller carries its own CV number. Exit 0 = accepted, 1 = rejected, 2 = usage /
+/// unreadable contract.
+fn run_validate_calibration(args: &[String]) -> ExitCode {
+    run_cli(
+        &VALIDATE_CALIBRATION_CLI,
+        args,
+        execute_validate_calibration,
+    )
+}
+
+fn execute_validate_calibration(args: &ValidateCalibrationArgs) -> Result<u8, (u8, String)> {
+    // Resolve the TRACK'S CV ceiling from the fixture — the one spelling the capture and the
+    // ranked load read. A run given no `--contract` resolves against the benchd default, exactly
+    // as `contract::declared(None)` does.
+    let loaded = args
+        .contract
+        .as_deref()
+        .map(contract::load)
+        .transpose()
+        .map_err(|m| (2, m))?;
+    let declared = contract::declared(loaded.as_ref());
+    let max_cv = baseline::max_cv_percent_of_contract(declared);
+    match baseline::load_calibration(Some(&args.calibration), None, max_cv) {
+        Ok(cal) => {
+            eprintln!(
+                "benchd validate-calibration: ACCEPT {} (box={}, prompts={}, max_cv={}%)",
+                cal.path.display(),
+                cal.calibration.box_name,
+                cal.calibration.prompts.len(),
+                max_cv,
+            );
+            Ok(0)
+        }
+        Err(e) => Err((1, format!("REJECT: {e}"))),
+    }
+}
+
 /// The `weights-digest` command line. [`WEIGHTS_DIGEST_USAGE`] is its prose; this is its grammar.
 static WEIGHTS_DIGEST_FLAGS: &[FlagSpec] = &[FlagSpec::value(&["--weights"]).required()];
 
@@ -10311,6 +10417,111 @@ mod tests {
     }
 
     #[test]
+    fn validate_calibration_table_parses_its_whole_flag_set() {
+        let full = argv(&["--calibration", "cal.json", "--contract", "c.json"]);
+        let parsed = parse_validate_calibration_args(&full).unwrap().unwrap();
+        assert_eq!(parsed.calibration, PathBuf::from("cal.json"));
+        assert_eq!(parsed.contract, Some(PathBuf::from("c.json")));
+
+        // `--contract` is optional: absent ⇒ the benchd default ceiling.
+        let bare = argv(&["--calibration", "cal.json"]);
+        assert_eq!(
+            parse_validate_calibration_args(&bare)
+                .unwrap()
+                .unwrap()
+                .contract,
+            None
+        );
+
+        assert_covers_table(VALIDATE_CALIBRATION_FLAGS, &[&full]);
+        assert_usage_documents_table(VALIDATE_CALIBRATION_USAGE, VALIDATE_CALIBRATION_FLAGS);
+        assert_required_flags_refuse(
+            VALIDATE_CALIBRATION_FLAGS,
+            |args| parse_validate_calibration_args(args).map(|p| p.map(|_| ())),
+            &full,
+        );
+    }
+
+    /// THE SINGLE-SOURCE PROOF for the preflight/validation path. The `validate-calibration`
+    /// command resolves the CV ceiling from `--contract` through the SAME
+    /// `baseline::max_cv_percent_of_contract` the capture and the ranked load use. A file whose
+    /// per-axis CV is 2.5 % is ADMITTED under a `calibration_max_cv_percent: 3.0` contract and
+    /// REFUSED when no contract raises the ceiling (the 2.0 default) — so the box preflight that
+    /// calls this can no longer hold a 2 % constant that re-breaks every CUDA deploy.
+    #[test]
+    fn validate_calibration_admits_two_and_a_half_percent_only_under_a_raised_contract() {
+        // Legs m(1-k), m(1-k), m(1+k), m(1+k) have a sample CV of 2k/sqrt(3).
+        fn legs(mean: f64, cv_percent: f64) -> Vec<f64> {
+            let k = cv_percent / 100.0 * 3f64.sqrt() / 2.0;
+            vec![
+                mean * (1.0 - k),
+                mean * (1.0 - k),
+                mean * (1.0 + k),
+                mean * (1.0 + k),
+            ]
+        }
+        let reference = "a".repeat(40);
+        let benchd = "b".repeat(40);
+        let identity = baseline::CalibrationIdentity {
+            track_id: "bonsai2-9b-cuda-v1",
+            box_name: "test-box",
+            reference_commit: &reference,
+            benchd_source_commit: &benchd,
+            captured_at: "2026-10-09T00:00:00Z",
+        };
+        let prefill_legs = legs(0.001, 2.5);
+        let decode_legs = legs(0.030, 2.5);
+        let passes = [baseline::PromptPasses {
+            prompt: "p1",
+            prefill_legs: &prefill_legs,
+            decode_legs: &decode_legs,
+        }];
+        // AUTHOR the 2.5 % file under a 3.0 ceiling (the capture a CUDA box would write).
+        let authored = baseline::calibration_from_passes(
+            &identity,
+            &passes,
+            baseline::HealthBand::DEFAULT,
+            Vec::new(),
+            3.0,
+        )
+        .expect("a 3.0 ceiling admits a 2.5% capture");
+
+        let dir = std::env::temp_dir().join(format!(
+            "benchd-validate-cal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cal_path = dir.join("calibration.json");
+        std::fs::write(&cal_path, serde_json::to_vec(&authored).unwrap()).unwrap();
+        let raised_contract = dir.join("raised.json");
+        std::fs::write(&raised_contract, br#"{"calibration_max_cv_percent": 3.0}"#).unwrap();
+
+        // ADMITTED under the 3.0 contract — the preflight path reads the per-track ceiling.
+        let admit = execute_validate_calibration(&ValidateCalibrationArgs {
+            calibration: cal_path.clone(),
+            contract: Some(raised_contract),
+        });
+        assert_eq!(admit, Ok(0), "a 2.5% file must load under a 3.0 contract");
+
+        // REFUSED under the 2.0 default (no contract) — the same file, the same resolver.
+        let refuse = execute_validate_calibration(&ValidateCalibrationArgs {
+            calibration: cal_path,
+            contract: None,
+        });
+        match refuse {
+            Err((1, msg)) => assert!(
+                msg.contains(bench_core::constants::CALIBRATION_CV_EXCEEDED),
+                "{msg}"
+            ),
+            other => panic!("a 2.5% file must refuse under the 2.0 default, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn weights_digest_table_parses_its_whole_flag_set() {
         let full = argv(&["--weights", "w-dir"]);
         let parsed = parse_weights_digest_args(&full).unwrap().unwrap();
@@ -10348,6 +10559,7 @@ mod tests {
             |a: &[String]| parse_validate_golden_args(a).map(|p| p.map(|_| ())),
             |a: &[String]| parse_correctness_args(a).map(|p| p.map(|_| ())),
             |a: &[String]| parse_validate_weights_args(a).map(|p| p.map(|_| ())),
+            |a: &[String]| parse_validate_calibration_args(a).map(|p| p.map(|_| ())),
             |a: &[String]| parse_weights_digest_args(a).map(|p| p.map(|_| ())),
         ] {
             assert!(parse(&argv(&["--help"])).unwrap().is_none());
