@@ -88,7 +88,7 @@ REFUSALS (by name):
     GOLDEN-COUNT-MISMATCH          --prompt was given, but not once per --golden
     BASELINE-CALIBRATION-INVALID   two goldens name the same prompt
     SERIAL-CONTROL-LEG-FAILED      a control leg did not complete
-    CALIBRATION-CV-EXCEEDED        the legs vary by more than the fixed maximum
+    CALIBRATION-CV-EXCEEDED        the legs vary by more than the track's maximum
 ";
 
 /// The environment variable naming the benchd source commit, for boxes that run a deployed binary.
@@ -478,6 +478,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         &prompt_passes,
         baseline::HealthBand::of_contract(&loaded.contract),
         gate_log.records(),
+        baseline::max_cv_percent_of_contract(&loaded.contract),
     )?;
     let sha256 = baseline::write_calibration(&args.out, &calibration)?;
     eprintln!(

@@ -7231,6 +7231,7 @@ mod tests {
             }],
             crate::baseline::HealthBand::DEFAULT,
             Vec::new(),
+            bench_core::constants::CALIBRATION_MAX_CV_PERCENT,
         )
         .unwrap();
         assert_eq!(
