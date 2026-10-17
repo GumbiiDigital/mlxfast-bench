@@ -369,6 +369,10 @@ pub struct ScoreMetrics {
     /// payload; absent on every other path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub official_pair_combine: Option<bench_core::contract::PairCombine>,
+    /// ADDITIVE — the rule that checked the paired run's control legs. `mean_of_legs` is sealed
+    /// on every mean-mode payload. Absent means `per_leg`, which keeps the old sealed bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_band_mode: Option<bench_core::contract::ControlBandMode>,
     /// ADDITIVE — the SCORED pair's [`PairedLegRecord::token_mismatch_count`]. Absent on a path
     /// with no paired legs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,6 +657,7 @@ impl ScoreMetrics {
             timed_token_tolerance_per_thousand: self.timed_token_tolerance_per_thousand,
             timed_token_near_tie_relative_gap: self.timed_token_near_tie_relative_gap,
             official_pair_combine: self.official_pair_combine,
+            control_band_mode: self.control_band_mode,
             token_mismatch_count: self.token_mismatch_count,
             token_mismatch_first_step: self.token_mismatch_first_step,
             token_mismatch_near_tie_count: self.token_mismatch_near_tie_count,
@@ -948,6 +953,7 @@ mod tests {
     /// byte-identically to before it existed.
     const ADDITIVE_METRICS_KEYS: &[&str] = &[
         "acceptance_lengths",
+        "control_band_mode",
         "effective_spec_depth",
         "effective_spec_mode",
         "engine_backend",
@@ -1033,6 +1039,7 @@ mod tests {
             timed_token_tolerance_per_thousand: Some(100),
             timed_token_near_tie_relative_gap: Some(0.05),
             official_pair_combine: Some(bench_core::contract::PairCombine::Mean),
+            control_band_mode: Some(bench_core::contract::ControlBandMode::MeanOfLegs),
             token_mismatch_count: Some(3),
             token_mismatch_first_step: Some(17),
             token_mismatch_near_tie_count: Some(2),
@@ -1523,6 +1530,7 @@ mod sealed_key_pin_tests {
                 timed_token_tolerance_per_thousand: Some(149),
                 timed_token_near_tie_relative_gap: Some(0.25),
                 official_pair_combine: Some(bench_core::contract::PairCombine::Mean),
+                control_band_mode: Some(bench_core::contract::ControlBandMode::MeanOfLegs),
                 token_mismatch_count: Some(151),
                 token_mismatch_first_step: Some(153),
                 token_mismatch_near_tie_count: Some(161),
@@ -1590,6 +1598,7 @@ mod sealed_key_pin_tests {
       "scoring_weights": "table",
       "window_shape": "table"
     },
+    "control_band_mode": "mean_of_legs",
     "correctness_seconds": 16.0,
     "decode_seconds_per_token": 3.5,
     "decode_speedup": 7.5,
