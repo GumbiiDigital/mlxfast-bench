@@ -4996,6 +4996,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 spawn_timed,
             },
             official::PairedWindow {
+                control_band_mode: declared_contract.control_band_mode.unwrap_or_default(),
                 // THE BAND SHAPE COMES FROM THE TRACK FIXTURE, resolved once above as
                 // `paired_bands` (`contract::acceptance_bands`). There is no in-tree shape left to
                 // fall back to — STEP 3 deleted the tables, so a fixture that declares none of the

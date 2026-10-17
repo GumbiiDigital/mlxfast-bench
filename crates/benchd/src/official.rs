@@ -874,6 +874,9 @@ pub struct PairedLegs<LB, LC, FB, FT> {
 /// migration, David 2026-09-15), resolved once before the run, so the platform has nothing left to
 /// decide here and is gone rather than carried unused.
 pub struct PairedWindow<G> {
+    /// THE CONTROL HEALTH GATE resolved from the track fixture. `PerLeg` is the default and can
+    /// refuse before a candidate runs. `MeanOfLegs` runs every pair, then checks the mean ratio.
+    pub control_band_mode: bench_core::contract::ControlBandMode,
     pub bands: AcceptanceBands,
     pub spec: Option<SpecConfig>,
     /// The run's RESOLVED measurement window (STEP 1, David 2026-09-15): the timed decode depth,
@@ -921,9 +924,10 @@ pub struct PairedWindow<G> {
 ///
 /// 1. **Serial-control leg** on the REFERENCE tree (`spawn_baseline`), no speculation
 ///    ([`run_serial_control_leg`]), verified against the pair's `control` golden — the SERIAL tape.
-/// 2. **Band check** of that leg against THIS BOX's calibration entry for the pair's prompt. The
-///    band is a health gate on leg 1; no number in the file is ever a denominator. Outside the
-///    band, the run dies by name and seals no score.
+/// 2. **Control health gate** against THIS BOX's calibration entry for the pair's prompt.
+///    `per_leg`, the default, checks now and refuses before the candidate. `mean_of_legs` records
+///    the ratio and checks the arithmetic mean after every pair. An earlier leg error still wins.
+///    Neither rule uses the calibration as the score denominator. A refusal seals no score.
 /// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, verified
 ///    against the pair's `candidate` golden, with the LIVE measurement from step 1 as its baseline
 ///    pair.
@@ -974,11 +978,16 @@ where
     let tolerance = window.token_tolerance_per_thousand;
     let near_tie_gap = window.near_tie_relative_gap;
     let combine = window.combine;
+    let control_band_mode = window.control_band_mode;
     let mut payload =
         official_core_paired_inner(goldens, calibration, seal, digests, commit, legs, window);
     payload.metrics.gates = gate_log.records();
     // The pair rule the run applied rides on every payload, so a reader of the score sees it.
     payload.metrics.official_pair_combine = Some(combine);
+    // The non-default control rule rides on every mean-mode payload. Per-leg bytes stay unchanged.
+    payload.metrics.control_band_mode = (control_band_mode
+        == bench_core::contract::ControlBandMode::MeanOfLegs)
+        .then_some(control_band_mode);
     // The token rule the run applied rides on every payload, so a reader of the score sees it.
     payload.metrics.timed_token_tolerance_per_thousand = tolerance;
     payload.metrics.timed_token_near_tie_relative_gap = near_tie_gap;
@@ -1011,6 +1020,7 @@ where
         mut spawn_timed,
     } = legs;
     let PairedWindow {
+        control_band_mode,
         bands,
         spec,
         window: window_shape,
@@ -1066,6 +1076,9 @@ where
     // ENGINE comes up before its worker and goes down before the next leg's comes up, so two
     // residents never hold GPU memory at once. The LAST pair's candidate session is kept open on
     // the load-once residency so the correctness gate runs over the same model residency.
+    // `mean_of_legs` needs each prompt and timing after the last pair. `per_leg` uses the same
+    // values immediately, so both modes collect one complete record per control leg.
+    let mut control_legs = Vec::with_capacity(pairs);
     let mut records: Vec<PairedLegRecord> = Vec::with_capacity(pairs);
     let mut candidate_timings: Vec<TimingResult> = Vec::with_capacity(pairs);
     let mut held_session: Option<Session<T>> = None;
@@ -1123,12 +1136,23 @@ where
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
         ));
-        if let Err(e) = calibration.check_band(
+        control_legs.push((
             pair_goldens.prompt,
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
-            crate::baseline::HealthBand::from(bands),
-        ) {
+        ));
+        // The default rule gates this control leg now. Mean mode waits until every candidate has
+        // run, so one noisy leg can be offset only by other control legs from this same job.
+        if let Err(e) = if control_band_mode == bench_core::contract::ControlBandMode::PerLeg {
+            calibration.check_band(
+                pair_goldens.prompt,
+                control.prefill_seconds_per_token,
+                control.decode_seconds_per_token,
+                crate::baseline::HealthBand::from(bands),
+            )
+        } else {
+            Ok(())
+        } {
             let e = if pairs > 1 {
                 format!("pair {pair} of {pairs}: {e}")
             } else {
@@ -1190,7 +1214,8 @@ where
                 let mut payload = *payload;
                 drop(candidate_leg);
                 let mut seal = seal;
-                seal.band_passed = true;
+                seal.band_passed =
+                    control_band_mode == bench_core::contract::ControlBandMode::PerLeg;
                 seal.leg = measured_leg;
                 seal_paired_baseline(&mut payload.metrics, &seal, &pair_goldens.control.sha256);
                 payload.metrics.paired_legs = records;
@@ -1214,6 +1239,27 @@ where
         } else {
             held_session = Some(session);
             held_candidate_leg = Some(candidate_leg);
+        }
+    }
+
+    // Mean mode reaches its ONLY band gate after every pair. A candidate or control error above
+    // returned first, so this refusal never replaces an earlier leg failure.
+    if control_band_mode == bench_core::contract::ControlBandMode::MeanOfLegs {
+        if let Err(error) =
+            calibration.check_mean_band(&control_legs, crate::baseline::HealthBand::from(bands))
+        {
+            return with_measured_pairs(
+                paired_refusal(
+                    goldens[(pairs - 1) % goldens.len()],
+                    digests,
+                    commit,
+                    error,
+                    seal,
+                    control_legs.last().map(|&(_, p, d)| (p, d)),
+                    ScoringInputs::no_denominator(floors, weights),
+                ),
+                records,
+            );
         }
     }
 
@@ -4997,6 +5043,230 @@ mod tests {
 
     // ---- THE RANKED PAIRED PATH (David 2026-09-08) --------------------------------------
 
+    /// Mean mode runs every candidate before the mean gate. An earlier leg error keeps its result.
+    /// Default and explicit `per_leg` keep the old immediate refusal and sealed fields.
+    #[test]
+    fn the_mean_control_band_runs_all_candidates_and_per_leg_keeps_the_old_refusal() {
+        use bench_core::contract::ControlBandMode;
+        let (first, _) = two_goldens();
+        let calibration = wide_calibration();
+        let run = |mode, failure| {
+            let opened = std::cell::Cell::new(0);
+            let mut window = paired_window_for_test(|_: &str| Ok(()));
+            window.pairs = 3;
+            window.control_band_mode = mode;
+            window.bands.decode_up_tolerance = -1.0;
+            let baseline_opened = Cell::new(0);
+            let payload = official_core_paired(
+                &[PairedGoldens {
+                    candidate: &first,
+                    control: &first,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| {
+                        baseline_opened.set(baseline_opened.get() + 1);
+                        if failure == 2 && baseline_opened.get() == 2 {
+                            Err("CONTROL-TEST-FAILURE".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    open_candidate_leg: |_| {
+                        opened.set(opened.get() + 1);
+                        if failure == 1 {
+                            Err("CANDIDATE-TEST-FAILURE".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    spawn_baseline: || {
+                        if failure == 4 && baseline_opened.get() == 2 {
+                            Err(RunnerError::Protocol("CONTROL-MEASURE-FAILURE".to_string()))
+                        } else {
+                            Session::connect(conformant_engine()).map(|(s, _)| s)
+                        }
+                    },
+                    spawn_timed: || {
+                        if failure == 3 {
+                            Err(RunnerError::Protocol(
+                                "CANDIDATE-MEASURE-FAILURE".to_string(),
+                            ))
+                        } else {
+                            Session::connect(conformant_engine()).map(|(s, _)| s)
+                        }
+                    },
+                },
+                window,
+            );
+            (payload, opened.get())
+        };
+        let (mean, opened) = run(ControlBandMode::MeanOfLegs, 0);
+        assert_eq!(opened, 3);
+        assert_eq!(mean.metrics.paired_legs.len(), 3);
+        assert_eq!(
+            mean.metrics.control_band_mode,
+            Some(ControlBandMode::MeanOfLegs)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&mean.to_sealed_json().unwrap()).unwrap()
+                ["metrics"]["control_band_mode"],
+            serde_json::json!("mean_of_legs")
+        );
+        assert!(mean
+            .metrics
+            .error
+            .contains("SERIAL-CONTROL-LEGS-OUTSIDE-BAND"));
+        let (failed, opened) = run(ControlBandMode::MeanOfLegs, 1);
+        assert_eq!(opened, 1);
+        assert_eq!(failed.metrics.error, "CANDIDATE-TEST-FAILURE");
+        let (failed, _) = run(ControlBandMode::MeanOfLegs, 3);
+        assert!(failed.metrics.error.contains("CANDIDATE-MEASURE-FAILURE"));
+        assert_eq!(failed.metrics.baseline_band_passed, Some(false));
+        let (failed, opened) = run(ControlBandMode::MeanOfLegs, 2);
+        assert_eq!(opened, 1);
+        assert_eq!(failed.metrics.error, "CONTROL-TEST-FAILURE");
+        assert_eq!(failed.metrics.paired_legs.len(), 1);
+        assert_eq!(failed.metrics.baseline_band_passed, Some(false));
+        let (failed, opened) = run(ControlBandMode::MeanOfLegs, 4);
+        assert_eq!(opened, 1);
+        assert!(failed.metrics.error.contains("CONTROL-MEASURE-FAILURE"));
+        assert_eq!(failed.metrics.paired_legs.len(), 1);
+        assert_eq!(failed.metrics.baseline_band_passed, Some(false));
+        for mode in [ControlBandMode::default(), ControlBandMode::PerLeg] {
+            let (payload, opened) = run(mode, 0);
+            assert_eq!(opened, 0);
+            assert!(payload.metrics.paired_legs.is_empty());
+            assert_eq!(payload.metrics.control_band_mode, None);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&payload.to_sealed_json().unwrap())
+                    .unwrap()["metrics"]
+                    .get("control_band_mode")
+                    .is_none()
+            );
+            let legacy_error = calibration
+                .check_band(
+                    "botany",
+                    payload
+                        .metrics
+                        .baseline_leg_prefill_seconds_per_token
+                        .unwrap(),
+                    payload
+                        .metrics
+                        .baseline_leg_decode_seconds_per_token
+                        .unwrap(),
+                    crate::baseline::HealthBand {
+                        decode_high: 0.0,
+                        ..crate::baseline::HealthBand::from(
+                            paired_window_for_test(|_: &str| Ok(())).bands,
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                payload.metrics.error,
+                format!("pair 1 of 3: {legacy_error}")
+            );
+            assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+            assert!(payload.score.is_none());
+        }
+    }
+
+    /// The mean gate uses each prompt's calibration ratio and the fixture limits on both axes.
+    /// It refuses invalid input and gives the per-leg verdict when the run has one pair.
+    #[test]
+    fn the_mean_control_band_uses_each_prompt_ratio_and_the_fixture_limits() {
+        let mut calibration = wide_calibration();
+        let mut second = wide_prompt_calibration("second");
+        second.prefill_seconds_per_token_mean = 10.0;
+        second.decode_seconds_per_token_mean = 10.0;
+        calibration.prompts.push(second);
+        let band = crate::baseline::HealthBand {
+            decode_high: 1.03,
+            ..crate::baseline::HealthBand::DEFAULT
+        };
+        for (values, passes) in [
+            (vec![1.08, 0.99, 0.99], true),
+            (vec![1.0, 1.0, 1.12], false),
+            (vec![1.06, 1.06, 0.99], false),
+        ] {
+            let legs: Vec<_> = values.iter().map(|v| ("botany", *v, *v)).collect();
+            let result = calibration.check_mean_band(&legs, band);
+            assert_eq!(result.is_ok(), passes);
+            if let Err(error) = result {
+                assert!(error.contains("SERIAL-CONTROL-LEGS-OUTSIDE-BAND"));
+                assert!(!error.contains("botany"));
+            }
+        }
+        assert!(calibration
+            .check_mean_band(&[("botany", 1.02, 1.02), ("second", 10.2, 10.2)], band)
+            .is_ok());
+        assert!(calibration
+            .check_mean_band(&[("missing", 1.0, 1.0)], band)
+            .unwrap_err()
+            .contains(crate::baseline::BASELINE_CALIBRATION_PROMPT_MISMATCH));
+        assert!(calibration
+            .check_mean_band(&[("botany", 1.06, 0.5)], band)
+            .is_err());
+        assert!(calibration
+            .check_mean_band(&[("botany", 1.04, 0.5)], band)
+            .is_ok());
+        // Unequal means make the weighted ratio pass while the mean ratio fails.
+        assert!(calibration
+            .check_mean_band(&[("botany", 0.5, 1.10), ("second", 5.0, 10.0)], band)
+            .is_err());
+        assert!((1.10 + 10.0) / 11.0 < band.decode_high);
+        let mut fixture_bands = TEST_BASELINE.bands;
+        for prefill_axis in [true, false] {
+            fixture_bands.prefill_up_tolerance = if prefill_axis { 0.20 } else { 0.01 };
+            fixture_bands.decode_up_tolerance = if prefill_axis { 0.01 } else { 0.20 };
+            let custom = crate::baseline::HealthBand::from(fixture_bands);
+            let (p, d) = if prefill_axis {
+                (1.15, 0.5)
+            } else {
+                (0.5, 1.15)
+            };
+            assert!(calibration
+                .check_mean_band(&[("botany", p, d); 2], custom)
+                .is_ok());
+            let (p, d) = if prefill_axis {
+                (0.5, 1.02)
+            } else {
+                (1.02, 0.5)
+            };
+            assert!(calibration
+                .check_mean_band(&[("botany", p, d); 2], custom)
+                .is_err());
+        }
+        let mut exact = wide_calibration();
+        exact.prompts[0].decode_seconds_per_token_mean = 0.060859185585736685;
+        let measured = 0.0626849611533088;
+        assert!(exact.check_band("botany", 0.5, measured, band).is_ok());
+        assert!(exact
+            .check_mean_band(&[("botany", 0.5, measured)], band)
+            .is_ok());
+        for invalid in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            calibration.prompts[0].decode_seconds_per_token_mean = invalid;
+            assert!(calibration
+                .check_mean_band(&[("botany", 1.0, 1.0)], band)
+                .unwrap_err()
+                .contains(crate::baseline::BASELINE_CALIBRATION_INVALID));
+        }
+        calibration.prompts[0].decode_seconds_per_token_mean = 1.0;
+        for value in [0.5, 1.0, 1.02, 1.04, 1.1, f64::NAN, 0.0] {
+            assert_eq!(
+                calibration
+                    .check_mean_band(&[("botany", value, value)], band)
+                    .is_ok(),
+                calibration.check_band("botany", value, value, band).is_ok()
+            );
+        }
+    }
+
     /// A calibration every mock leg is FASTER than. The mock engine's wall clock is ~0, so its
     /// measured seconds-per-token is a real but tiny positive number; means of one second per
     /// token put every such leg far below the ceiling of the track's band, so the orchestration
@@ -5068,6 +5338,7 @@ mod tests {
         G: FnMut(&str) -> bench_runner::Result<()>,
     {
         PairedWindow {
+            control_band_mode: Default::default(),
             bands: TEST_BASELINE.bands,
             spec: None,
             window: test_window(),
@@ -5139,6 +5410,7 @@ mod tests {
                 spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
             },
             PairedWindow {
+                control_band_mode: Default::default(),
                 pairs: 2,
                 gate_log: std::rc::Rc::clone(&log),
                 ..paired_window_for_test(gate)
@@ -5724,6 +5996,7 @@ mod tests {
         combine: PairCombine,
     ) -> PairedWindow<impl FnMut(&str) -> bench_runner::Result<()>> {
         PairedWindow {
+            control_band_mode: Default::default(),
             bands: AcceptanceBands {
                 prefill_up_tolerance: 1e9,
                 decode_up_tolerance: 1e9,
@@ -6606,6 +6879,7 @@ mod tests {
                 spawn_timed: || Session::connect(candidate()).map(|(s, _)| s),
             },
             PairedWindow {
+                control_band_mode: Default::default(),
                 pairs,
                 token_tolerance_per_thousand: tolerance,
                 near_tie_relative_gap: near_tie_gap,
@@ -6738,6 +7012,7 @@ mod tests {
                 },
             },
             PairedWindow {
+                control_band_mode: Default::default(),
                 token_tolerance_per_thousand: Some(1000),
                 ..paired_window_for_test(|_phase: &str| Ok(()))
             },

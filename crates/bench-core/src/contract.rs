@@ -23,6 +23,35 @@ use crate::score::{ScoringWeights, SpeedupFloors};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// HOW a paired run checks its serial-control legs against the box calibration.
+///
+/// [`ControlBandMode::PerLeg`] is the default and keeps the old gate. Unknown text refuses with
+/// `CONTROL-BAND-MODE-INVALID`; a fixture cannot select an unrecognized rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBandMode {
+    /// Check each control leg before its candidate leg. The first leg outside the fixture band
+    /// refuses the run with `SERIAL-CONTROL-LEG-OUTSIDE-BAND`.
+    #[default]
+    PerLeg,
+    /// Run every pair, then gate the arithmetic mean of the per-prompt control ratios. A failed
+    /// mean refuses the run with `SERIAL-CONTROL-LEGS-OUTSIDE-BAND`; earlier leg errors still win.
+    MeanOfLegs,
+}
+
+impl<'de> Deserialize<'de> for ControlBandMode {
+    /// Accept only the two contract spellings. Any other value refuses during contract parsing.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "per_leg" => Ok(Self::PerLeg),
+            "mean_of_legs" => Ok(Self::MeanOfLegs),
+            _ => Err(serde::de::Error::custom(
+                "CONTROL-BAND-MODE-INVALID: expected per_leg or mean_of_legs",
+            )),
+        }
+    }
+}
+
 /// One entry of the contract's `timed_prompt_pool[]`. `sha256`, `bytes` and
 /// `noop_decode_speedup` are read (the pin identity plus the per-prompt no-op ref carried into
 /// the superset `results.json`); the remaining entry keys (`r2_path`,
@@ -240,6 +269,11 @@ pub struct Contract {
     /// track keeps 2.0, while a noisier box fleet declares its own ceiling here.
     #[serde(default)]
     pub calibration_max_cv_percent: Option<f64>,
+    /// THE CONTROL HEALTH GATE for a paired run. Absent means [`ControlBandMode::PerLeg`], so old
+    /// fixtures keep their immediate per-leg refusal. `mean_of_legs` delays the gate until every
+    /// pair finishes and uses the same fixture band.
+    #[serde(default)]
+    pub control_band_mode: Option<ControlBandMode>,
     /// The DECODE weight of the published composite ([`ScoringWeights::decode`], 0.75 on every
     /// track scored so far).
     ///
@@ -347,6 +381,7 @@ impl Contract {
         decode_band_down_enabled: None,
         prefill_band_down_enabled: None,
         calibration_max_cv_percent: None,
+        control_band_mode: None,
         score_decode_weight: None,
         score_prefill_weight: None,
         correctness_steps: None,
@@ -2837,5 +2872,33 @@ mod batch_size_tests {
     fn a_negative_batch_size_is_refused_at_the_parse() {
         let err = Contract::parse(br#"{"track_id":"t","scored_batch_size":-1}"#).unwrap_err();
         assert!(err.contains("--contract parse failed"), "{err}");
+    }
+}
+
+#[cfg(test)]
+/// Contract tests for the control health mode, its default, and its named parse refusal.
+mod control_band_tests {
+    use super::*;
+
+    /// An absent field and `per_leg` keep the old per-leg gate. `mean_of_legs` selects the mean gate.
+    /// Any other value refuses with `CONTROL-BAND-MODE-INVALID`.
+    #[test]
+    fn the_control_band_mode_defaults_to_per_leg_and_refuses_unknown_values() {
+        let absent: Contract = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.control_band_mode, None);
+        assert_eq!(
+            absent.control_band_mode.unwrap_or_default(),
+            ControlBandMode::PerLeg
+        );
+        let per_leg: Contract = serde_json::from_str(r#"{"control_band_mode":"per_leg"}"#).unwrap();
+        assert_eq!(per_leg.control_band_mode, Some(ControlBandMode::PerLeg));
+        let mean: Contract =
+            serde_json::from_str(r#"{"control_band_mode":"mean_of_legs"}"#).unwrap();
+        assert_eq!(mean.control_band_mode, Some(ControlBandMode::MeanOfLegs));
+        assert_eq!(Contract::NONE_DECLARED.control_band_mode, None);
+        let error = serde_json::from_str::<Contract>(r#"{"control_band_mode":"wrong"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CONTROL-BAND-MODE-INVALID"));
     }
 }

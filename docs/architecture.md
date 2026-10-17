@@ -259,6 +259,7 @@ fields, the paired-run fields and the two speedup floors are each declared on th
 | identity | `timed_prompt_pool` | The timed prompts, their pins and their per-prompt references. |
 | paired run | `official_pairs` | The number of pairs one ranked run measures. |
 | paired run | `official_pair_combine` | How the pairs make one score: `lower_median` (absent) or `mean` of the per-pair composites. |
+| paired run | `control_band_mode` | How control health is checked: `per_leg` (absent) or `mean_of_legs`. See [Control band mean](control-band-mean.md). |
 | paired run | `scores_against_live_control_leg` | Whether the track measures its own denominator. |
 | paired run | `paired_flow_retired` | Whether the `measure-job` seam is closed for this track. |
 | paired run | `timed_token_tolerance_per_thousand` | The timed token tolerance, 0 to 1000. Absent: one different timed token fails the run. |
@@ -272,6 +273,7 @@ fields, the paired-run fields and the two speedup floors are each declared on th
 | speedup floors | `prefill_speedup_floor` | The prefill speedup the scored run must clear. It is the only gate on a slow candidate prefill. |
 | acceptance bands | `prefill_band_up_tolerance`, `decode_band_up_tolerance` | The ceiling of the control leg's health band, `1 + up` times the calibrated mean. They do not gate the candidate. |
 | acceptance bands | `prefill_band_down_tolerance`, `prefill_band_down_enabled`, `decode_band_down_tolerance`, `decode_band_down_enabled` | The candidate's lower bound: when enabled, a candidate below `1 - down` of its reference fails as too fast. |
+| calibration | `calibration_max_cv_percent` | The maximum sample CV on either calibration axis, in percent. Absent uses the benchd default of 2.0. |
 | scoring weights | `score_decode_weight`, `score_prefill_weight` | The weights of the published composite. |
 | window shape | `correctness_steps` | The checked decode steps the correctness gate evaluates. |
 | window shape | `benchmark_decode_steps` | The timed decode depth of the official and local-iterate modes. |
