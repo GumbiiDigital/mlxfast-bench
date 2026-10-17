@@ -81,6 +81,9 @@ pub const BASELINE_CALIBRATION_TRACK_MISMATCH: &str = "BASELINE-CALIBRATION-TRAC
 pub const BASELINE_CALIBRATION_BOX_MISMATCH: &str = "BASELINE-CALIBRATION-BOX-MISMATCH";
 /// The measured serial-control leg is outside this box's band on at least one axis.
 pub const SERIAL_CONTROL_LEG_OUTSIDE_BAND: &str = "SERIAL-CONTROL-LEG-OUTSIDE-BAND";
+/// The EXACT-MATCH refusal when the mean control ratio exceeds the fixture band. This plural
+/// class belongs only to `mean_of_legs`; `per_leg` keeps [`SERIAL_CONTROL_LEG_OUTSIDE_BAND`].
+pub const SERIAL_CONTROL_LEGS_OUTSIDE_BAND: &str = "SERIAL-CONTROL-LEGS-OUTSIDE-BAND";
 /// The golden carries a stored baseline pair, which this path has no source for.
 pub const GOLDEN_CARRIES_STORED_BASELINE: &str = "GOLDEN-CARRIES-STORED-BASELINE";
 /// A stored-pair override (`MLXFAST_PAIRED_BASELINE_*` / `--baseline-*`) reached this path.
@@ -365,6 +368,61 @@ impl BaselineCalibration {
             ));
         }
         self.entry(prompt).map(|_| ())
+    }
+
+    /// THE `mean_of_legs` HEALTH GATE for one or more completed control legs.
+    ///
+    /// One leg uses [`Self::check_band`], so its verdict and failure text stay unchanged. Several
+    /// legs divide each timing by that prompt's calibration mean, then average those ratios by
+    /// axis. The fixture's upper band remains the limit; the lower side remains unchecked.
+    ///
+    /// A missing prompt or invalid mean keeps its existing named calibration refusal. An invalid
+    /// timing or a high mean refuses with [`SERIAL_CONTROL_LEGS_OUTSIDE_BAND`]. The caller seals no
+    /// score after any refusal.
+    pub fn check_mean_band(
+        &self,
+        legs: &[(&str, f64, f64)],
+        band: HealthBand,
+    ) -> Result<(), String> {
+        if let &[(prompt, prefill, decode)] = legs {
+            let entry = self.entry(prompt)?;
+            if ![
+                entry.prefill_seconds_per_token_mean,
+                entry.decode_seconds_per_token_mean,
+            ]
+            .iter()
+            .all(|mean| mean.is_finite() && *mean > 0.0)
+            {
+                entry.validate(f64::MAX)?;
+            }
+            return self.check_band(prompt, prefill, decode, band);
+        }
+        let mut sums = [0.0; 2];
+        for &(prompt, prefill, decode) in legs {
+            let entry = self.entry(prompt)?;
+            for (axis, measured, mean) in [
+                (0, prefill, entry.prefill_seconds_per_token_mean),
+                (1, decode, entry.decode_seconds_per_token_mean),
+            ] {
+                if !(mean.is_finite() && mean > 0.0) {
+                    entry.validate(f64::MAX)?;
+                }
+                if !(measured.is_finite() && measured > 0.0) {
+                    return Err(format!("{SERIAL_CONTROL_LEGS_OUTSIDE_BAND}: control timing is not finite and positive"));
+                }
+                sums[axis] += measured / mean;
+            }
+        }
+        for (axis, sum, high) in [
+            ("prefill", sums[0], band.prefill_high),
+            ("decode", sums[1], band.decode_high),
+        ] {
+            let mean_ratio = sum / legs.len() as f64;
+            if !mean_ratio.is_finite() || mean_ratio > high {
+                return Err(format!("{SERIAL_CONTROL_LEGS_OUTSIDE_BAND}: {axis} mean ratio {mean_ratio} exceeds {high}; box {:?}", self.box_name));
+            }
+        }
+        Ok(())
     }
 
     /// The HEALTH GATE on the serial-control leg of `prompt`: `measured <= mean * high` on both
@@ -1830,7 +1888,8 @@ mod tests {
     /// `calibration_max_cv_percent: 3.0` ADMITS a per-axis CV of 2.5 % that the 2.0 default
     /// REFUSES — on the capture path (`calibration_from_passes`) and on the load/parse path
     /// (`BaselineCalibration::parse`), both reading the ceiling the fixture resolves through
-    /// `max_cv_percent_of_contract`. A silent fixture still resolves to the benchd default.
+    /// `max_cv_percent_of_contract`. A silent fixture still resolves to the benchd default. The
+    /// raised CV ceiling does not widen the health band that the mean gate applies later.
     #[test]
     fn a_track_may_raise_the_cv_ceiling_above_the_default_on_both_paths() {
         // The resolver: a declared ceiling wins; silence keeps the benchd default.
@@ -1905,6 +1964,13 @@ mod tests {
         let reloaded = BaselineCalibration::parse(&bytes, raised_ceiling)
             .expect("a file captured under 3.0 re-validates under 3.0");
         assert_eq!(reloaded, admitted);
+        let band = HealthBand::of_contract(&raised);
+        assert!(reloaded
+            .check_mean_band(&[("p1", 0.0005, 0.0315); 2], band)
+            .is_err());
+        assert!(reloaded
+            .check_mean_band(&[("p1", 0.0005, 0.0303); 2], band)
+            .is_ok());
     }
 
     #[test]
