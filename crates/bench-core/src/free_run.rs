@@ -119,7 +119,7 @@ pub struct FreeRunResponse {
 /// so an artifact can state which path produced its decode number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
-    /// `"rectangular"` or `"serial"` (any other string is carried verbatim — the seal never guesses).
+    /// `"rectangular"` or `"serial"`; the runner replaces other wire text with a stable seal.
     pub mode: String,
     /// Rounds that ran the rectangular path, when reported.
     pub rectangular_rounds: Option<u64>,
@@ -656,8 +656,8 @@ pub struct CohortFreeRunResponse {
     pub accepted_total: u64,
     /// Cohort-sum committed tokens; MUST equal `B * N`.
     pub committed_total: u64,
-    /// The engine's depth-clamp reason histogram over the window. AUDIT-only, sealed verbatim.
-    pub depth_clamp_reasons: std::collections::BTreeMap<String, u32>,
+    /// The engine's sealed depth-clamp reason histogram over the window. AUDIT-only.
+    pub depth_clamp_reasons: std::collections::BTreeMap<String, u64>,
 }
 
 /// Enforce the COHORT consistency QUADRUPLE on a batched `free_decode_run` response, returning the
@@ -826,7 +826,7 @@ pub struct CohortFreeRunAudit {
     cohort_committed_total: u64,
     natural_accepted_by_stream: Vec<Vec<u32>>,
     active_streams_by_round: Vec<u32>,
-    depth_clamp_reasons: std::collections::BTreeMap<String, u32>,
+    depth_clamp_reasons: std::collections::BTreeMap<String, u64>,
 }
 
 impl CohortFreeRunAudit {
@@ -860,11 +860,12 @@ impl CohortFreeRunAudit {
         &self.active_streams_by_round
     }
 
-    /// The raw depth-clamp reason histogram, persisted VERBATIM. This is the evidence for whether
-    /// the window ACTUALLY SPECULATED: a cohort clamped to depth zero (e.g.
+    /// The sealed depth-clamp reason histogram. Safe keys stay verbatim, and other keys use stable
+    /// text seals. This is the evidence for whether the window ACTUALLY SPECULATED: a cohort
+    /// clamped to depth zero (e.g.
     /// `automatic_rectangular_limit`, `tail_depth`) is a legitimate engine outcome, and the report
     /// has to be able to say so rather than presenting a target-only window as a speculative one.
-    pub fn depth_clamp_reasons(&self) -> &std::collections::BTreeMap<String, u32> {
+    pub fn depth_clamp_reasons(&self) -> &std::collections::BTreeMap<String, u64> {
         &self.depth_clamp_reasons
     }
 
@@ -914,10 +915,10 @@ impl CohortFreeRunAudit {
 
     /// The total depth-clamp events the engine reported. Reported as ONE scalar rather than one
     /// metric per reason key: the histogram keys are ENGINE-CONTROLLED strings, and the metric
-    /// namespace is not a place to let an engine mint names. The full histogram is sealed verbatim
+    /// namespace is not a place to let an engine mint names. The full sealed histogram is available
     /// via [`depth_clamp_reasons`](Self::depth_clamp_reasons).
     pub fn depth_clamp_total(&self) -> u64 {
-        self.depth_clamp_reasons.values().map(|&v| v as u64).sum()
+        self.depth_clamp_reasons.values().sum()
     }
 
     /// The flat metrics for a cohort window: the shared `audit_spec_*` family (per-round common
@@ -1205,7 +1206,7 @@ mod tests {
             accepted_total: (batch_size as u64) * (n - rounds) as u64,
             committed_total: batch_size as u64 * n as u64,
             acceptance_lengths,
-            depth_clamp_reasons: [("tail_depth".to_string(), 1u32)].into_iter().collect(),
+            depth_clamp_reasons: [("tail_depth".to_string(), 1u64)].into_iter().collect(),
         }
     }
 
@@ -1444,8 +1445,8 @@ mod tests {
         // verbatim through the accessor.
         let mut c = conformant_cohort(2);
         c.depth_clamp_reasons = [
-            ("automatic_rectangular_limit".to_string(), 2u32),
-            ("smuggled_metric_key".to_string(), 5u32),
+            ("automatic_rectangular_limit".to_string(), 2u64),
+            ("smuggled_metric_key".to_string(), 5u64),
         ]
         .into_iter()
         .collect();

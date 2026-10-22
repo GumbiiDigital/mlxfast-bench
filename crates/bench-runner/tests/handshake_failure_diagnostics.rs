@@ -32,6 +32,18 @@ fn handshake_failure(tag: &str, body: &str) -> String {
 /// As [`handshake_failure`] but with an explicit stderr-forwarding policy, so the OFFICIAL
 /// (`forward = false`) posture can be exercised without a real `sandbox-exec`.
 fn handshake_failure_forwarding(tag: &str, body: &str, forward: bool) -> String {
+    let diagnostic = handshake_error_forwarding(tag, body, forward).diagnostic();
+    diagnostic
+        .strip_prefix("protocol violation: ")
+        .unwrap_or(&diagnostic)
+        .to_string()
+}
+
+fn handshake_error(tag: &str, body: &str) -> RunnerError {
+    handshake_error_forwarding(tag, body, true)
+}
+
+fn handshake_error_forwarding(tag: &str, body: &str, forward: bool) -> RunnerError {
     let dir = std::env::temp_dir().join(format!("bench134-{tag}-{}", std::process::id()));
     let engine = write_script(&dir, body);
     let transport = ChildStdioTransport::spawn_with_parent_env_forwarding(
@@ -42,13 +54,12 @@ fn handshake_failure_forwarding(tag: &str, body: &str, forward: bool) -> String 
         forward,
     )
     .expect("spawn fake worker");
-    let message = match Session::connect(transport) {
+    let error = match Session::connect(transport) {
         Ok(_) => panic!("{tag}: expected the handshake to fail"),
-        Err(RunnerError::Protocol(msg)) => msg,
-        Err(other) => panic!("{tag}: expected a Protocol error, got {other}"),
+        Err(error) => error,
     };
     std::fs::remove_dir_all(&dir).ok();
-    message
+    error
 }
 
 /// The signature `measure_job` seals into `rejected_pairs[].reason` must stay recognisable: the
@@ -79,12 +90,45 @@ fn dies_before_hello_surfaces_stderr_and_status() {
     );
 }
 
+#[test]
+fn dies_before_hello_seals_stderr_but_keeps_status() {
+    let error = handshake_error(
+        "sealed-before-hello",
+        "#!/bin/sh\nprintf 'PLANTED-PROMPT-TEXT 4242\\n' 1>&2\nexit 3\n",
+    );
+    let sealed = error.to_string();
+    assert!(
+        !sealed.contains("PLANTED") && !sealed.contains("4242"),
+        "{sealed}"
+    );
+    assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+    assert!(sealed.contains("worker exited with status 3"), "{sealed}");
+    assert!(error.diagnostic().contains("PLANTED-PROMPT-TEXT 4242"));
+}
+
+#[test]
+fn hello_not_ok_seals_the_engine_error() {
+    let error = handshake_error(
+        "hello-not-ok",
+        "#!/bin/sh\nprintf '%s\\n' \
+         '{\"id\":0,\"ok\":false,\"error\":\"PLANTED-PROMPT-TEXT 4242\"}'\n",
+    );
+    let sealed = error.to_string();
+    assert!(
+        !sealed.contains("PLANTED") && !sealed.contains("4242"),
+        "{sealed}"
+    );
+    assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+    assert!(sealed.contains("hello was not ok"), "{sealed}");
+    assert!(error.diagnostic().contains("PLANTED-PROMPT-TEXT 4242"));
+}
+
 /// A worker that emits a non-JSON preamble line and a TRUNCATED (newline-less) hello, then dies
 /// mid-handshake. The partial line is never a response, so the read still ends in EOF — and the
 /// stderr that explains the truncation must still arrive.
 #[test]
 fn dies_mid_hello_surfaces_stderr_and_status() {
-    let message = handshake_failure(
+    let error = handshake_error(
         "mid-hello",
         "#!/bin/sh\n\
          printf 'loading weights...\\n'\n\
@@ -92,6 +136,10 @@ fn dies_mid_hello_surfaces_stderr_and_status() {
          printf 'panic: head provenance digest failed\\n' 1>&2\n\
          exit 5\n",
     );
+    let diagnostic = error.diagnostic();
+    let message = diagnostic
+        .strip_prefix("protocol violation: ")
+        .unwrap_or(&diagnostic);
     assert!(
         message.starts_with("engine response line could not be decoded"),
         "mid-hello: unexpected signature: {message}"
@@ -104,6 +152,19 @@ fn dies_mid_hello_surfaces_stderr_and_status() {
         message.contains("worker exited with status 5"),
         "worker exit status missing from the error: {message}"
     );
+    assert!(
+        message.contains("EOF while parsing a value"),
+        "serde cause missing from the diagnostic: {message}"
+    );
+    assert!(
+        message.contains(r#"{"id":0,"ok":tr"#),
+        "truncated response line missing from the diagnostic: {message}"
+    );
+
+    let sealed = error.to_string();
+    assert!(sealed.contains("category=Eof line=1 column="), "{sealed}");
+    assert!(!sealed.contains("EOF while parsing a value"), "{sealed}");
+    assert!(!sealed.contains(r#"{"id":0,"ok":tr"#), "{sealed}");
 }
 
 /// A worker that floods stderr with far more than the 64 KiB retained tail, then dies. The

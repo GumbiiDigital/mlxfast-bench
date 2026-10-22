@@ -24,6 +24,12 @@ pub enum ReadOutcome {
     TimedOut,
 }
 
+/// Benchd-written process status and engine-written stderr from a failed child.
+pub struct FailureDiagnostic {
+    pub detail: String,
+    pub engine_text: String,
+}
+
 /// One NDJSON line in each direction. Implementations own the framing (`'\n'`).
 pub trait LineTransport {
     /// Write one NDJSON line. Implementations append the trailing `'\n'`;
@@ -61,11 +67,9 @@ pub trait LineTransport {
     /// default) means "no child to autopsy" — the in-process
     /// [`MockEngine`](crate::mock::MockEngine) has nothing to add.
     ///
-    /// The returned string is a single line, safe to embed in an error message and to seal into a
-    /// run record: every stderr line passed through
-    /// [`redact_worker_stderr_line`], and the tail is byte-capped at
-    /// [`WORKER_STDERR_TAIL_BYTE_LIMIT`].
-    fn failure_diagnostic(&mut self) -> Option<String> {
+    /// The returned detail is benchd-written. The engine text is for scrubbed diagnostic logs;
+    /// sealed errors include only its digest and byte count.
+    fn failure_diagnostic(&mut self) -> Option<FailureDiagnostic> {
         None
     }
 }
@@ -876,13 +880,14 @@ impl ChildStdioTransport {
     /// undiagnosable), kills it if it outlasts that, then collects the stderr drain and reports
     /// how the child ended together with the retained tail.
     ///
-    /// Returns a single line: `<ending>; worker stderr tail: <lines>`, every line redacted and
-    /// scrubbed and the whole bounded by [`WORKER_STDERR_TAIL_BYTE_LIMIT`], so it is safe both to
-    /// print and (after [`crate::scrub::scrub_reason_for_seal`] caps it) to seal.
-    pub fn post_mortem(&mut self) -> String {
-        let ending = self.reap_with_grace().describe();
+    /// Returns the benchd-written ending separately from the engine-written stderr tail.
+    pub fn post_mortem(&mut self) -> FailureDiagnostic {
+        let detail = self.reap_with_grace().describe();
         let tail = self.stderr_drain.finish_bounded(WORKER_STDERR_FLUSH_GRACE);
-        format!("{ending}; {}", format_stderr_tail(&tail))
+        FailureDiagnostic {
+            detail,
+            engine_text: format_stderr_tail(&tail),
+        }
     }
 
     /// Wait out [`WORKER_EXIT_GRACE`] for a SELF-DIRECTED exit, then kill.
@@ -999,7 +1004,7 @@ impl LineTransport for ChildStdioTransport {
     /// them with the transport. Note it is INDEPENDENT of stderr FORWARDING: an official
     /// (sandboxed) spawn never echoes worker stderr to this process's stderr, but the tail is
     /// still retained and still surfaces here, which is the only channel a sealed record has.
-    fn failure_diagnostic(&mut self) -> Option<String> {
+    fn failure_diagnostic(&mut self) -> Option<FailureDiagnostic> {
         Some(self.post_mortem())
     }
 }

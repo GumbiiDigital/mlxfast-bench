@@ -1632,7 +1632,8 @@ fn merge_overlay_against_harness(
 
     let passed_ceiling = median.is_finite() && median <= QWEN_MTP_DECODE_SPEEDUP_CEILING;
 
-    // Seal via the REUSED ScorePayload coarsening/sort path, then inject the paired discriminators
+    // Build via the reused ScorePayload publication path, then inject the paired discriminators.
+    // The number seal runs once, after all insertions.
     // as top-level keys (ScoreMetrics is the Swift-parity schema and stays UNTOUCHED — the generic
     // score's roster/parity is unaffected; the discriminators live alongside score/passed/metrics).
     let payload = ScorePayload {
@@ -1640,11 +1641,9 @@ fn merge_overlay_against_harness(
         passed,
         metrics,
     };
-    let sealed = payload
-        .to_sealed_json()
+    let mut value = payload
+        .to_public_unsealed_value()
         .map_err(|e| format!("overlay score serialization failed: {e}"))?;
-    let mut value: Value =
-        serde_json::from_str(&sealed).map_err(|e| format!("overlay reserialize failed: {e}"))?;
     if let Value::Object(map) = &mut value {
         map.insert("scoring_mode".to_string(), json!(SCORING_MODE));
         // F1 CHANGE 2 — the aggregation label FOLLOWS THE SHAPE. A cohort score is not a median of
@@ -1709,6 +1708,18 @@ fn merge_overlay_against_harness(
             );
         }
     }
+    let mut private_value = serde_json::to_value(&payload)
+        .map_err(|e| format!("overlay private score serialization failed: {e}"))?;
+    if let (Value::Object(private), Value::Object(public)) = (&mut private_value, &value) {
+        for (key, value) in public {
+            if !["metrics", "passed", "score"].contains(&key.as_str()) {
+                private.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    crate::score::write_private_audit(&private_value)
+        .map_err(|e| format!("overlay private audit write failed: {e}"))?;
+    crate::score::seal_public_value(&mut value);
     // Sorted + pretty (serde_json Value is a BTreeMap → sorted keys), matching the sealed shape.
     let sealed_json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("overlay serialize failed: {e}"))?;
@@ -2200,8 +2211,8 @@ mod tests {
         );
         assert!(err.contains("above ceiling"), "exact ceiling text: {err}");
         assert!(
-            err.contains('5'),
-            "ceiling error must name the 5.0 ceiling: {err}"
+            !err.chars().any(|c| c.is_ascii_digit()),
+            "ceiling error must omit exact numbers: {err}"
         );
     }
 
@@ -3243,6 +3254,40 @@ mod tests {
             v["timed_mode"],
             json!(bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8)
         );
+    }
+
+    #[test]
+    fn overlay_private_audit_keeps_exact_metrics_and_insertions() {
+        if std::env::var_os("BENCHD_OVERLAY_PRIVATE_AUDIT_CHILD").is_some() {
+            let out =
+                merge_matched(&passing_gates(), &identity_cohort(), None, None, &pooln(8)).unwrap();
+            assert!(out.passed);
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "benchd-overlay-private-audit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("private.json");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay::tests::overlay_private_audit_keeps_exact_metrics_and_insertions",
+                "--test-threads=1",
+            ])
+            .env("BENCHD_OVERLAY_PRIVATE_AUDIT_CHILD", "1")
+            .env("BENCHD_PRIVATE_AUDIT_PATH", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let private: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(private["metrics"]["peak_ram_gb"], json!(20.25));
+        assert_eq!(private["cohort"]["composite_score"], json!(2f64.powf(1.25)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// REFUSAL TWIN of the accepted regime — a batched tag at ANY OTHER WIDTH is still refused. The

@@ -111,24 +111,52 @@ fn seal_official_per_prompt(
 /// `head_provenance_sha256` is MIRRORED onto each `per_prompt` entry, which is where the board reads
 /// it; the entries are already sealed by then, so this fills them in place.
 ///
-/// THE RUNNER AND RESIDENT IDENTITIES ARE SEALED THE SAME WAY. The wire contract says `runner` and
-/// `resident` are modeled "exactly like `head_provenance`" — so they are recorded here too, as
-/// `runner_id` / `runner_model_type` / `runner_manifest_sha256` / `runner_build` and
-/// `resident_pid` / `resident_load_epoch`. Each is absent from the sealed JSON when the hello
-/// lacked it, never `0` and never `""`: an absent key is the honest statement "the worker said
-/// nothing", which is a different claim from "the worker said zero". They are IDENTITY, recorded in
-/// the score.json metrics and NEVER scored — nothing reads them back as an input to a number.
+/// Free-text identity values are logged after scrubbing, then replaced with stable text seals.
+/// Digest fields stay readable only when they are exactly 64 lowercase hexadecimal characters.
+/// Resident numbers are log-only; the in-window resident comparison still refuses a change.
 pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
-    metrics.engine_backend = hello.backend.clone();
-    metrics.engine_device = hello.device.clone();
+    let seal_text = |field: &str, value: &str| {
+        eprintln!(
+            "benchd: engine identity: {field}={}",
+            bench_runner::scrub_engine_text(value)
+        );
+        bench_runner::error::engine_text_seal(value)
+    };
+    metrics.engine_backend = hello
+        .backend
+        .as_deref()
+        .map(|value| seal_text("engine_backend", value));
+    metrics.engine_device = hello
+        .device
+        .as_deref()
+        .map(|value| seal_text("engine_device", value));
     metrics.engine_protocol_version = hello.protocol_version;
-    metrics.head_provenance_sha256 = hello.head_provenance.as_ref().map(|p| p.sha256.clone());
-    metrics.runner_id = hello.runner.as_ref().map(|r| r.id.clone());
-    metrics.runner_model_type = hello.runner.as_ref().map(|r| r.model_type.clone());
-    metrics.runner_manifest_sha256 = hello.runner.as_ref().map(|r| r.manifest_sha256.clone());
-    metrics.runner_build = hello.runner.as_ref().map(|r| r.build.clone());
-    metrics.resident_pid = hello.resident.as_ref().map(|r| r.pid);
-    metrics.resident_load_epoch = hello.resident.as_ref().map(|r| r.load_epoch);
+    metrics.head_provenance_sha256 = hello
+        .head_provenance
+        .as_ref()
+        .map(|p| crate::measure_job::seal_engine_digest(&p.sha256));
+    metrics.runner_id = hello.runner.as_ref().map(|r| seal_text("runner_id", &r.id));
+    metrics.runner_model_type = hello
+        .runner
+        .as_ref()
+        .map(|r| seal_text("runner_model_type", &r.model_type));
+    metrics.runner_manifest_sha256 = hello
+        .runner
+        .as_ref()
+        .map(|r| crate::measure_job::seal_engine_digest(&r.manifest_sha256));
+    metrics.runner_build = hello
+        .runner
+        .as_ref()
+        .map(|r| seal_text("runner_build", &r.build));
+    metrics.resident_pid = None;
+    metrics.resident_load_epoch = None;
+    if let Some(resident) = &hello.resident {
+        eprintln!("benchd: engine identity: resident_pid={}", resident.pid);
+        eprintln!(
+            "benchd: engine identity: resident_load_epoch={}",
+            resident.load_epoch
+        );
+    }
     for entry in &mut metrics.per_prompt {
         entry
             .head_provenance_sha256
@@ -142,8 +170,7 @@ pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::He
 /// The resident's `load_epoch` is constant for the life of the process, so a changed `pid` or
 /// `load_epoch` between the prefill worker's hello and the decode worker's hello means the window
 /// did not run against one resident process: something reloaded the weights mid-window. That
-/// violates weights-load-once, and it makes the sealed identity a lie — the score would name one
-/// process while part of the window ran on another. It is refused rather than sealed.
+/// violates weights-load-once. It is refused even though the process numbers are log-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentIdentityChanged {
     /// The resident identity the FIRST phase of this window reported.
@@ -164,18 +191,10 @@ impl ResidentIdentityChanged {
 
 impl std::fmt::Display for ResidentIdentityChanged {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let show = |r: &Option<bench_protocol::ResidentIdentity>| match r {
-            Some(r) => format!("pid {} load_epoch {}", r.pid, r.load_epoch),
-            None => "no resident (the worker loaded its own weights)".to_string(),
-        };
         write!(
             f,
-            "{}: one timed window ran against two different resident identities — the first phase \
-             reported {}, a later phase reported {}. The resident load_epoch is constant for the \
-             life of the process, so this is a reload inside the window (weights-load-once).",
-            self.name(),
-            show(&self.first),
-            show(&self.then)
+            "{}: pid or load_epoch changed within one timed window",
+            self.name()
         )
     }
 }
@@ -640,7 +659,7 @@ where
     // resolved its default — serial. On an engine where speculation is a SERVE-BOOT property that
     // was invisible; on a per-REQUEST engine it means a declared MTP leg was measured SERIAL while
     // being scored against the MTP oracle. The resolved spec now rides the timed window, and the
-    // engine's `effective_spec` echo must equal it or the leg is discarded (spec-never-ignored,
+    // engine's `effective_spec` echo must honor it or the leg is discarded (spec-never-ignored,
     // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
     let (measured, held_session) = match measure_candidate_window(
         OfficialParams {
@@ -3658,7 +3677,7 @@ mod tests {
     }
 
     #[test]
-    fn official_warmup_leg_failure_fails_closed_before_timed_legs() {
+    fn official_warmup_engine_error_is_sealed_before_timed_legs() {
         // The measurement-integrity warmup is WIRED and FAIL-CLOSED: a fault in the unmeasured
         // warmup leg fails the run with a warmup-labelled error and stops BEFORE any timed worker
         // spawns. The warmup worker (first spawn) faults its `free_decode_run`; because warmup runs
@@ -3676,7 +3695,7 @@ mod tests {
                 let n = spawn_n.get();
                 spawn_n.set(n + 1);
                 let engine = if n == 0 {
-                    conformant_engine().error_on("free_decode_run", "warmup boom")
+                    conformant_engine().error_on("free_decode_run", "PLANTED-PROMPT-TEXT 4242")
                 } else {
                     conformant_engine()
                 };
@@ -3688,6 +3707,16 @@ mod tests {
         assert!(
             payload.metrics.error.contains("official warmup leg failed"),
             "warmup fault must surface a warmup-labelled failure, got: {}",
+            payload.metrics.error
+        );
+        assert!(
+            payload.metrics.error.contains("engine-text-sha256="),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(
+            !payload.metrics.error.contains("PLANTED") && !payload.metrics.error.contains("4242"),
+            "{}",
             payload.metrics.error
         );
         assert_eq!(
@@ -4497,7 +4526,7 @@ mod tests {
         assert_eq!(
             d1.metrics.effective_spec_mode.as_deref(),
             Some("mtp"),
-            "the engine's own effective_spec echo, validated equal to the request"
+            "the engine's own effective_spec echo, validated against the request"
         );
         assert_eq!(d1.metrics.effective_spec_depth, Some(1));
         assert_eq!(d1.metrics.spec_rounds, Some(64));
@@ -4591,6 +4620,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn official_seals_an_unsolicited_effective_spec_before_score_json() {
+        let golden = official_golden(None);
+        let payload = run_official(&golden, || {
+            conformant_engine().diverge_spec_echo(SpecConfig {
+                mode: "PLANTED-PROMPT-TEXT 4242".to_string(),
+                mtp: None,
+                dflash: Some(serde_json::json!({"leak": "PLANTED dflash"})),
+                dspark: Some(serde_json::json!(["PLANTED dspark"])),
+            })
+        });
+
+        let json = payload.to_sealed_json().unwrap();
+        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
+    }
+
     /// SPEC-NEVER-IGNORED IS NOT WEAKENED BY THE WIRING. An engine that echoes a DIFFERENT depth
     /// than the one requested has its leg DISCARDED — the run fails with the divergence, and no
     /// depth is sealed from the engine's word.
@@ -4625,7 +4671,7 @@ mod tests {
         assert!(payload.metrics.per_prompt.is_empty());
     }
 
-    /// THE VERIFY/REPLAY DISAGREEMENT COUNT IS SEALED WHEN THE ENGINE REPORTS IT.
+    /// THE VERIFY/REPLAY DISAGREEMENT COUNT STAYS PRIVATE.
     ///
     /// The depth-1 MTP cycle's rejecting rounds compare the two-row verify's argmax against the
     /// one-row replay's argmax; the tower is not batch-invariant, so the two can differ. The REPLAY
@@ -4633,7 +4679,7 @@ mod tests {
     /// on the timed leg beside the other spec counters, so a scored artifact states how often the
     /// two row shapes disagreed instead of leaving it invisible.
     #[test]
-    fn official_seals_the_engines_verify_replay_disagreement_count() {
+    fn official_omits_the_engines_verify_replay_disagreement_count() {
         let golden = official_golden(None);
         // 64 drafted, 32 accepted => 32 rejecting rounds; 30 of them disagreed.
         let payload = run_official_with_spec(
@@ -4647,11 +4693,9 @@ mod tests {
         assert_eq!(payload.metrics.spec_verify_replay_disagreements, Some(30));
         let json = payload.to_sealed_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            v["metrics"]["spec_verify_replay_disagreements"],
-            serde_json::json!(30),
-            "the sealed key is spec_verify_replay_disagreements"
-        );
+        assert!(v["metrics"]
+            .get("spec_verify_replay_disagreements")
+            .is_none());
         // The counters it sits beside are untouched, and NOTHING ENFORCED moved.
         assert_eq!(payload.metrics.spec_drafted_total, Some(64));
         assert_eq!(payload.metrics.spec_accepted_total, Some(32));
@@ -4698,8 +4742,12 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
         assert_eq!(v["metrics"]["spec_verification_mode"], "rectangular");
-        assert_eq!(v["metrics"]["spec_rectangular_verification_rounds"], 64);
-        assert_eq!(v["metrics"]["spec_serial_verification_rounds"], 0);
+        assert!(v["metrics"]
+            .get("spec_rectangular_verification_rounds")
+            .is_none());
+        assert!(v["metrics"]
+            .get("spec_serial_verification_rounds")
+            .is_none());
         let silent =
             run_official_with_spec(&golden, SpecConfig::mtp(1), even_histogram(2), 64, 32, None);
         assert_eq!(silent.metrics.spec_verification_mode, None);
@@ -4709,6 +4757,32 @@ mod tests {
             .unwrap()
             .get("spec_verification_mode")
             .is_none());
+
+        let planted = "PLANTED-PROMPT-TEXT 4242";
+        let hist = even_histogram(2);
+        let committed: u64 = hist.iter().map(|&x| u64::from(x)).sum();
+        let engine = move || {
+            conformant_engine()
+                .free_run_acceptance_lengths(hist.clone())
+                .free_run_totals(64, 32, committed)
+                .free_run_verification(planted, 64, 0)
+        };
+        let payload = official_core_windowed(
+            OfficialParams {
+                spec: Some(SpecConfig::mtp(1)),
+                ..test_run(
+                    &golden,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || Session::connect(engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        );
+        let json = payload.to_sealed_json().unwrap();
+        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
     }
 
     /// ABSENT IS NOT ZERO. An engine that does not put the counter on the wire — every engine built
@@ -4771,8 +4845,8 @@ mod tests {
         assert_eq!(ok.metrics.spec_verify_replay_disagreements, Some(32));
     }
 
-    /// The ENGINE IDENTITY seal takes the TIMED worker's hello verbatim and mirrors the head digest
-    /// onto the per-prompt entry the board reads.
+    /// The ENGINE IDENTITY seal hashes free text and mirrors a valid head digest onto the
+    /// per-prompt entry the board reads.
     #[test]
     fn engine_identity_seal_records_the_hello_and_mirrors_the_head_digest() {
         let mut metrics = ScoreMetrics {
@@ -4796,17 +4870,30 @@ mod tests {
             resident: None,
         };
         seal_engine_identity(&mut metrics, &hello);
-        assert_eq!(
-            metrics.engine_backend.as_deref(),
-            Some("ds4-dfm-rs@abc123 overlay=def nvcc=12.8 driver=580")
-        );
-        assert_eq!(metrics.engine_device.as_deref(), Some("cuda sm_121"));
+        assert!(metrics
+            .engine_backend
+            .as_deref()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
+        assert!(metrics
+            .engine_device
+            .as_deref()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
         assert_eq!(metrics.engine_protocol_version, Some(1));
         assert_eq!(metrics.head_provenance_sha256, Some("ab".repeat(32)));
         assert_eq!(
             metrics.per_prompt[0].head_provenance_sha256, metrics.head_provenance_sha256,
             "the board reads the head digest off the per-prompt entry"
         );
+        let json = ScorePayload {
+            score: Some(1.0),
+            passed: true,
+            metrics: metrics.clone(),
+        }
+        .to_sealed_json()
+        .unwrap();
+        assert!(json.contains(&"ab".repeat(32)), "{json}");
 
         // An engine that announces none of it seals no key at all (a pre-#106 engine is unchanged).
         let mut bare = ScoreMetrics::default();
@@ -4852,10 +4939,56 @@ mod tests {
         }
     }
 
-    /// The RUNNER and RESIDENT identities are sealed exactly like the head provenance — recorded in
-    /// the score.json metrics, and read back out of the sealed bytes unchanged.
     #[test]
-    fn runner_and_resident_identities_are_sealed_into_the_metrics() {
+    fn planted_engine_identity_text_never_reaches_serialized_score_json() {
+        let marker = "PLANTED-PROMPT-TEXT 4242";
+        let mut metrics = ScoreMetrics {
+            per_prompt: vec![crate::score::ScorePerPrompt::default()],
+            ..Default::default()
+        };
+        seal_engine_identity(
+            &mut metrics,
+            &bench_runner::Hello {
+                nonce: "n".to_string(),
+                protocol_version: Some(1),
+                backend: Some(marker.to_string()),
+                device: Some(marker.to_string()),
+                capabilities: Vec::new(),
+                spec_modes: Vec::new(),
+                head_provenance: Some(bench_protocol::HeadProvenance {
+                    sha256: marker.to_string(),
+                    bytes: 7,
+                    file_count: 1,
+                }),
+                max_batch_size: None,
+                runner: Some(bench_protocol::RunnerIdentity {
+                    id: marker.to_string(),
+                    model_type: marker.to_string(),
+                    manifest_sha256: marker.to_string(),
+                    build: marker.to_string(),
+                }),
+                resident: Some(bench_protocol::ResidentIdentity {
+                    pid: 4242,
+                    load_epoch: 4243,
+                }),
+            },
+        );
+        let json = ScorePayload {
+            score: Some(1.0),
+            passed: true,
+            metrics,
+        }
+        .to_sealed_json()
+        .unwrap();
+        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
+        assert!(!json.contains("4242"), "{json}");
+        assert!(!json.contains("4243"), "{json}");
+    }
+
+    /// Runner free text is sealed, valid digests stay readable, and resident numbers stay log-only.
+    #[test]
+    fn runner_identity_digest_and_resident_numbers_have_safe_serialized_forms() {
         let mut metrics = ScoreMetrics::default();
         seal_engine_identity(
             &mut metrics,
@@ -4880,12 +5013,24 @@ mod tests {
                 }),
             },
         );
-        assert_eq!(metrics.runner_id.as_deref(), Some("layr/qwen4exp-125b-a6b"));
-        assert_eq!(metrics.runner_model_type.as_deref(), Some("qwen4_exp"));
+        assert!(metrics
+            .runner_id
+            .as_deref()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
+        assert!(metrics
+            .runner_model_type
+            .as_deref()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
         assert_eq!(metrics.runner_manifest_sha256, Some("ab".repeat(32)));
-        assert_eq!(metrics.runner_build.as_deref(), Some("c4089870"));
-        assert_eq!(metrics.resident_pid, Some(4242));
-        assert_eq!(metrics.resident_load_epoch, Some(1_756_944_000));
+        assert!(metrics
+            .runner_build
+            .as_deref()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
+        assert_eq!(metrics.resident_pid, None);
+        assert_eq!(metrics.resident_load_epoch, None);
 
         // ROUND TRIP through the sealed bytes: Yukon reads score.json as {score, metrics}, so the
         // keys must survive serialization under their sealed names and read back identically.
@@ -4898,12 +5043,21 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = v["metrics"].as_object().unwrap();
-        assert_eq!(obj["runner_id"], "layr/qwen4exp-125b-a6b");
-        assert_eq!(obj["runner_model_type"], "qwen4_exp");
+        assert!(obj["runner_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
+        assert!(obj["runner_model_type"]
+            .as_str()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
         assert_eq!(obj["runner_manifest_sha256"], "ab".repeat(32));
-        assert_eq!(obj["runner_build"], "c4089870");
-        assert_eq!(obj["resident_pid"], 4242);
-        assert_eq!(obj["resident_load_epoch"], 1_756_944_000u64);
+        assert!(obj["runner_build"]
+            .as_str()
+            .unwrap()
+            .starts_with("engine-text-sha256="));
+        assert!(!obj.contains_key("resident_pid"));
+        assert!(!obj.contains_key("resident_load_epoch"));
         let back: ScorePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.metrics, metrics);
     }
@@ -4938,8 +5092,10 @@ mod tests {
         let err = retain_timed_hello(&mut slot, hello_with(4242, 8))
             .expect_err("a changed load_epoch is a mid-window reload");
         assert_eq!(err.name(), "resident_identity_changed_within_window");
-        assert!(err.to_string().contains("load_epoch 7"));
-        assert!(err.to_string().contains("load_epoch 8"));
+        assert!(err.to_string().contains("pid or load_epoch changed"));
+        assert!(!err.to_string().contains("4242"));
+        assert!(!err.to_string().contains(" 7"));
+        assert!(!err.to_string().contains(" 8"));
 
         // A DIFFERENT resident process is refused too.
         let mut slot = None;
@@ -5005,11 +5161,9 @@ mod tests {
         .to_sealed_json()
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&sealed).unwrap();
-        assert_eq!(
-            v["metrics"]["per_prompt"][0]["effective_mean_draft_len"],
-            json!(0.0),
-            "0 is a REAL measured value the board reads; it must be sealed, not omitted"
-        );
+        assert!(v["metrics"]["per_prompt"][0]
+            .get("effective_mean_draft_len")
+            .is_none());
     }
 
     /// The GATES-ONLY official payload measured no timed prompt, so it seals NO record and the key
@@ -7784,9 +7938,6 @@ mod tests {
                             f(r, &format!("{role}_decode_window_seconds_per_token")),
                             decode
                         );
-                        let seed_spt =
-                            f(r, &format!("{role}_seed_prefill_window_seconds_per_token"));
-                        assert!(seed_spt * BENCHMARK_DECODE_SEED_TOKENS as f64 >= 0.06);
                         assert!(
                             decode * (BENCHMARK_DECODE_STEPS as f64) < 0.06,
                             "{combine:?}: {role} decode {decode} s/tok carries the seed prefill"
@@ -7841,7 +7992,11 @@ mod tests {
                 .collect()
         }
 
-        fn assert_sealed_clean(payload: &ScorePayload, tokens: &[i64]) {
+        fn assert_sealed_clean(
+            payload: &ScorePayload,
+            tokens: &[i64],
+            expected_mismatch_bucket: Option<i64>,
+        ) {
             assert!(!payload.passed);
             let sealed = payload.to_sealed_json().unwrap();
             assert_carries_no_token(&sealed, tokens);
@@ -7849,11 +8004,15 @@ mod tests {
             for key in [
                 "first_failing_case",
                 "first_failing_layer",
-                "first_failing_step",
                 "expected_token",
                 "actual_token",
             ] {
                 assert_eq!(m[key], serde_json::Value::Null, "{key}");
+            }
+            if expected_mismatch_bucket.is_some() {
+                assert!(m.get("first_failing_step").is_none());
+            } else {
+                assert_eq!(m["first_failing_step"], serde_json::Value::Null);
             }
         }
 
@@ -7869,7 +8028,7 @@ mod tests {
                 "{}",
                 payload.metrics.error
             );
-            assert_sealed_clean(&payload, &every_token());
+            assert_sealed_clean(&payload, &every_token(), Some(2));
         }
 
         /// Paired, exact rule: the candidate leg returns a different token at step 5.
@@ -7890,7 +8049,7 @@ mod tests {
                 "{}",
                 payload.metrics.error
             );
-            assert_sealed_clean(&payload, &every_token());
+            assert_sealed_clean(&payload, &every_token(), Some(4));
         }
 
         /// Paired: the CONTROL leg returns a different token at step 3.
@@ -7927,7 +8086,7 @@ mod tests {
                 "{}",
                 payload.metrics.error
             );
-            assert_sealed_clean(&payload, &every_token());
+            assert_sealed_clean(&payload, &every_token(), None);
         }
 
         /// Paired with a tolerance: 13 of 129 tokens differ, the replay counts them, and the
@@ -7954,7 +8113,7 @@ mod tests {
                 payload.metrics.error
             );
             assert_eq!(payload.metrics.token_mismatch_count, Some(13));
-            assert_sealed_clean(&payload, &every_token());
+            assert_sealed_clean(&payload, &every_token(), Some(8));
         }
 
         /// Paired with a near-tie limit: a different token that is not the reference engine's
@@ -7979,7 +8138,7 @@ mod tests {
                 "{}",
                 payload.metrics.error
             );
-            assert_sealed_clean(&payload, &every_token());
+            assert_sealed_clean(&payload, &every_token(), Some(8));
         }
 
         /// The official correctness gate: the base case expects 130_000.. and the engine returns
@@ -8000,7 +8159,7 @@ mod tests {
             let mut tokens = every_token();
             tokens.extend(expected);
             tokens.extend((0..64).map(|i| 140_000 + i));
-            assert_sealed_clean(&payload, &tokens);
+            assert_sealed_clean(&payload, &tokens, Some(0));
         }
     }
 }

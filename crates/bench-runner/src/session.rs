@@ -17,7 +17,7 @@ use bench_protocol::{
     REPLAY_WIDTH_COHORT, TOP_LOGITS_K,
 };
 
-use crate::error::{Result, RunnerError};
+use crate::error::{json_error_summary, Result, RunnerError};
 use crate::transport::{LineTransport, ReadOutcome};
 
 /// The decoded, validated `hello` (id=0) fields callers care about.
@@ -171,10 +171,13 @@ impl<T: LineTransport> Session<T> {
             )));
         }
         if !resp.ok {
-            return Err(RunnerError::Protocol(format!(
-                "hello was not ok: {}",
-                resp.error.as_deref().unwrap_or("unknown error")
-            )));
+            return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                detail: "hello was not ok".to_string(),
+                engine_text: resp
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            }));
         }
         let nonce = match resp.nonce {
             Some(ref n) if !n.is_empty() => n.clone(),
@@ -288,21 +291,21 @@ impl<T: LineTransport> Session<T> {
         // Engine fault) BEFORE the nonce/id checks, which would otherwise mask it as a
         // NonceMismatch or id-mismatch. Either way the session is discarded (fail-closed).
         if resp.id == -1 && !resp.ok {
-            return Err(RunnerError::Engine {
+            return Err(log_engine_text_error(RunnerError::Engine {
                 kind: req.kind.clone(),
                 message: resp
                     .error
                     .clone()
                     .unwrap_or_else(|| "engine could not parse the request line".to_string()),
-            });
+            }));
         }
 
         // 1. nonce
         if resp.nonce.as_deref() != Some(self.nonce.as_str()) {
-            return Err(RunnerError::NonceMismatch {
+            return Err(log_engine_text_error(RunnerError::NonceMismatch {
                 expected: self.nonce.clone(),
                 got: resp.nonce.clone(),
-            });
+            }));
         }
         // 2. id echo
         if resp.id != id {
@@ -313,13 +316,13 @@ impl<T: LineTransport> Session<T> {
         }
         // 3. ok
         if !resp.ok {
-            return Err(RunnerError::Engine {
+            return Err(log_engine_text_error(RunnerError::Engine {
                 kind: req.kind.clone(),
                 message: resp
                     .error
                     .clone()
                     .unwrap_or_else(|| "unknown error".to_string()),
-            });
+            }));
         }
         Ok(resp)
     }
@@ -345,7 +348,7 @@ impl<T: LineTransport> Session<T> {
 
     /// `decode_begin` carrying the per-module speculative `spec` (`docs/spec-config-design.md`).
     /// When a `spec` is supplied, benchd enforces SPEC-NEVER-IGNORED (§6): the response MUST echo an
-    /// `effective_spec` EQUAL to the request, else the session is discarded fail-closed
+    /// `effective_spec` that honors the request, else the session is discarded fail-closed
     /// ([`RunnerError::SpecEchoDivergence`]) — the same posture as [`Self::require_free_run_capability`].
     /// A `None` spec issues the legacy no-spec `decode_begin` and does not check the echo.
     pub fn decode_begin_spec(
@@ -384,10 +387,10 @@ impl<T: LineTransport> Session<T> {
             return Ok(());
         }
         self.discarded = true;
-        Err(RunnerError::SpecModeNotRunnable {
+        Err(log_engine_text_error(RunnerError::SpecModeNotRunnable {
             mode: spec.mode.clone(),
             advertised: self.spec_modes.clone(),
-        })
+        }))
     }
 
     /// Spec-never-ignored enforcement (§6): when `requested` is `Some`, the engine's echoed
@@ -413,13 +416,13 @@ impl<T: LineTransport> Session<T> {
             return Ok(());
         }
         self.discarded = true;
-        Err(RunnerError::SpecEchoDivergence {
+        Err(log_engine_text_error(RunnerError::SpecEchoDivergence {
             requested: serde_json::to_string(requested).unwrap_or_default(),
             effective: resp
                 .effective_spec
                 .as_ref()
                 .map(|e| serde_json::to_string(e).unwrap_or_default()),
-        })
+        }))
     }
 
     /// `decode_step` — one timed decode step (§3).
@@ -877,12 +880,13 @@ fn read_response_line<T: LineTransport>(
                 // error into whatever record seals it. The leading clause is unchanged, so
                 // anything keying on this signature still matches.
                 let base = "engine closed the stream before returning a response".to_string();
-                return Err(RunnerError::Protocol(
-                    match transport.failure_diagnostic() {
-                        Some(diagnostic) => format!("{base} ({diagnostic})"),
-                        None => base,
-                    },
-                ));
+                return Err(match transport.failure_diagnostic() {
+                    Some(diagnostic) => log_engine_text_error(RunnerError::ProtocolEngineText {
+                        detail: format!("{base} ({})", diagnostic.detail),
+                        engine_text: diagnostic.engine_text,
+                    }),
+                    None => RunnerError::Protocol(base),
+                });
             }
             ReadOutcome::Line(line) => {
                 if !line_looks_like_json_response(&line) {
@@ -898,18 +902,29 @@ fn read_response_line<T: LineTransport>(
                 match serde_json::from_str::<WorkerResponse>(&line) {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
-                        let base = format!("engine response line could not be decoded: {e}");
-                        return Err(RunnerError::Protocol(
-                            match transport.failure_diagnostic() {
-                                Some(diagnostic) => format!("{base} ({diagnostic})"),
-                                None => base,
-                            },
-                        ));
+                        let mut detail = format!(
+                            "engine response line could not be decoded: {}",
+                            json_error_summary(&e)
+                        );
+                        let mut engine_text = format!("decode error: {e}; response line: {line}");
+                        if let Some(diagnostic) = transport.failure_diagnostic() {
+                            detail.push_str(&format!(" ({})", diagnostic.detail));
+                            engine_text.push_str(&format!("; {}", diagnostic.engine_text));
+                        }
+                        return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                            detail,
+                            engine_text,
+                        }));
                     }
                 }
             }
         }
     }
+}
+
+fn log_engine_text_error(error: RunnerError) -> RunnerError {
+    eprintln!("benchd: engine diagnostic: {}", error.diagnostic());
+    error
 }
 
 /// (b) admission (engine #35/#37) — build the TRUSTED-ORACLE request: the per-stream seed context,
@@ -944,12 +959,15 @@ fn assert_replay_width_echo(requested: &str, report: &CohortReferenceReplayRepor
     match report.replay_width.as_deref() {
         None => Ok(()),
         Some(echoed) if echoed == requested => Ok(()),
-        Some(echoed) => Err(RunnerError::Protocol(format!(
-            "cohort_reference_replay ran at replay_width '{echoed}' but the request pinned \
-             '{requested}' — the trusted oracle's replay geometry is the reference the token \
-             tolerance gate judges against; refusing the report rather than gating against a \
-             geometry benchd did not request"
-        ))),
+        Some(echoed) => Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+            detail: format!(
+                "cohort_reference_replay did not use the requested replay_width {requested:?} — \
+                 the trusted oracle's replay geometry is the reference the token tolerance gate \
+                 judges against; refusing the report rather than gating against a geometry benchd \
+                 did not request"
+            ),
+            engine_text: echoed.to_string(),
+        })),
     }
 }
 
@@ -985,8 +1003,13 @@ mod tests {
         assert!(assert_replay_width_echo(REPLAY_WIDTH_COHORT, &report(Some("cohort"))).is_ok());
         let err = assert_replay_width_echo(REPLAY_WIDTH_COHORT, &report(Some("canonical")))
             .expect_err("a divergent width must be refused fail-closed");
-        let msg = err.to_string();
-        assert!(msg.contains("canonical") && msg.contains("cohort"), "{msg}");
+        let sealed = err.to_string();
+        assert!(
+            sealed.contains("cohort") && sealed.contains("engine-text-sha256="),
+            "{sealed}"
+        );
+        assert!(!sealed.contains("canonical"), "{sealed}");
+        assert!(err.diagnostic().contains("canonical"));
     }
 
     #[test]

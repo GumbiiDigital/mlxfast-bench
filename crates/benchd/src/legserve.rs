@@ -69,6 +69,15 @@ pub const LEG_SERVE_BOOT_FAILED: &str = "LEG-SERVE-BOOT-FAILED";
 /// A resident socket was inherited from the environment on a path that boots its own, per leg.
 pub const LEG_SERVE_INHERITED_SOCKET: &str = "LEG-SERVE-INHERITED-SOCKET";
 
+fn engine_text_seal(text: &str) -> String {
+    let scrubbed = bench_runner::scrub_engine_text(text);
+    format!(
+        "engine-text-sha256={} engine-text-bytes={}",
+        bench_core::hash::sha256_hex(scrubbed.as_bytes()),
+        scrubbed.len()
+    )
+}
+
 /// The per-leg boot/teardown script THIS platform's trees carry. The argv contract behind the two
 /// names is the same; the name differs because the two engine families already had their own
 /// resident wrapper and each keeps it.
@@ -207,10 +216,12 @@ pub fn boot_leg(
             )
         })?;
     if !out.status.success() {
+        let stderr = bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
+        eprintln!("benchd: engine diagnostic: {stderr}");
         return Err(format!(
             "{LEG_SERVE_BOOT_FAILED}: the {label} leg's resident did not boot ({}): {}",
             out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            engine_text_seal(&stderr)
         ));
     }
     let socket = std::fs::read_to_string(&socket_out)
@@ -514,7 +525,7 @@ mod tests {
         for (name, body) in [
             (
                 "nonzero",
-                "#!/bin/sh\necho 'resident refused: no GPU lock' >&2\nexit 2\n",
+                "#!/bin/sh\necho 'PLANTED-PROMPT-TEXT 4242' >&2\nexit 2\n",
             ),
             ("nosocket", "#!/bin/sh\nexit 0\n"),
         ] {
@@ -530,6 +541,10 @@ mod tests {
             }
             let err = boot_leg(&dir, None, "serial-control", Platform::Mlx).unwrap_err();
             assert!(err.contains(LEG_SERVE_BOOT_FAILED), "{name}: {err}");
+            if name == "nonzero" {
+                assert!(err.contains("engine-text-sha256="), "{err}");
+                assert!(!err.contains("PLANTED") && !err.contains("4242"), "{err}");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

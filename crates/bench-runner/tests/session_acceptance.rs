@@ -98,28 +98,40 @@ fn free_run_correctness_returns_tokens() {
 fn hello_rejects_nonzero_id() {
     let engine = MockEngine::new().with_hello(1, true, Some(MOCK_NONCE));
     let result = Session::connect(engine);
-    assert!(matches!(result, Err(RunnerError::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(RunnerError::Protocol(_) | RunnerError::ProtocolEngineText { .. })
+    ));
 }
 
 #[test]
 fn hello_rejects_not_ok() {
     let engine = MockEngine::new().with_hello(0, false, Some(MOCK_NONCE));
     let result = Session::connect(engine);
-    assert!(matches!(result, Err(RunnerError::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(RunnerError::ProtocolEngineText { .. })
+    ));
 }
 
 #[test]
 fn hello_rejects_missing_nonce() {
     let engine = MockEngine::new().with_hello(0, true, None);
     let result = Session::connect(engine);
-    assert!(matches!(result, Err(RunnerError::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(RunnerError::Protocol(_) | RunnerError::ProtocolEngineText { .. })
+    ));
 }
 
 #[test]
 fn hello_rejects_empty_nonce() {
     let engine = MockEngine::new().with_hello(0, true, Some(""));
     let result = Session::connect(engine);
-    assert!(matches!(result, Err(RunnerError::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(RunnerError::Protocol(_) | RunnerError::ProtocolEngineText { .. })
+    ));
 }
 
 // ---- WS1-5: nonce / id / engine-error session discard ---------------------
@@ -155,7 +167,7 @@ fn id_mismatch_discards_session() {
     session.decode_begin(&[1, 2, 3]).unwrap();
 
     match session.decode_step(10) {
-        Err(RunnerError::Protocol(_)) => {}
+        Err(RunnerError::Protocol(_) | RunnerError::ProtocolEngineText { .. }) => {}
         other => panic!("expected Protocol, got {other:?}"),
     }
     match session.decode_step(11) {
@@ -205,7 +217,7 @@ fn eof_before_response_is_protocol_error() {
     let (mut session, _hello) = Session::connect(engine).unwrap();
     session.begin_phase();
     match session.decode_begin(&[1, 2, 3]) {
-        Err(RunnerError::Protocol(_)) => {}
+        Err(RunnerError::Protocol(_) | RunnerError::ProtocolEngineText { .. }) => {}
         other => panic!("expected Protocol, got {other:?}"),
     }
     assert!(session.is_discarded());
