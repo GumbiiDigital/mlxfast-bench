@@ -1162,7 +1162,22 @@ pub(crate) fn write_private_audit(value: &Value) -> Result<(), serde_json::Error
     let Some(path) = std::env::var_os("BENCHD_PRIVATE_AUDIT_PATH") else {
         return Ok(());
     };
-    let bytes = serde_json::to_vec_pretty(value)?;
+    let existing_diagnostics = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|existing| {
+            existing
+                .get(bench_runner::error::PRIVATE_ENGINE_DIAGNOSTICS_KEY)
+                .cloned()
+        });
+    let mut private = value.clone();
+    if let (Some(diagnostics), Some(object)) = (existing_diagnostics, private.as_object_mut()) {
+        object.insert(
+            bench_runner::error::PRIVATE_ENGINE_DIAGNOSTICS_KEY.to_string(),
+            diagnostics,
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&private)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true);
     #[cfg(unix)]
@@ -1704,6 +1719,10 @@ mod tests {
         assert_eq!(private["metrics"]["checked_steps"], 77);
         assert_eq!(private["metrics"]["spec_rounds"], 7_777);
         assert_eq!(private["metrics"]["spec_acceptance_rate"], 0.66);
+        assert_eq!(
+            private[bench_runner::error::PRIVATE_ENGINE_DIAGNOSTICS_KEY][0]["text"],
+            "PLANTED-PRIVATE-ENGINE-TEXT"
+        );
         let leg = &private["metrics"]["paired_legs"][0];
         assert_eq!(leg["control_warmup_wall_seconds"], 1.25);
         assert_eq!(leg["control_warmup_prefill_seconds_per_token"], 0.01);
@@ -1782,6 +1801,13 @@ mod tests {
                 ..zero_metrics()
             },
         };
+        if mode == "set" {
+            bench_runner::error::record_private_engine_text(
+                "test-engine-text",
+                "PLANTED-PRIVATE-ENGINE-TEXT",
+            )
+            .unwrap();
+        }
         let sealed = payload.to_sealed_json().unwrap();
         for planted in ["77", "7777", "0.66", "[1,2,3,4,5,6,7,8]"] {
             assert!(!sealed.contains(planted), "{sealed}");

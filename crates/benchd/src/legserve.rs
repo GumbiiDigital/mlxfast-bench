@@ -74,12 +74,11 @@ pub const LEG_SERVE_BOOT_FAILED: &str = "LEG-SERVE-BOOT-FAILED";
 /// A resident socket was inherited from the environment on a path that boots its own, per leg.
 pub const LEG_SERVE_INHERITED_SOCKET: &str = "LEG-SERVE-INHERITED-SOCKET";
 
-fn engine_text_seal(text: &str) -> String {
-    let scrubbed = bench_runner::scrub_engine_text(text);
+fn socket_file_text_seal(text: &str) -> String {
     format!(
-        "engine-text-sha256={} engine-text-bytes={}",
-        bench_core::hash::sha256_hex(scrubbed.as_bytes()),
-        scrubbed.len()
+        "class=resident-socket-file sha256={} length={}",
+        bench_core::hash::sha256_hex(text.as_bytes()),
+        text.len()
     )
 }
 
@@ -141,8 +140,12 @@ impl LegServe {
         if !out.status.success() {
             let stderr =
                 bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
-            let sealed = engine_text_seal(&stderr);
-            eprintln!("benchd: resident teardown diagnostic: {sealed}");
+            let class = "resident-teardown-stderr";
+            if bench_runner::error::record_private_engine_text(class, &stderr).is_err() {
+                eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
+            }
+            let sealed = bench_runner::error::engine_text_seal(&stderr);
+            eprintln!("benchd: resident teardown diagnostic: class={class} {sealed}");
             return Err(format!(
                 "the {} leg's resident did not stop cleanly ({}): {}",
                 self.label, out.status, sealed
@@ -283,11 +286,15 @@ pub fn boot_leg(
         })?;
     if !out.status.success() {
         let stderr = bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
-        eprintln!("benchd: engine diagnostic: {stderr}");
+        let class = "resident-boot-stderr";
+        if bench_runner::error::record_private_engine_text(class, &stderr).is_err() {
+            eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
+        }
+        let sealed = bench_runner::error::engine_text_seal(&stderr);
+        eprintln!("benchd: engine diagnostic: class={class} {sealed}");
         return Err(format!(
             "{LEG_SERVE_BOOT_FAILED}: the {label} leg's resident did not boot ({}): {}",
-            out.status,
-            engine_text_seal(&stderr)
+            out.status, sealed
         ));
     }
     let socket = std::fs::read_to_string(&socket_out)
@@ -310,9 +317,9 @@ pub fn boot_leg(
         ));
     }
     eprintln!(
-        "benchd: the {label} leg's resident is up from {} at {socket} ({spec_mode}, draft-len \
-         {draft_len})",
-        workspace.display()
+        "benchd: the {label} leg's resident is up from {} ({spec_mode}, draft-len {draft_len}); {}",
+        workspace.display(),
+        socket_file_text_seal(&socket)
     );
     Ok(LegServe {
         workspace: workspace.to_path_buf(),
@@ -359,6 +366,16 @@ pub fn refuse_inherited_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_file_log_seals_the_text() {
+        let planted = "/tmp/PLANTED-PROMPT-TEXT.sock";
+        let sealed = socket_file_text_seal(planted);
+        assert!(sealed.starts_with("class=resident-socket-file sha256="));
+        assert!(sealed.contains(&format!("length={}", planted.len())));
+        assert!(!sealed.contains(planted));
+        assert!(!sealed.contains("PLANTED"));
+    }
 
     /// A workspace holding a STUB boot/stop script for `platform`. The stub records the argv of
     /// every call in `calls.txt` and answers `--boot` with `socket` on the first line of the

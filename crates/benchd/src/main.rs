@@ -2826,6 +2826,12 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     // The paired measure-job runs under ONE resident for the window, so both legs' profiles name
     // the process env's socket — the legacy single-resident topology, unchanged.
     let window_socket = process_resident_socket();
+    let mut sandbox_run_inputs = args.goldens.clone();
+    sandbox_run_inputs.extend(args.correctness_golden.iter().cloned());
+    if !args.local_dev {
+        let env = std::env::vars_os().collect();
+        refuse_audit_inside_candidate_workspace(&env, &args.candidate)?;
+    }
     // a8 ruling (b) — Seatbelt is a macOS facility. On a non-macOS host (the linux-aarch64 CUDA
     // box) `/usr/bin/sandbox-exec` does not exist, so the legs resolve NO plan and spawn
     // UNSANDBOXED through `spawn_official_worker`, exactly as the official and iterate paths
@@ -2836,6 +2842,14 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         .then(|| {
             resolve_official_sandbox_from_env(
                 &baseline_exec,
+                WorkerSandboxScope {
+                    worker_tree: &args.baseline,
+                    role: WorkerLegRole::Control {
+                        trusted_reference_tree: &args.baseline,
+                    },
+                    baseline_workspace: Some(&args.baseline),
+                    run_input_paths: &sandbox_run_inputs,
+                },
                 golden_path,
                 false,
                 None,
@@ -2847,6 +2861,12 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         .then(|| {
             resolve_official_sandbox_from_env(
                 &candidate_exec,
+                WorkerSandboxScope {
+                    worker_tree: &args.candidate,
+                    role: WorkerLegRole::Candidate,
+                    baseline_workspace: Some(&args.baseline),
+                    run_input_paths: &sandbox_run_inputs,
+                },
                 golden_path,
                 false,
                 None,
@@ -4383,6 +4403,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         } else {
             None
         };
+    let mut sandbox_run_inputs = args.goldens.clone();
+    sandbox_run_inputs.extend(args.control_goldens.iter().cloned());
+    sandbox_run_inputs.extend(args.warmup_golden.iter().cloned());
+    sandbox_run_inputs.extend(args.baseline_calibration.iter().cloned());
+    if args.mode == Mode::Official {
+        let env = std::env::vars_os().collect();
+        refuse_audit_inside_candidate_workspace(&env, Path::new("."))?;
+    }
 
     // B-2: an OFFICIAL run FAILS CLOSED on any missing sandbox prerequisite (worker disabled,
     // MLXFAST_NO_SANDBOX=1, no engine exe, no derivable profile, no sandbox-exec) — resolved
@@ -4403,6 +4431,12 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             // process env's socket, which is the topology it runs under.
             Some(resolve_official_sandbox_from_env(
                 &args.engine,
+                WorkerSandboxScope {
+                    worker_tree: Path::new("."),
+                    role: WorkerLegRole::Candidate,
+                    baseline_workspace: args.baseline_workspace.as_deref(),
+                    run_input_paths: &sandbox_run_inputs,
+                },
                 &args.goldens[0],
                 true,
                 validated_private_dir.as_deref(),
@@ -4924,6 +4958,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // golden and leg 2 the candidate's, and a leg must be denied the file it is verified
         // against, not the other leg's.
         let leg_sandbox_plan = |engine: &str,
+                                worker_tree: &Path,
+                                role: WorkerLegRole<'_>,
                                 golden: &Path,
                                 honor_executable_override: bool|
          -> bench_runner::Result<Option<OfficialSandboxPlan>> {
@@ -4933,6 +4969,12 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             let socket = spawn_resident_socket(&leg_env.borrow(), None);
             resolve_official_sandbox_from_env(
                 engine,
+                WorkerSandboxScope {
+                    worker_tree,
+                    role,
+                    baseline_workspace: Some(&workspace),
+                    run_input_paths: &sandbox_run_inputs,
+                },
                 golden,
                 honor_executable_override,
                 validated_private_dir.as_deref(),
@@ -4979,6 +5021,10 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         let spawn_baseline = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let plan = leg_sandbox_plan(
                 &reference_engine_str,
+                &workspace,
+                WorkerLegRole::Control {
+                    trusted_reference_tree: &workspace,
+                },
                 control_golden_path(pair_golden.get()),
                 false,
             )?;
@@ -4994,7 +5040,13 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // Leg 2's workers, rooted at the SUBMISSION tree — byte-for-byte the single-leg path's.
         let timed_hello = std::cell::RefCell::new(None);
         let spawn_timed = || -> bench_runner::Result<Session<ChildStdioTransport>> {
-            let plan = leg_sandbox_plan(&args.engine, &args.goldens[pair_golden.get()], true)?;
+            let plan = leg_sandbox_plan(
+                &args.engine,
+                &workspace_root,
+                WorkerLegRole::Candidate,
+                &args.goldens[pair_golden.get()],
+                true,
+            )?;
             let transport = spawn_official_worker(
                 plan.as_ref(),
                 &args.engine,
@@ -5748,6 +5800,153 @@ fn official_gates_only_from_env() -> bool {
         .unwrap_or(false)
 }
 
+const WORKER_EVALUATOR_PATH_ENVS: &[&str] = &[
+    "MLXFAST_QWEN38_GOLDEN_DIR",
+    "MLXFAST_BASELINE_WORKSPACE",
+    "MLXFAST_BASELINE_CALIBRATION",
+    "BASELINE_CALIBRATION",
+    "BENCHD_BIN_DIR",
+    "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+    "MLXFAST_PRIVATE_DIR",
+    "BENCHD_PRIVATE_AUDIT_PATH",
+    "MLXFAST_RESIDENT_LOG_ROOT",
+    "RESIDENT_UP_LOG_DIR",
+];
+const RUNNER_REGISTRATION_FILES: &[&str] = &[".credentials", ".credentials_rsaparams", ".runner"];
+
+#[derive(Clone, Copy)]
+enum WorkerLegRole<'a> {
+    Candidate,
+    Control { trusted_reference_tree: &'a Path },
+}
+
+struct WorkerSandboxScope<'a> {
+    worker_tree: &'a Path,
+    role: WorkerLegRole<'a>,
+    baseline_workspace: Option<&'a Path>,
+    run_input_paths: &'a [PathBuf],
+}
+
+fn nonempty_env_path(
+    env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    name: &str,
+) -> Option<PathBuf> {
+    env.get(std::ffi::OsStr::new(name))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolved_worker_path(path: &Path) -> Result<PathBuf, String> {
+    bench_runner::sandbox::absolute_path(&path.to_string_lossy())
+        .map(PathBuf::from)
+        .map_err(|error| {
+            format!(
+                "official benchmark sandbox path {} could not be resolved safely: {error}",
+                path.display()
+            )
+        })
+}
+
+fn refuse_audit_inside_candidate_workspace(
+    env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    candidate_workspace: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let audit = nonempty_env_path(env, "BENCHD_PRIVATE_AUDIT_PATH")
+        .as_deref()
+        .map(resolved_worker_path)
+        .transpose()?;
+    let workspace = resolved_worker_path(candidate_workspace)?;
+    if audit
+        .as_ref()
+        .is_some_and(|path| path.starts_with(&workspace))
+    {
+        return Err(format!(
+            "BENCHD_PRIVATE_AUDIT_PATH must be outside the candidate-readable workspace tree {}",
+            workspace.display()
+        ));
+    }
+    Ok(audit)
+}
+
+/// Match the engine resident profile's evaluator-only list. Only an explicit control spawn whose
+/// executable is inside its trusted reference tree may read that tree.
+fn worker_evaluator_paths(
+    env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    worker_tree: &Path,
+    executable: &Path,
+    role: WorkerLegRole<'_>,
+    baseline_workspace: Option<&Path>,
+    run_input_paths: &[PathBuf],
+) -> Result<Vec<String>, String> {
+    let resolved_tree = resolved_worker_path(worker_tree)?;
+    let trusted_control_root = match role {
+        WorkerLegRole::Candidate => None,
+        WorkerLegRole::Control {
+            trusted_reference_tree,
+        } => {
+            let root = resolved_worker_path(trusted_reference_tree)?;
+            let resolved_executable = resolved_worker_path(executable)?;
+            resolved_executable.starts_with(&root).then_some(root)
+        }
+    };
+
+    let resolved_audit = if matches!(role, WorkerLegRole::Candidate) {
+        refuse_audit_inside_candidate_workspace(env, worker_tree)?
+    } else {
+        nonempty_env_path(env, "BENCHD_PRIVATE_AUDIT_PATH")
+            .as_deref()
+            .map(resolved_worker_path)
+            .transpose()?
+    };
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for name in WORKER_EVALUATOR_PATH_ENVS {
+        if let Some(path) = nonempty_env_path(env, name) {
+            if *name == "MLXFAST_BASELINE_WORKSPACE" {
+                let resolved = resolved_worker_path(&path)?;
+                if trusted_control_root.as_ref() == Some(&resolved) {
+                    continue;
+                }
+            }
+            paths.push(path);
+        }
+    }
+    if let Some(path) = baseline_workspace {
+        let resolved = resolved_worker_path(path)?;
+        if trusted_control_root.as_ref() != Some(&resolved) {
+            paths.push(path.to_path_buf());
+        }
+    }
+    paths.extend(run_input_paths.iter().cloned());
+
+    if let Some(audit) = resolved_audit.as_ref() {
+        if let Some(parent) = audit.parent() {
+            if parent != resolved_tree {
+                paths.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let build_cache = nonempty_env_path(env, "MLXFAST_BUILD_CACHE_DIR").or_else(|| {
+        nonempty_env_path(env, "HOME").map(|home| home.join(".cache/mlxfast-engine-build"))
+    });
+    if let Some(path) = build_cache {
+        paths.push(path);
+    }
+
+    if let Some(workspace) = nonempty_env_path(env, "RUNNER_WORKSPACE") {
+        if let Some(root) = workspace.parent().and_then(Path::parent) {
+            paths.extend(RUNNER_REGISTRATION_FILES.iter().map(|name| root.join(name)));
+        }
+    }
+
+    let mut resolved = std::collections::BTreeSet::new();
+    for path in paths {
+        resolved.insert(resolved_worker_path(&path)?.to_string_lossy().to_string());
+    }
+    Ok(resolved.into_iter().collect())
+}
+
 /// Resolve the official-run Seatbelt sandbox from the process env + the engine/golden paths,
 /// FAIL-CLOSED (Swift `runtimeWorkerOptions`, main.swift:1143-1219). Reads the `MLXFAST_*`
 /// knobs, probes `/usr/bin/sandbox-exec` for executability, and returns the resolved plan or
@@ -5757,11 +5956,22 @@ fn official_gates_only_from_env() -> bool {
 /// outbound Unix-socket connect the worker needs to attach to the resident bench-worker.
 fn resolve_official_sandbox_from_env(
     engine: &str,
+    scope: WorkerSandboxScope<'_>,
     golden: &Path,
     honor_executable_override: bool,
     validated_private_dir: Option<&str>,
     resident_socket: Option<&str>,
 ) -> Result<OfficialSandboxPlan, String> {
+    let env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+        std::env::vars_os().collect();
+    let evaluator_paths = worker_evaluator_paths(
+        &env,
+        scope.worker_tree,
+        Path::new(engine),
+        scope.role,
+        scope.baseline_workspace,
+        scope.run_input_paths,
+    )?;
     let use_rw = std::env::var("MLXFAST_USE_RUNTIME_WORKER").ok();
     let no_sb = std::env::var("MLXFAST_NO_SANDBOX").ok();
     // `honor_executable_override` is FALSE for the REFERENCE leg of a paired run: that leg's
@@ -5798,6 +6008,7 @@ fn resolve_official_sandbox_from_env(
         resident_socket,
         fallback_executable: engine,
         golden_path: &golden_str,
+        evaluator_paths: &evaluator_paths,
         sandbox_exec_available: sandbox_exec_is_executable(),
     };
     // forwards_worker_stderr = false: official never echoes worker stderr (the plan also
@@ -8295,6 +8506,178 @@ mod tests {
         );
     }
 
+    /// Candidate and control workers share every evaluator deny except the control's own tree.
+    #[test]
+    fn worker_evaluator_paths_keep_candidate_denies_and_drop_only_control_baseline() {
+        let env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = [
+            ("MLXFAST_QWEN38_GOLDEN_DIR", "/eval/goldens"),
+            ("MLXFAST_BASELINE_WORKSPACE", "/eval/reference"),
+            ("MLXFAST_BASELINE_CALIBRATION", "/eval/calibration.json"),
+            ("BASELINE_CALIBRATION", "/eval/measure-calibration.json"),
+            ("BENCHD_BIN_DIR", "/eval/bin"),
+            ("MLXFAST_CORRECTNESS_GOLDEN_PATH", "/eval/correctness.json"),
+            ("MLXFAST_PRIVATE_DIR", "/eval/private"),
+            ("BENCHD_PRIVATE_AUDIT_PATH", "/eval/audit/private.json"),
+            ("MLXFAST_RESIDENT_LOG_ROOT", "/eval/resident-logs"),
+            ("RESIDENT_UP_LOG_DIR", "/eval/logs"),
+            ("HOME", "/home/runner"),
+            ("RUNNER_WORKSPACE", "/runner/_work/repo/repo"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+
+        let run_inputs = vec![
+            PathBuf::from("/cli/calibration.json"),
+            PathBuf::from("/cli/candidate.golden.json"),
+            PathBuf::from("/cli/control.golden.json"),
+            PathBuf::from("/cli/warmup.golden.json"),
+        ];
+        let candidate = worker_evaluator_paths(
+            &env,
+            Path::new("/candidate/tree"),
+            Path::new("/candidate/tree/bin/engine"),
+            WorkerLegRole::Candidate,
+            Some(Path::new("/cli/reference")),
+            &run_inputs,
+        )
+        .unwrap();
+        let control = worker_evaluator_paths(
+            &env,
+            Path::new("/eval/reference"),
+            Path::new("/eval/reference/bin/engine"),
+            WorkerLegRole::Control {
+                trusted_reference_tree: Path::new("/eval/reference"),
+            },
+            Some(Path::new("/eval/reference")),
+            &run_inputs,
+        )
+        .unwrap();
+        let expected_shared = [
+            "/eval/goldens",
+            "/eval/calibration.json",
+            "/eval/measure-calibration.json",
+            "/eval/bin",
+            "/eval/correctness.json",
+            "/eval/private",
+            "/eval/audit/private.json",
+            "/eval/audit",
+            "/eval/resident-logs",
+            "/eval/logs",
+            "/home/runner/.cache/mlxfast-engine-build",
+            "/runner/_work/.credentials",
+            "/runner/_work/.credentials_rsaparams",
+            "/runner/_work/.runner",
+            "/cli/calibration.json",
+            "/cli/candidate.golden.json",
+            "/cli/control.golden.json",
+            "/cli/warmup.golden.json",
+        ];
+
+        assert!(candidate.iter().any(|path| path == "/eval/reference"));
+        assert!(candidate.iter().any(|path| path == "/cli/reference"));
+        assert!(!control.iter().any(|path| path == "/eval/reference"));
+        for path in expected_shared {
+            let resolved = resolved_worker_path(Path::new(path))
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert!(candidate.iter().any(|actual| actual == &resolved), "{path}");
+            assert!(control.iter().any(|actual| actual == &resolved), "{path}");
+        }
+        assert_eq!(candidate.len(), control.len() + 2);
+    }
+
+    #[test]
+    fn control_exception_is_explicit_and_requires_a_trusted_executable() {
+        let env = [("MLXFAST_BASELINE_WORKSPACE", "/eval/reference")]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        let nested_candidate = worker_evaluator_paths(
+            &env,
+            Path::new("/eval/reference/candidate"),
+            Path::new("/eval/reference/candidate/bin/engine"),
+            WorkerLegRole::Candidate,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(nested_candidate
+            .iter()
+            .any(|path| path == "/eval/reference"));
+
+        let false_control = worker_evaluator_paths(
+            &env,
+            Path::new("/eval/reference"),
+            Path::new("/candidate/bin/engine"),
+            WorkerLegRole::Control {
+                trusted_reference_tree: Path::new("/eval/reference"),
+            },
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(false_control.iter().any(|path| path == "/eval/reference"));
+    }
+
+    #[test]
+    fn candidate_workspace_cannot_hold_the_private_audit() {
+        let env = [("BENCHD_PRIVATE_AUDIT_PATH", "/candidate/tree/private.json")]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        let error = worker_evaluator_paths(
+            &env,
+            Path::new("/candidate/tree"),
+            Path::new("/candidate/tree/bin/engine"),
+            WorkerLegRole::Candidate,
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("BENCHD_PRIVATE_AUDIT_PATH"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_registration_paths_are_derived_before_symlink_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "benchd-runner-registration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runner_root = root.join("runner/_work");
+        let target = root.join("checkout-target");
+        std::fs::create_dir_all(runner_root.join("repo")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let workspace = runner_root.join("repo/repo");
+        symlink(&target, &workspace).unwrap();
+        let env = [("RUNNER_WORKSPACE", workspace.as_os_str())]
+            .into_iter()
+            .map(|(key, value)| (std::ffi::OsString::from(key), value.to_os_string()))
+            .collect();
+        let paths = worker_evaluator_paths(
+            &env,
+            Path::new("/candidate"),
+            Path::new("/candidate/engine"),
+            WorkerLegRole::Candidate,
+            None,
+            &[],
+        )
+        .unwrap();
+        let expected = std::fs::canonicalize(&runner_root)
+            .unwrap()
+            .join(".credentials")
+            .to_string_lossy()
+            .to_string();
+        assert!(paths.contains(&expected), "{paths:?}");
+        assert!(!paths.iter().any(|path| path == "/.credentials"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// THE LEG'S OWN SOCKET, AND ONLY ITS OWN, REACHES THAT LEG'S SEATBELT PROFILE.
     ///
     /// Seatbelt counts an AF_UNIX connect as network, so the profile's one `network-outbound`
@@ -8357,36 +8740,40 @@ mod tests {
 
         // THE PROFILE: each leg's profile allows exactly its own socket — not the other leg's, and
         // not the process env's.
+        let resolved_socket = |socket: &str| bench_runner::sandbox::absolute_path(socket).unwrap();
+        let reference_socket = resolved_socket(REFERENCE_SOCKET);
+        let candidate_socket = resolved_socket(CANDIDATE_SOCKET);
+        let process_socket = resolved_socket(PROCESS_SOCKET);
         let reference_profile = profile_for(reference.as_deref());
         assert!(
             reference_profile.contains(&format!(
-                "(allow network-outbound (remote unix-socket (path-literal \"{REFERENCE_SOCKET}\")))"
+                "(allow network-outbound (remote unix-socket (path-literal \"{reference_socket}\")))"
             )),
             "{reference_profile}"
         );
         assert!(
-            !reference_profile.contains(CANDIDATE_SOCKET),
+            !reference_profile.contains(&candidate_socket),
             "the reference leg must not be allowed to reach the candidate's resident: \
              {reference_profile}"
         );
         assert!(
-            !reference_profile.contains(PROCESS_SOCKET),
+            !reference_profile.contains(&process_socket),
             "the reference leg must not be allowed to reach a window resident: {reference_profile}"
         );
 
         let candidate_profile = profile_for(candidate.as_deref());
         assert!(
             candidate_profile.contains(&format!(
-                "(allow network-outbound (remote unix-socket (path-literal \"{CANDIDATE_SOCKET}\")))"
+                "(allow network-outbound (remote unix-socket (path-literal \"{candidate_socket}\")))"
             )),
             "{candidate_profile}"
         );
         assert!(
-            !candidate_profile.contains(REFERENCE_SOCKET),
+            !candidate_profile.contains(&reference_socket),
             "{candidate_profile}"
         );
         assert!(
-            !candidate_profile.contains(PROCESS_SOCKET),
+            !candidate_profile.contains(&process_socket),
             "{candidate_profile}"
         );
         // Exactly ONE allowance, on each side.

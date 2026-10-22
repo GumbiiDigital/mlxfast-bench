@@ -1,12 +1,12 @@
 {
   "version": "0.0.0",
   "branch": "main",
-  "source_commit": "6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b",
+  "source_commit": "0aacae37f70e681d2465fff23856665a04bc44cd",
   "target_triple": "aarch64-apple-darwin",
-  "sha256": "0bbc5a359dea604d45520ff6bed82f3f319cdad90afd503c8fb48926160aacd4",
-  "bytes": 3685664,
+  "sha256": "cf0f0078511ff9664ff08e546b609ade713dd3717fedad2536d1e7187709d3d3",
+  "bytes": 3750528,
   "binaries": {
-    "benchd": {"sha256": "0bbc5a359dea604d45520ff6bed82f3f319cdad90afd503c8fb48926160aacd4", "bytes": 3685664},
-    "record-correctness-golden": {"sha256": "98d6ffb2fb5949511e86d78bb5f9a60b1ee6b935238607fb939675100f7e2318", "bytes": 1550640}
+    "benchd": {"sha256": "cf0f0078511ff9664ff08e546b609ade713dd3717fedad2536d1e7187709d3d3", "bytes": 3750528},
+    "record-correctness-golden": {"sha256": "bdec472cc874fd3deb8b49179f27addc66f2f5eff12907ffeeba7a9895f46ee7", "bytes": 1572816}
   }
 }

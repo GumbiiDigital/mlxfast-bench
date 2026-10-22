@@ -123,6 +123,59 @@ fn hello_not_ok_seals_the_engine_error() {
     assert!(error.diagnostic().contains("PLANTED-PROMPT-TEXT 4242"));
 }
 
+#[test]
+fn engine_error_public_stderr_is_hash_only_and_private_audit_keeps_text() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "bench-runner-private-diagnostic-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let private = root.join("private.json");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "engine_error_public_stderr_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("BENCH_RUNNER_PUBLIC_DIAGNOSTIC_CHILD", "1")
+        .env("BENCHD_PRIVATE_AUDIT_PATH", &private)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("PLANTED-PROMPT-TEXT 4242"), "{stderr}");
+    assert!(stderr.contains("class=protocol-engine-text"), "{stderr}");
+    assert!(stderr.contains("engine-text-sha256="), "{stderr}");
+
+    let audit: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&private).unwrap()).unwrap();
+    assert!(audit["engine_diagnostics"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("PLANTED-PROMPT-TEXT 4242"));
+    assert_eq!(
+        std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn engine_error_public_stderr_child() {
+    if std::env::var_os("BENCH_RUNNER_PUBLIC_DIAGNOSTIC_CHILD").is_none() {
+        return;
+    }
+    let _ = handshake_error_forwarding(
+        "public-diagnostic-child",
+        "#!/bin/sh\nprintf '%s\\n' \
+         '{\"id\":0,\"ok\":false,\"error\":\"PLANTED-PROMPT-TEXT 4242\"}'\n",
+        false,
+    );
+}
+
 /// A worker that emits a non-JSON preamble line and a TRUNCATED (newline-less) hello, then dies
 /// mid-handshake. The partial line is never a response, so the read still ends in EOF — and the
 /// stderr that explains the truncation must still arrive.

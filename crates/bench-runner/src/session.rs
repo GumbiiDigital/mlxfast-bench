@@ -923,7 +923,11 @@ fn read_response_line<T: LineTransport>(
 }
 
 fn log_engine_text_error(error: RunnerError) -> RunnerError {
-    eprintln!("benchd: engine diagnostic: {}", error.diagnostic());
+    let class = error.engine_diagnostic_class();
+    if crate::error::record_private_engine_text(class, &error.diagnostic()).is_err() {
+        eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
+    }
+    eprintln!("benchd: engine diagnostic: class={class} {error}");
     error
 }
 

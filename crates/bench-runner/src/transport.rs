@@ -337,6 +337,7 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 struct WorkerStderrDrain {
     handle: Option<JoinHandle<()>>,
     tail: Arc<Mutex<StderrTail>>,
+    private_recorded: bool,
 }
 
 /// The retained tail: the lines themselves plus the byte total they occupy under the tail budget
@@ -372,6 +373,7 @@ impl WorkerStderrDrain {
         Self {
             handle: Some(handle),
             tail,
+            private_recorded: false,
         }
     }
 
@@ -410,7 +412,17 @@ impl WorkerStderrDrain {
         if let Some(handle) = self.handle.take() {
             join_bounded(handle, grace);
         }
-        self.tail_snapshot()
+        let tail = self.tail_snapshot();
+        if !self.private_recorded && !tail.is_empty() {
+            self.private_recorded = true;
+            let text = format_stderr_tail(&tail);
+            if crate::error::record_private_engine_text("worker-stderr", &text).is_err() {
+                eprintln!(
+                    "benchd: private engine diagnostic audit write failed: class=worker-stderr"
+                );
+            }
+        }
+        tail
     }
 }
 
@@ -558,10 +570,14 @@ fn forward_and_retain(redacted: &str, tail: &Arc<Mutex<StderrTail>>, forward: bo
     // Official sets `forward = false` (no-op emitter, main.swift:1217): the line is still
     // redacted + retained in the tail, but never echoed to this process's stderr, so
     // submitted code cannot stream hidden-prompt content into CI logs. The line is already
-    // redacted, so even when forwarded no golden-adjacent content reaches the log.
+    // sealed, so even a benign-looking engine line cannot carry prompt text into the log.
     if forward {
         let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{WORKER_STDERR_FORWARD_PREFIX}{redacted}");
+        let sealed = crate::error::engine_text_seal(redacted);
+        let _ = writeln!(
+            err,
+            "{WORKER_STDERR_FORWARD_PREFIX}class=worker-stderr {sealed}"
+        );
         drop(err);
     }
 

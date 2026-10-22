@@ -113,16 +113,19 @@ fn seal_official_per_prompt(
 /// `head_provenance_sha256` is MIRRORED onto each `per_prompt` entry, which is where the board reads
 /// it; the entries are already sealed by then, so this fills them in place.
 ///
-/// Free-text identity values are logged after scrubbing, then replaced with stable text seals.
-/// Digest fields stay readable only when they are exactly 64 lowercase hexadecimal characters.
+/// Engine identity values are logged only as stable text seals; full scrubbed values go to the
+/// private audit when configured.
+/// Engine-supplied digest values are hashed again before publication; their raw values stay only
+/// in the private audit.
 /// Resident numbers are log-only; the in-window resident comparison still refuses a change.
 pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
     let seal_text = |field: &str, value: &str| {
-        eprintln!(
-            "benchd: engine identity: {field}={}",
-            bench_runner::scrub_engine_text(value)
-        );
-        bench_runner::error::engine_text_seal(value)
+        if bench_runner::error::record_private_engine_text(field, value).is_err() {
+            eprintln!("benchd: private engine diagnostic audit write failed: class={field}");
+        }
+        let sealed = bench_runner::error::engine_text_seal(value);
+        eprintln!("benchd: engine identity: class={field} {sealed}");
+        sealed
     };
     metrics.engine_backend = hello
         .backend
@@ -136,16 +139,15 @@ pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::He
     metrics.head_provenance_sha256 = hello
         .head_provenance
         .as_ref()
-        .map(|p| crate::measure_job::seal_engine_digest(&p.sha256));
+        .map(|p| crate::measure_job::seal_engine_digest("head_provenance_sha256", &p.sha256));
     metrics.runner_id = hello.runner.as_ref().map(|r| seal_text("runner_id", &r.id));
     metrics.runner_model_type = hello
         .runner
         .as_ref()
         .map(|r| seal_text("runner_model_type", &r.model_type));
-    metrics.runner_manifest_sha256 = hello
-        .runner
-        .as_ref()
-        .map(|r| crate::measure_job::seal_engine_digest(&r.manifest_sha256));
+    metrics.runner_manifest_sha256 = hello.runner.as_ref().map(|r| {
+        crate::measure_job::seal_engine_digest("runner_manifest_sha256", &r.manifest_sha256)
+    });
     metrics.runner_build = hello
         .runner
         .as_ref()
@@ -153,11 +155,8 @@ pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::He
     metrics.resident_pid = None;
     metrics.resident_load_epoch = None;
     if let Some(resident) = &hello.resident {
-        eprintln!("benchd: engine identity: resident_pid={}", resident.pid);
-        eprintln!(
-            "benchd: engine identity: resident_load_epoch={}",
-            resident.load_epoch
-        );
+        let _ = seal_text("resident_pid", &resident.pid.to_string());
+        let _ = seal_text("resident_load_epoch", &resident.load_epoch.to_string());
     }
     for entry in &mut metrics.per_prompt {
         entry
@@ -5551,6 +5550,7 @@ mod tests {
             resident: None,
         };
         seal_engine_identity(&mut metrics, &hello);
+        let public_head = bench_core::hash::sha256_hex("ab".repeat(32).as_bytes());
         assert!(metrics
             .engine_backend
             .as_deref()
@@ -5562,7 +5562,7 @@ mod tests {
             .unwrap()
             .starts_with("engine-text-sha256="));
         assert_eq!(metrics.engine_protocol_version, Some(1));
-        assert_eq!(metrics.head_provenance_sha256, Some("ab".repeat(32)));
+        assert_eq!(metrics.head_provenance_sha256, Some(public_head.clone()));
         assert_eq!(
             metrics.per_prompt[0].head_provenance_sha256, metrics.head_provenance_sha256,
             "the board reads the head digest off the per-prompt entry"
@@ -5574,7 +5574,8 @@ mod tests {
         }
         .to_sealed_json()
         .unwrap();
-        assert!(json.contains(&"ab".repeat(32)), "{json}");
+        assert!(json.contains(&public_head), "{json}");
+        assert!(!json.contains(&"ab".repeat(32)), "{json}");
 
         // An engine that announces none of it seals no key at all (a pre-#106 engine is unchanged).
         let mut bare = ScoreMetrics::default();
@@ -5671,6 +5672,7 @@ mod tests {
     #[test]
     fn runner_identity_digest_and_resident_numbers_have_safe_serialized_forms() {
         let mut metrics = ScoreMetrics::default();
+        let public_manifest = bench_core::hash::sha256_hex("ab".repeat(32).as_bytes());
         seal_engine_identity(
             &mut metrics,
             &bench_runner::Hello {
@@ -5704,7 +5706,10 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("engine-text-sha256="));
-        assert_eq!(metrics.runner_manifest_sha256, Some("ab".repeat(32)));
+        assert_eq!(
+            metrics.runner_manifest_sha256,
+            Some(public_manifest.clone())
+        );
         assert!(metrics
             .runner_build
             .as_deref()
@@ -5732,7 +5737,8 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("engine-text-sha256="));
-        assert_eq!(obj["runner_manifest_sha256"], "ab".repeat(32));
+        assert_eq!(obj["runner_manifest_sha256"], public_manifest);
+        assert_ne!(obj["runner_manifest_sha256"], "ab".repeat(32));
         assert!(obj["runner_build"]
             .as_str()
             .unwrap()

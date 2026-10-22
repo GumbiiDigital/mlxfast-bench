@@ -100,7 +100,16 @@ pub fn check_manifest(path: &Path, hello: &Hello, trusted: bool) -> Result<(), M
         report
             .failures
             .iter()
-            .map(|f| format!("{}: {f}", f.name()))
+            .map(|failure| {
+                let class = failure.name();
+                let text = failure.to_string();
+                if bench_runner::error::record_private_engine_text(class, &text).is_err() {
+                    eprintln!(
+                        "benchd: private engine diagnostic audit write failed: class={class}"
+                    );
+                }
+                format!("{class}: {}", bench_runner::error::engine_text_seal(&text))
+            })
             .collect(),
     ))
 }

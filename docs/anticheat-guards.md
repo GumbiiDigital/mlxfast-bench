@@ -43,3 +43,16 @@ The runtime-worker Seatbelt profile also denies POSIX shared memory, System V IP
 semaphores, preference writes, and Mach lookups. It allows only the five Mach services required by
 MLX: `com.apple.MTLCompilerService`, the two OpenDirectory services, `com.apple.logd`, and
 `com.apple.diagnosticd`. These rules stop one worker from leaving state for a later worker.
+
+Public engine identity digest keys keep their existing names, but their values are now
+`sha256(engine_value)`. This applies to `head_provenance_sha256` and
+`runner_manifest_sha256`, including the per-prompt head mirror. An engine-supplied 64-character
+hex value is not treated as trusted proof. The raw engine value is written only to the private
+audit when `BENCHD_PRIVATE_AUDIT_PATH` is configured.
+
+The worker deny set includes the private audit file, its parent directory when that parent is not
+the worker's own workspace, and the whole `MLXFAST_RESIDENT_LOG_ROOT`. An official candidate run
+refuses when its private audit is inside the candidate-readable workspace. CLI-selected baseline,
+calibration, candidate/control golden, and warm-up golden paths are denied in addition to the
+environment-selected paths. Only an explicit control leg whose executable resolves inside the
+trusted reference tree may read that reference tree.
