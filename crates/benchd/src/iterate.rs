@@ -1073,7 +1073,7 @@ where
 ///
 /// SPEC (`--mtp-depth`): the resolved per-module speculative config rides on the TIMED free-run
 /// decode window of BOTH shapes. `None` (the default) is byte-for-byte today's no-spec request; a
-/// `Some` arms spec-never-ignored, so the engine's `effective_spec` echo must equal it or the leg is
+/// `Some` arms spec-never-ignored, so the engine's `effective_spec` echo must honor it or the leg is
 /// discarded. The teacher-forced correctness gate carries NO spec — see `iterate_flow_windowed`.
 fn local_iterate_timing_params(
     golden: &GoldenFixture,
@@ -1810,8 +1810,8 @@ pub(crate) fn base_metrics(
 /// * `per_prompt` — one entry for the ONE prompt this leg timed, identified BY BYTES with the
 ///   golden's own sha256. Entries are never invented for prompts the run did not measure.
 /// * `effective_spec_mode` / `effective_spec_depth` — WHAT SPECULATED. When the leg carried a spec,
-///   this is the engine's own `effective_spec` ECHO, already validated equal to benchd's request
-///   (spec-never-ignored). When it carried NONE, benchd requested the engine's default path, which
+///   this is the engine's own `effective_spec` ECHO after the spec-never-ignored gate and opaque-key
+///   projection. When it carried NONE, benchd requested the engine's default path, which
 ///   the protocol defines as serial — so the leg seals `serial` / depth `0` rather than leaving the
 ///   scored run with no statement of what ran at all.
 /// * The COUNTERS (`spec_rounds`, `spec_drafted_total`, `spec_accepted_total`,
@@ -3095,29 +3095,15 @@ mod tests {
         );
         assert_eq!(score, expected);
 
-        // Sealed JSON: all metrics fields present + typed, and the sha256 sidecar
-        // matches the exact bytes.
+        // Sealed JSON keeps score inputs and omits engine-derived numbers.
         let json = payload.to_sealed_json().unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let metrics_obj = value.get("metrics").unwrap().as_object().unwrap();
-        // 56 SWIFT-PARITY keys + the ADDITIVE seals a timed local-iterate leg now records: the
-        // board's `per_prompt` array, the run's `effective_spec_mode`/`effective_spec_depth`,
-        // the additive `local_phases` diagnostics, and the leg's window split
-        // (`candidate_leg_decode_window_seconds_per_token`,
-        // `candidate_leg_seed_prefill_window_seconds_per_token`).
-        // This leg requests NO spec, so it seals `serial` / `0` and NONE of the drafting counters
-        // (nothing drafted), and it runs against a mock with no head provenance, so no engine
-        // identity key appears either.
-        assert_eq!(
-            metrics_obj.len(),
-            62,
-            "all ScoreMetrics fields must be present"
-        );
         assert_eq!(
             metrics_obj["effective_spec_mode"],
             serde_json::json!("serial")
         );
-        assert_eq!(metrics_obj["effective_spec_depth"], serde_json::json!(0));
+        assert!(!metrics_obj.contains_key("effective_spec_depth"));
         assert!(metrics_obj.contains_key("per_prompt"));
         for absent in [
             "spec_rounds",
@@ -3129,6 +3115,8 @@ mod tests {
             "spec_rectangular_verification_rounds",
             "spec_serial_verification_rounds",
             "acceptance_lengths",
+            "checked_steps",
+            "candidate_leg_seed_prefill_window_seconds_per_token",
         ] {
             assert!(
                 !metrics_obj.contains_key(absent),
@@ -4499,11 +4487,12 @@ mod tests {
                 .unwrap()
                 .remove("local_phases"),
             Some(serde_json::json!({
-                "correctness": "not_run", "correctness_checked_steps": 0, "timing": "not_run"
+                "correctness": "not_run", "timing": "not_run"
             })),
         );
 
         let mut expected = capture["record"].clone();
+        crate::score::seal_engine_chosen_numbers(&mut expected).unwrap();
         let substituted: Vec<&str> = capture["nondeterministic_or_runner_identity"]
             .as_array()
             .unwrap()
@@ -4511,12 +4500,14 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         for key in &substituted {
-            let live = actual["metrics"][key].clone();
-            assert!(
-                !live.is_null(),
-                "{key} is declared substitutable but absent from the sealed payload"
-            );
-            expected["metrics"][*key] = live;
+            if let Some(live) = actual["metrics"].get(*key) {
+                expected["metrics"][*key] = live.clone();
+            } else {
+                assert!(
+                    expected["metrics"].get(*key).is_none(),
+                    "{key} differs across sealed payloads"
+                );
+            }
         }
         // The reference's record carries its officialBaseline* CONSTANTS in these two fields
         // (#74). A track that pins no pair has no number for the capture to hold, so the capture
@@ -4557,7 +4548,7 @@ mod tests {
         // capture must not quietly relax them.
         assert_eq!(actual["metrics"]["golden_hash"], serde_json::json!(""));
         assert_eq!(actual["metrics"]["case_count"], serde_json::json!(0));
-        assert_eq!(actual["metrics"]["checked_steps"], serde_json::json!(0));
+        assert!(actual["metrics"].get("checked_steps").is_none());
     }
 
     /// The other direction of the same contract, deliberately adjacent: a run that DID happen
@@ -4887,7 +4878,12 @@ mod tests {
             }),
         );
         assert!(
-            payload.metrics.error.contains("engine exploded"),
+            payload
+                .metrics
+                .error
+                .contains("engine reported failure on \"correctness_step\": engine-text-sha256=")
+                && payload.metrics.error.contains("engine-text-bytes=15")
+                && !payload.metrics.error.contains("engine exploded"),
             "site :431 signature — reached a different exit: {:?}",
             payload.metrics.error
         );
@@ -5278,7 +5274,7 @@ mod tests {
         let golden = TestGolden::new().steps(li_expected()).fixture();
         let (mut session, _) = Session::connect(
             window_engine(&golden, vec![2i64; li_expected()])
-                .error_on("free_decode_run", "timed free-run failed"),
+                .error_on("free_decode_run", "PLANTED-PROMPT-TEXT 4242"),
         )
         .unwrap();
         let payload = iterate_flow_windowed(
@@ -5299,7 +5295,13 @@ mod tests {
             "site :619 signature — the timed phase produced nothing"
         );
         assert!(
-            payload.metrics.error.contains("timed free-run failed"),
+            payload
+                .metrics
+                .error
+                .contains("engine reported failure on \"free_decode_run\": engine-text-sha256=")
+                && payload.metrics.error.contains("engine-text-bytes=24")
+                && !payload.metrics.error.contains("PLANTED")
+                && !payload.metrics.error.contains("4242"),
             "site :619 signature — reached a different exit: {:?}",
             payload.metrics.error
         );
@@ -5484,7 +5486,7 @@ mod tests {
             crate::testgolden::assert_carries_no_token(&sealed, &[123_457, 234_568]);
             let m = &serde_json::from_str::<serde_json::Value>(&sealed).unwrap()["metrics"];
             assert_eq!(m["first_failing_case"], serde_json::Value::Null, "{mode:?}");
-            assert_eq!(m["first_failing_step"], serde_json::Value::Null, "{mode:?}");
+            assert!(m.get("first_failing_step").is_none(), "{mode:?}");
         }
     }
 

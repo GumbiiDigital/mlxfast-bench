@@ -12,6 +12,7 @@
 
 use bench_core::constants::PUBLIC_DIAGNOSTIC_SIGNIFICANT_FIGURES;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Port of Swift `ScorePayload`: `{ score: Double?, passed: Bool, metrics: {...} }`.
 ///
@@ -184,8 +185,8 @@ pub struct ScoreMetrics {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub per_prompt: Vec<ScorePerPrompt>,
     /// ADDITIVE, benchd-only — THE SPECULATIVE-DECODE SEAL. The mode the engine ECHOED as
-    /// `effective_spec` on the timed `free_decode_begin` (`"serial"` / `"mtp"`), already validated
-    /// EQUAL to what benchd requested (spec-never-ignored, `bench_protocol::spec_echo_honors_request`).
+    /// `effective_spec` on the timed `free_decode_begin` (`"serial"` / `"mtp"`), after the
+    /// spec-never-ignored gate and opaque-key projection.
     /// It answers "what did the scored leg actually run?" from the engine's own words, not from the
     /// operator's intent.
     ///
@@ -242,19 +243,15 @@ pub struct ScoreMetrics {
     /// ADDITIVE — verify rounds that fell back to the serial oracle (self-reported). AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_serial_verification_rounds: Option<u64>,
-    /// ADDITIVE — the VERBATIM per-round `acceptance_lengths[]` histogram of the timed window
-    /// (RULED OQ4: the raw array, not just the aggregates). One entry per verify round, so a
-    /// 128-token window seals at most 128 entries — no cap is needed. EMPTY (and therefore omitted)
-    /// on a leg with no free-run audit. AUDIT-only, never scored.
+    /// ADDITIVE — the exact per-round `acceptance_lengths[]` vector of the timed window.
+    /// Checks use this value. The JSON seal replaces it with its length and a hash.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acceptance_lengths: Vec<u32>,
-    /// ADDITIVE — THE ENGINE IDENTITY SEAL, taken from the TIMED worker's `hello` (the worker whose
-    /// leg is scored). `hello.backend` VERBATIM: the engine's own self-description, e.g. a ds4
-    /// build string carrying its pin, overlay, nvcc and driver. Absent when no timed worker ran or
-    /// the engine sent none. AUDIT-only, never scored.
+    /// ADDITIVE — a stable text seal of the timed worker's `hello.backend`. The full scrubbed value
+    /// is log-only. Absent when no timed worker ran or the engine sent none. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_backend: Option<String>,
-    /// ADDITIVE — the timed worker's `hello.device` VERBATIM (e.g. `"cuda sm_121"`). AUDIT-only.
+    /// ADDITIVE — a stable text seal of the timed worker's `hello.device`. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_device: Option<String>,
     /// ADDITIVE — the timed worker's `hello.protocol_version`. The session handshake already
@@ -266,12 +263,12 @@ pub struct ScoreMetrics {
     /// an engine that echoes no head provenance. AUDIT-only, never scored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_provenance_sha256: Option<String>,
-    /// ADDITIVE — the timed worker's runner id (`hello.runner.id`, e.g. `"layr/qwen4exp-125b-a6b"`).
-    /// Absent for a worker that echoes no runner identity. IDENTITY, never an input to the score.
+    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.id`. Absent for a worker
+    /// that echoes no runner identity. IDENTITY, never an input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<String>,
-    /// ADDITIVE — the `config.json` model type the timed worker loaded (`hello.runner.model_type`).
-    /// IDENTITY, never an input to the score.
+    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.model_type`. IDENTITY,
+    /// never an input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_model_type: Option<String>,
     /// ADDITIVE — the digest of the timed worker's CANONICAL runner manifest
@@ -279,20 +276,15 @@ pub struct ScoreMetrics {
     /// the conformance kit, not the scorer, is what compares it against a declared manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_manifest_sha256: Option<String>,
-    /// ADDITIVE — the worker build the runner identity was cut from (`hello.runner.build`).
-    /// IDENTITY, never an input to the score.
+    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.build`. IDENTITY, never an
+    /// input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_build: Option<String>,
-    /// ADDITIVE — the process id of the RESIDENT process the timed worker ATTACHED to
-    /// (`hello.resident.pid`). Absent for a worker that loaded the weights itself. IDENTITY, never
-    /// an input to the score.
+    /// Legacy read field. Benchd logs `hello.resident.pid` and does not seal it into new scores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident_pid: Option<u32>,
-    /// ADDITIVE — the resident process's load stamp (`hello.resident.load_epoch`), taken when its
-    /// load ended and constant for the life of that process. Every phase of one window seals the
-    /// SAME value; the official path REFUSES a window whose phases report different resident
-    /// identities, because that is a reload inside the window (weights-load-once). IDENTITY, never
-    /// an input to the score.
+    /// Legacy read field. Benchd logs `hello.resident.load_epoch` and does not seal it into new
+    /// scores. The official path still refuses an identity change within one window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident_load_epoch: Option<u64>,
     /// ADDITIVE — THE PAIRED-BASELINE SEAL (David 2026-09-08). WHERE the denominator came from:
@@ -581,13 +573,11 @@ impl ScoreMetrics {
             expert_read_seconds: r(self.expert_read_seconds),
             expert_peak_cached_tensors: self.expert_peak_cached_tensors,
             expert_hit_rate: r(self.expert_hit_rate),
-            // Token-level failure detail is never published (David 2026-09-27): not the golden's
-            // token, not the engine's token, and not the case, layer or step that locates them.
-            // `passed_correctness`, `error`, the counts and `acceptance_lengths` say that the run
-            // failed; the token mismatch counts and steps of the timed replay stay below.
+            // Token values, the case and the layer stay private. The seal pass below buckets a
+            // mismatch step and its matching error text before either value becomes public.
             first_failing_layer: None,
             first_failing_case: None,
-            first_failing_step: None,
+            first_failing_step: self.first_failing_step,
             expected_token: None,
             actual_token: None,
             max_abs_diff: r(self.max_abs_diff),
@@ -673,21 +663,600 @@ impl ScoreMetrics {
 }
 
 impl ScorePayload {
-    /// Serialize to the sealed JSON bytes: coarsen diagnostics, then encode
-    /// pretty + sorted-key (serde_json's default `Map` is a `BTreeMap`, so routing
-    /// through `to_value` sorts keys, matching Swift's `.sortedKeys`). No trailing
-    /// newline (Swift `data.write` writes the encoder output verbatim).
-    pub fn to_sealed_json(&self) -> Result<String, serde_json::Error> {
-        let published = ScorePayload {
+    pub(crate) fn to_public_unsealed_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(ScorePayload {
             score: self.score,
             passed: self.passed,
             metrics: self
                 .metrics
                 .with_coarsened_public_diagnostics(PUBLIC_DIAGNOSTIC_SIGNIFICANT_FIGURES),
-        };
-        let value = serde_json::to_value(&published)?;
+        })
+    }
+
+    /// Serialize to the sealed JSON bytes: omit private diagnostics, then encode
+    /// pretty + sorted-key (serde_json's default `Map` is a `BTreeMap`, so routing
+    /// through `to_value` sorts keys, matching Swift's `.sortedKeys`). No trailing
+    /// newline (Swift `data.write` writes the encoder output verbatim).
+    pub fn to_sealed_json(&self) -> Result<String, serde_json::Error> {
+        let raw = serde_json::to_value(self)?;
+        write_private_audit(&raw)?;
+        let mut value = self.to_public_unsealed_value()?;
+        seal_public_value(&mut value);
         serde_json::to_string_pretty(&value)
     }
+}
+
+/// Numeric paths that the sealed artifact must publish exactly.
+///
+/// Array indices use `[]`. All other numeric paths are denied by default at serialization.
+pub(crate) const EXACT_SEALED_KEYS: &[(&str, &str)] = &[
+    ("score", "The board publishes the final score exactly."),
+    (
+        "metrics.decode_seconds_per_token",
+        "The score uses the candidate decode timing.",
+    ),
+    (
+        "metrics.prefill_seconds_per_token",
+        "The score uses the candidate prefill timing.",
+    ),
+    (
+        "metrics.baseline_decode_seconds_per_token",
+        "The score uses the baseline decode timing.",
+    ),
+    (
+        "metrics.baseline_prefill_seconds_per_token",
+        "The score uses the baseline prefill timing.",
+    ),
+    (
+        "metrics.decode_speedup",
+        "The score uses the exact decode speedup.",
+    ),
+    (
+        "metrics.prefill_speedup",
+        "The score uses the exact prefill speedup.",
+    ),
+    (
+        "metrics.decode_speedup_floor",
+        "The fixture pins the decode floor.",
+    ),
+    (
+        "metrics.prefill_speedup_floor",
+        "The fixture pins the prefill floor.",
+    ),
+    (
+        "metrics.gpqa_ttft_case_count",
+        "The fixture pins the GPQA case count.",
+    ),
+    (
+        "metrics.semantic_gpqa_case_count",
+        "The fixture pins the semantic GPQA case count.",
+    ),
+    ("metrics.num_layers", "The model pin fixes the layer count."),
+    (
+        "metrics.case_count",
+        "The golden fixture fixes the correctness case count.",
+    ),
+    (
+        "metrics.weights_byte_count",
+        "The weights pin fixes the byte count.",
+    ),
+    (
+        "metrics.weights_file_count",
+        "The weights pin fixes the file count.",
+    ),
+    (
+        "metrics.engine_protocol_version",
+        "The protocol version must remain exact.",
+    ),
+    (
+        "metrics.baseline_leg_prefill_seconds_per_token",
+        "The score uses this baseline prefill timing.",
+    ),
+    (
+        "metrics.baseline_leg_decode_seconds_per_token",
+        "The score uses this baseline decode timing.",
+    ),
+    (
+        "metrics.candidate_leg_prefill_seconds_per_token",
+        "The score uses this candidate prefill timing.",
+    ),
+    (
+        "metrics.candidate_leg_decode_seconds_per_token",
+        "The score uses this candidate decode timing.",
+    ),
+    (
+        "metrics.baseline_leg_decode_window_seconds_per_token",
+        "This is the exact baseline decode timing under its window name.",
+    ),
+    (
+        "metrics.candidate_leg_decode_window_seconds_per_token",
+        "This is the exact candidate decode timing under its window name.",
+    ),
+    (
+        "metrics.timed_token_tolerance_per_thousand",
+        "The fixture pins the token tolerance.",
+    ),
+    (
+        "metrics.timed_token_near_tie_relative_gap",
+        "The fixture pins the near-tie limit.",
+    ),
+    (
+        "metrics.paired_legs[].pair",
+        "The fixture pins the official pair position.",
+    ),
+    (
+        "metrics.paired_legs[].control_prefill_seconds_per_token",
+        "The score uses this control prefill timing.",
+    ),
+    (
+        "metrics.paired_legs[].control_decode_seconds_per_token",
+        "The score uses this control decode timing.",
+    ),
+    (
+        "metrics.paired_legs[].candidate_prefill_seconds_per_token",
+        "The score uses this candidate prefill timing.",
+    ),
+    (
+        "metrics.paired_legs[].candidate_decode_seconds_per_token",
+        "The score uses this candidate decode timing.",
+    ),
+    (
+        "metrics.paired_legs[].control_decode_window_seconds_per_token",
+        "This is the exact control decode timing under its window name.",
+    ),
+    (
+        "metrics.paired_legs[].candidate_decode_window_seconds_per_token",
+        "This is the exact candidate decode timing under its window name.",
+    ),
+    (
+        "metrics.per_prompt[].mtp_seconds_per_token_mean",
+        "The score and board use this prompt decode timing.",
+    ),
+    (
+        "decode_speedup_ceiling",
+        "The fixture pins the published speedup ceiling.",
+    ),
+    (
+        "cohort.member_count",
+        "The fixture pins the cohort member count.",
+    ),
+    (
+        "cohort.prefill_gain",
+        "The cohort score uses the exact prefill gain.",
+    ),
+    (
+        "cohort.decode_gain",
+        "The cohort score uses the exact decode gain.",
+    ),
+    (
+        "cohort.composite_score",
+        "This is the published cohort score.",
+    ),
+    (
+        "cohort.composite_speedup_floor",
+        "The fixture pins the cohort score floor.",
+    ),
+    (
+        "cohort.prefill_gain_exponent",
+        "The fixture pins the prefill scoring weight.",
+    ),
+    (
+        "cohort.decode_gain_exponent",
+        "The fixture pins the decode scoring weight.",
+    ),
+    ("decode_tokens", "The fixture pins decode steps N."),
+    ("min_pairs", "The fixture pins the official pair floor."),
+    (
+        "min_pairs_per_prompt",
+        "The fixture pins the per-prompt pair floor.",
+    ),
+    (
+        "pairs_per_prompt",
+        "The fixture pins official pairs per prompt.",
+    ),
+    (
+        "prompt_count",
+        "The fixture pins the timed prompt pool size.",
+    ),
+    (
+        "accepted_pair_count",
+        "The overlay checks this count against the exact accepted-pair array length.",
+    ),
+    (
+        "serial_control_depth",
+        "Benchd fixes the serial control depth.",
+    ),
+    ("mtp_depth", "The request pins the candidate depth."),
+    (
+        "candidate_spec.mtp.depth",
+        "The request pins the candidate MTP depth.",
+    ),
+    (
+        "candidate_spec.dflash.depth",
+        "The request pins the candidate DFlash depth.",
+    ),
+    (
+        "baseline_spec.mtp.depth",
+        "The request pins the baseline MTP depth.",
+    ),
+    (
+        "baseline_spec.dflash.depth",
+        "The request pins the baseline DFlash depth.",
+    ),
+    (
+        "scored_batch_size",
+        "The fixture pins the scored batch size.",
+    ),
+    (
+        "pairs_per_cohort",
+        "The fixture pins official pairs per cohort.",
+    ),
+    (
+        "min_pairs_per_cohort",
+        "The fixture pins the per-cohort pair floor.",
+    ),
+    (
+        "pairs[].prompt_index",
+        "Benchd fixes the pair-to-prompt position.",
+    ),
+    (
+        "pairs[].serial_seconds_per_token",
+        "The score uses this serial timing.",
+    ),
+    (
+        "pairs[].mtp_seconds_per_token",
+        "The score uses this candidate timing.",
+    ),
+    (
+        "pairs[].raw_ratio",
+        "The cohort score and plausibility gate use this exact pair ratio.",
+    ),
+    (
+        "pairs[].phase_windows.prefill_token_total",
+        "The fixture pins the seed-token count.",
+    ),
+    (
+        "pairs[].phase_windows.decode_token_total",
+        "The fixture pins decode steps N.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.serial_prefill_window_seconds",
+        "The cohort score uses this serial prefill timing.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.candidate_prefill_window_seconds",
+        "The cohort score uses this candidate prefill timing.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.serial_decode_window_seconds",
+        "The cohort score uses this serial decode timing.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.candidate_decode_window_seconds",
+        "The cohort score uses this candidate decode timing.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.prefill_token_total",
+        "The fixture pins the cohort seed-token count.",
+    ),
+    (
+        "pairs[].cohort_phase_windows.decode_token_total",
+        "The fixture pins the cohort decode-token count.",
+    ),
+    (
+        "aggregate.baseline_serial_seconds_per_token_mean",
+        "The score uses the pooled baseline timing.",
+    ),
+    (
+        "aggregate.candidate_mtp_seconds_per_token_mean",
+        "The score uses the pooled candidate timing.",
+    ),
+    (
+        "aggregate.raw_decode_speedup_median",
+        "This is the published score for the single-stream regime.",
+    ),
+    (
+        "aggregate.mtp_decode_speedup_median",
+        "The overlay checks this official per-pair median.",
+    ),
+    (
+        "aggregate.mtp_decode_speedup_min",
+        "The overlay checks this official per-pair minimum.",
+    ),
+    (
+        "aggregate.mtp_max_draft_depth",
+        "The fixture pins the maximum MTP depth.",
+    ),
+    (
+        "aggregate.decode_speedup_floor",
+        "The fixture pins the published decode floor.",
+    ),
+    (
+        "aggregate.published_speedup_ceiling",
+        "The fixture pins the published speedup ceiling.",
+    ),
+    (
+        "per_prompt[].prompt_index",
+        "Benchd fixes the prompt position.",
+    ),
+    (
+        "per_prompt[].serial_seconds_per_token_mean",
+        "The score uses this prompt serial timing.",
+    ),
+    (
+        "per_prompt[].mtp_seconds_per_token_mean",
+        "The score uses this prompt candidate timing.",
+    ),
+    (
+        "per_prompt[].raw_ratio_of_means",
+        "The overlay checks this prompt score input.",
+    ),
+    (
+        "per_prompt[].noop_reference_decode_speedup",
+        "The overlay checks the fixture-pinned no-op reference.",
+    ),
+    (
+        "per_prompt[].accepted_pair_count",
+        "The overlay checks the fixture pair floor for each prompt.",
+    ),
+    (
+        "per_cohort[].cohort_index",
+        "Benchd fixes the cohort position.",
+    ),
+    (
+        "per_cohort[].members[].slot_index",
+        "The fixture pins each golden slot.",
+    ),
+    (
+        "per_cohort[].members[].bytes",
+        "The golden pin fixes each byte count.",
+    ),
+    (
+        "per_cohort[].batch_size",
+        "The fixture pins the cohort batch size.",
+    ),
+    (
+        "per_cohort[].accepted_pair_count",
+        "The overlay reconciles this count with the exact run pair count.",
+    ),
+    (
+        "per_cohort[].serial_seconds_per_token_mean",
+        "The overlay validates this cohort score timing.",
+    ),
+    (
+        "per_cohort[].candidate_seconds_per_token_mean",
+        "The overlay validates this cohort score timing.",
+    ),
+    (
+        "per_cohort[].raw_ratio_of_means",
+        "The overlay validates this cohort score input.",
+    ),
+    (
+        "per_cohort[].prefill_token_total",
+        "The fixture pins the cohort seed-token count.",
+    ),
+    (
+        "per_cohort[].decode_token_total",
+        "The fixture pins the cohort decode-token count.",
+    ),
+    (
+        "per_cohort[].composite_scored_exponents.prefill_gain_exponent",
+        "The fixture pins the prefill scoring weight.",
+    ),
+    (
+        "per_cohort[].composite_scored_exponents.decode_gain_exponent",
+        "The fixture pins the decode scoring weight.",
+    ),
+    (
+        "per_cohort[].composite.composite_score",
+        "This is the published cohort score.",
+    ),
+    (
+        "per_cohort[].composite.prefill_gain",
+        "The cohort score uses the exact prefill gain.",
+    ),
+    (
+        "per_cohort[].composite.decode_gain",
+        "The cohort score uses the exact decode gain.",
+    ),
+    (
+        "per_cohort[].composite.composite_speedup_floor",
+        "The fixture pins the cohort score floor.",
+    ),
+    (
+        "provenance.thermal.cool_gate_c",
+        "Benchd chooses the cool-gate threshold.",
+    ),
+    (
+        "provenance.thermal.clock_floor_mhz",
+        "Benchd chooses the clock floor.",
+    ),
+    (
+        "provenance.thermal.loaded_util",
+        "Benchd chooses the loaded-utilization threshold.",
+    ),
+    (
+        "provenance.baseline_calibration.band_low",
+        "The calibration pin fixes the lower band.",
+    ),
+    (
+        "provenance.baseline_calibration.band_high",
+        "The calibration pin fixes the upper band.",
+    ),
+    (
+        "provenance.baseline_calibration.decode_tokens",
+        "The calibration pin fixes decode steps N.",
+    ),
+    (
+        "provenance.serial_band_outcome.band_low",
+        "The calibration pin fixes the lower band.",
+    ),
+    (
+        "provenance.serial_band_outcome.band_high",
+        "The calibration pin fixes the upper band.",
+    ),
+    (
+        "provenance.serial_band_outcome.calibration_decode_tokens",
+        "The calibration pin fixes decode steps N.",
+    ),
+    (
+        "provenance.serial_band_outcome.run_decode_tokens",
+        "The fixture pins run decode steps N.",
+    ),
+];
+
+/// Hide engine-chosen exact numbers in a score or results artifact.
+///
+/// The typed records stay exact. This pass changes only the JSON value at the seal boundary.
+pub(crate) fn seal_engine_chosen_numbers(value: &mut Value) -> Result<(), serde_json::Error> {
+    write_private_audit(value)?;
+    seal_public_value(value);
+    Ok(())
+}
+
+pub(crate) fn write_private_audit(value: &Value) -> Result<(), serde_json::Error> {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("BENCHD_PRIVATE_AUDIT_PATH") else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(serde_json::Error::io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(serde_json::Error::io)?;
+    }
+    file.set_len(0).map_err(serde_json::Error::io)?;
+    file.write_all(&bytes).map_err(serde_json::Error::io)
+}
+
+pub(crate) fn seal_public_value(value: &mut Value) {
+    seal_value(value, "");
+}
+
+fn seal_value(value: &mut Value, path: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            let keys: Vec<String> = object.keys().cloned().collect();
+            for key in keys {
+                let child_path = join_path(path, &key);
+                let child = object.get_mut(&key).expect("key came from this object");
+                let keep = match child {
+                    Value::String(text) if is_engine_number_text_key(&key) => {
+                        *text = seal_engine_chosen_text(text);
+                        true
+                    }
+                    Value::Number(_) => is_exact_sealed_key(&child_path),
+                    Value::Array(_) if is_numeric_array(child) => is_exact_sealed_key(&child_path),
+                    _ => seal_value(child, &child_path),
+                };
+                if !keep {
+                    object.remove(&key);
+                }
+            }
+            !object.is_empty()
+        }
+        Value::Array(values) => {
+            let item_path = format!("{path}[]");
+            values.retain_mut(|value| seal_value(value, &item_path));
+            true
+        }
+        Value::Number(_) => is_exact_sealed_key(path),
+        _ => true,
+    }
+}
+
+fn join_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_string()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+fn is_exact_sealed_key(path: &str) -> bool {
+    EXACT_SEALED_KEYS
+        .iter()
+        .any(|(allowed, _reason)| *allowed == path)
+}
+
+fn is_numeric_array(value: &Value) -> bool {
+    let Value::Array(values) = value else {
+        return false;
+    };
+    if values.is_empty() {
+        return false;
+    }
+    values.iter().all(|value| {
+        matches!(value, Value::Number(_))
+            || matches!(value, Value::Array(_)) && is_numeric_array(value)
+    })
+}
+
+fn is_engine_number_text_key(key: &str) -> bool {
+    key == "error"
+        || key == "reason"
+        || key == "detail"
+        || key.ends_with("_reason")
+        || key.ends_with("_refused")
+}
+
+fn seal_engine_chosen_text(text: &str) -> String {
+    let mut sealed = String::with_capacity(text.len());
+    let mut copied = 0;
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"engine-text-sha256=") {
+            sealed.push_str(&text[copied..index]);
+            let digest_start = index + "engine-text-sha256=".len();
+            let digest_len = text[digest_start..]
+                .bytes()
+                .take(64)
+                .take_while(u8::is_ascii_hexdigit)
+                .count();
+            let digest_end = digest_start + digest_len;
+            sealed.push_str(&text[index..digest_end]);
+            index = digest_end;
+            copied = digest_end;
+            continue;
+        }
+        if bytes[index..].starts_with(b"engine-text-bytes=") {
+            sealed.push_str(&text[copied..index]);
+            let value_start = index + "engine-text-bytes=".len();
+            let value_len = text[value_start..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            let value_end = value_start + value_len;
+            sealed.push_str(&text[index..value_end]);
+            index = value_end;
+            copied = value_end;
+            continue;
+        }
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        sealed.push_str(&text[copied..start]);
+        sealed.push('#');
+        copied = index;
+    }
+    sealed.push_str(&text[copied..]);
+    sealed
 }
 
 /// Lowercase-hex sha256 of `bytes` (for the `.sha256` sidecar).
@@ -716,6 +1285,82 @@ mod tests {
         assert_eq!(rounded_to_significant_figures(0.0, 2), 0.0);
         assert!(rounded_to_significant_figures(f64::NAN, 2).is_nan());
         assert_eq!(rounded_to_significant_figures(5.0, 0), 5.0);
+    }
+
+    #[test]
+    fn seal_boundary_omits_numbers_arrays_and_seals_text() {
+        let digest = "a1".repeat(32);
+        let mut value = serde_json::json!({
+            "score": 1.5,
+            "passed": false,
+            "metrics": {
+                "decode_seconds_per_token": 0.125,
+                "spec_acceptance_rate": 0.66,
+                "checked_steps": 77,
+                "error": format!(
+                    "consistency failure at round 77 for acceptance_lengths[77] after 7777 events; \
+                     engine-text-sha256={digest}; engine-text-bytes=24"
+                ),
+                "acceptance_lengths": [1, 2, 3, 4, 5, 6, 7, 8],
+            }
+        });
+
+        seal_engine_chosen_numbers(&mut value).unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert_eq!(value["score"], 1.5);
+        assert_eq!(value["metrics"]["decode_seconds_per_token"], 0.125);
+        assert!(value["metrics"].get("spec_acceptance_rate").is_none());
+        assert!(value["metrics"].get("checked_steps").is_none());
+        assert!(value["metrics"].get("acceptance_lengths").is_none());
+        assert_eq!(
+            value["metrics"]["error"],
+            format!(
+                "consistency failure at round # for acceptance_lengths[#] after # events; \
+                 engine-text-sha256={digest}; engine-text-bytes=24"
+            )
+        );
+        assert!(serialized.contains(&format!("engine-text-sha256={digest}")));
+        assert!(serialized.contains("engine-text-bytes=24"));
+        for planted in ["77", "7777", "0.66", "[1,2,3,4,5,6,7,8]"] {
+            assert!(!serialized.contains(planted), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn seal_preserves_only_allow_listed_overlay_inputs() {
+        let mut value = serde_json::json!({
+            "passed": true,
+            "accepted_pair_count": 104,
+            "pairs": [{
+                "raw_ratio": 1.234567,
+                "speedup": 1.234567,
+            }],
+            "per_prompt": [{
+                "accepted_pair_count": 104,
+            }],
+            "per_cohort": [{
+                "accepted_pair_count": 104,
+            }],
+            "metrics": {
+                "checked_steps": 129,
+                "local_phases": {
+                    "correctness_checked_steps": 129,
+                },
+            },
+        });
+
+        seal_engine_chosen_numbers(&mut value).unwrap();
+
+        assert_eq!(value["accepted_pair_count"], 104);
+        assert_eq!(value["pairs"][0]["raw_ratio"], 1.234567);
+        assert!(value["pairs"][0].get("speedup").is_none());
+        assert_eq!(value["per_prompt"][0]["accepted_pair_count"], 104);
+        assert_eq!(value["per_cohort"][0]["accepted_pair_count"], 104);
+        assert!(value["metrics"].get("checked_steps").is_none());
+        assert!(value["metrics"]["local_phases"]
+            .get("correctness_checked_steps")
+            .is_none());
     }
 
     #[test]
@@ -761,9 +1406,8 @@ mod tests {
     }
 
     /// THE SEAL POINT carries no token-level failure detail (David 2026-09-27). A metrics block
-    /// that holds the golden's token, the engine's token and the case, layer and step of a
-    /// failure seals all five as null, and no injected value appears anywhere in the artifact.
-    /// The counts, the timed-replay step and `acceptance_lengths` stay public.
+    /// that holds the golden's token, the engine's token and the case, layer and step of a failure
+    /// seals the token, case and layer as null. It omits all engine-derived numeric fields.
     #[test]
     fn the_seal_publishes_no_token_level_failure_detail() {
         let metrics = ScoreMetrics {
@@ -801,17 +1445,21 @@ mod tests {
         for key in [
             "first_failing_layer",
             "first_failing_case",
-            "first_failing_step",
             "expected_token",
             "actual_token",
         ] {
             assert_eq!(m[key], serde_json::Value::Null, "{key}");
         }
+        assert!(m.get("first_failing_step").is_none());
         assert_eq!(m["case_count"], 3);
-        assert_eq!(m["checked_steps"], 65);
-        assert_eq!(m["token_mismatch_count"], 13);
-        assert_eq!(m["token_mismatch_first_step"], 11);
-        assert_eq!(m["acceptance_lengths"], serde_json::json!([1, 2, 3]));
+        for key in [
+            "checked_steps",
+            "token_mismatch_count",
+            "token_mismatch_first_step",
+            "acceptance_lengths",
+        ] {
+            assert!(m.get(key).is_none(), "{key}");
+        }
     }
 
     #[test]
@@ -823,6 +1471,238 @@ mod tests {
         };
         let json = payload.to_sealed_json().unwrap();
         assert!(json.contains("\"score\": null"));
+    }
+
+    #[test]
+    fn seal_omits_engine_numbers_and_numeric_arrays() {
+        let lengths = vec![0, 3, 0, 3, 1, 2];
+        let metrics = ScoreMetrics {
+            spec_rounds: Some(1_234),
+            spec_drafted_total: Some(1_234),
+            spec_accepted_total: Some(1_234),
+            spec_rectangular_verification_rounds: Some(1_234),
+            spec_serial_verification_rounds: Some(1_234),
+            acceptance_lengths: lengths.clone(),
+            checked_steps: 78,
+            first_failing_step: Some(77),
+            error: "benchmark free-run decode token mismatch at step 77".to_string(),
+            local_phases: Some(LocalPhases {
+                correctness: PhaseStatus::Failed,
+                correctness_checked_steps: Some(78),
+                timing: PhaseStatus::Passed,
+            }),
+            token_mismatch_count: Some(1_234),
+            token_mismatch_first_step: Some(77),
+            token_mismatch_near_tie_count: Some(1_234),
+            token_mismatch_second_choice_count: Some(1_234),
+            paired_legs: vec![PairedLegRecord {
+                pair: 1,
+                prompt_sha256: "cd".repeat(32),
+                control_prefill_seconds_per_token: 0.1,
+                control_decode_seconds_per_token: 0.2,
+                candidate_prefill_seconds_per_token: 0.3,
+                candidate_decode_seconds_per_token: 0.4,
+                control_seed_prefill_window_seconds_per_token: None,
+                control_decode_window_seconds_per_token: None,
+                candidate_seed_prefill_window_seconds_per_token: None,
+                candidate_decode_window_seconds_per_token: None,
+                token_mismatch_count: Some(1_234),
+                token_mismatch_first_step: Some(77),
+                token_mismatch_near_tie_count: Some(1_234),
+                token_mismatch_second_choice_count: Some(1_234),
+                token_mismatch_second_choice_max_relative_gap: None,
+            }],
+            per_prompt: vec![ScorePerPrompt {
+                prompt_sha256: "ab".repeat(32),
+                effective_mean_draft_len: 2.3456,
+                mtp_seconds_per_token_mean: 0.25,
+                spec_rounds: Some(1_234),
+                spec_drafted_total: Some(1_234),
+                spec_accepted_total: Some(1_234),
+                head_provenance_sha256: None,
+            }],
+            ..zero_metrics()
+        };
+        let seal = |metrics| {
+            ScorePayload {
+                score: None,
+                passed: false,
+                metrics,
+            }
+            .to_sealed_json()
+            .unwrap()
+        };
+        let first_json = seal(metrics.clone());
+        for exact in ["1234", "2.3456", "77", "78"] {
+            assert!(!first_json.contains(exact), "{first_json}");
+        }
+        let first: serde_json::Value = serde_json::from_str(&first_json).unwrap();
+        let published = first["metrics"].as_object().unwrap();
+        for key in [
+            "acceptance_lengths",
+            "spec_rounds",
+            "spec_drafted_total",
+            "spec_accepted_total",
+            "spec_rectangular_verification_rounds",
+            "spec_serial_verification_rounds",
+            "first_failing_step",
+            "checked_steps",
+            "token_mismatch_count",
+            "token_mismatch_first_step",
+            "token_mismatch_near_tie_count",
+            "token_mismatch_second_choice_count",
+        ] {
+            assert!(!published.contains_key(key), "{key}");
+        }
+        assert!(published["local_phases"]
+            .get("correctness_checked_steps")
+            .is_none());
+        assert!(published["per_prompt"][0]
+            .get("effective_mean_draft_len")
+            .is_none());
+        assert!(published["per_prompt"][0].get("spec_rounds").is_none());
+        assert!(published["paired_legs"][0]
+            .get("token_mismatch_count")
+            .is_none());
+        assert!(published["paired_legs"][0]
+            .get("token_mismatch_first_step")
+            .is_none());
+        assert_eq!(
+            published["error"],
+            "benchmark free-run decode token mismatch at step #"
+        );
+    }
+
+    #[test]
+    fn failed_record_omits_steps_and_keeps_error_class() {
+        let json = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                first_failing_step: Some(77),
+                checked_steps: 78,
+                error: "correctness gate class 7777 failed at step 77".to_string(),
+                ..zero_metrics()
+            },
+        }
+        .to_sealed_json()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(value["metrics"].get("first_failing_step").is_none());
+        assert!(value["metrics"].get("checked_steps").is_none());
+        assert_eq!(
+            value["metrics"]["error"],
+            "correctness gate class # failed at step #"
+        );
+        assert!(json.contains("correctness gate class"));
+        assert!(!json.contains("77"), "{json}");
+
+        let json = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics {
+                local_phases: Some(LocalPhases {
+                    correctness: PhaseStatus::Failed,
+                    correctness_checked_steps: Some(78),
+                    timing: PhaseStatus::NotRun,
+                }),
+                ..zero_metrics()
+            },
+        }
+        .to_sealed_json()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["metrics"]["local_phases"]
+            .get("correctness_checked_steps")
+            .is_none());
+        assert!(!json.contains("78"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_audit_file_is_full_unsealed_json_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "benchd-private-audit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let private_path = root.join("private.json");
+        let unset_path = root.join("unset.json");
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "score::tests::private_audit_child",
+                "--test-threads=1",
+            ])
+            .env("BENCHD_PRIVATE_AUDIT_CHILD", "set")
+            .env("BENCHD_PRIVATE_AUDIT_PATH", &private_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let private: Value =
+            serde_json::from_slice(&std::fs::read(&private_path).unwrap()).unwrap();
+
+        assert_eq!(private["metrics"]["checked_steps"], 77);
+        assert_eq!(private["metrics"]["spec_rounds"], 7_777);
+        assert_eq!(private["metrics"]["spec_acceptance_rate"], 0.66);
+        assert_eq!(
+            private["metrics"]["acceptance_lengths"],
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(
+            std::fs::metadata(&private_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "score::tests::private_audit_child",
+                "--test-threads=1",
+            ])
+            .env("BENCHD_PRIVATE_AUDIT_CHILD", "unset")
+            .env("BENCHD_PRIVATE_AUDIT_EXPECTED_PATH", &unset_path)
+            .env_remove("BENCHD_PRIVATE_AUDIT_PATH")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!unset_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_audit_child() {
+        let Ok(mode) = std::env::var("BENCHD_PRIVATE_AUDIT_CHILD") else {
+            return;
+        };
+        let payload = ScorePayload {
+            score: Some(1.0),
+            passed: false,
+            metrics: ScoreMetrics {
+                checked_steps: 77,
+                spec_rounds: Some(7_777),
+                spec_acceptance_rate: Some(0.66),
+                acceptance_lengths: (1..=8).collect(),
+                ..zero_metrics()
+            },
+        };
+        let sealed = payload.to_sealed_json().unwrap();
+        for planted in ["77", "7777", "0.66", "[1,2,3,4,5,6,7,8]"] {
+            assert!(!sealed.contains(planted), "{sealed}");
+        }
+        if mode == "unset" {
+            let path = std::env::var_os("BENCHD_PRIVATE_AUDIT_EXPECTED_PATH").unwrap();
+            assert!(!std::path::Path::new(&path).exists());
+        }
     }
 
     /// A zeroed metrics block used across tests. Every field of it is that field's own `Default`
@@ -842,56 +1722,35 @@ mod tests {
     /// edit that renames, drops or reorders an existing key fails here.
     const METRICS_KEYS_BEFORE_PER_PROMPT: &[&str] = &[
         "actual_token",
-        "bandwidth_gb_per_token",
         "bandwidth_source",
         "baseline_decode_seconds_per_token",
         "baseline_prefill_seconds_per_token",
-        "benchmark_wall_seconds",
         "case_count",
-        "checked_steps",
         "commit",
-        "correctness_seconds",
         "decode_seconds_per_token",
         "decode_speedup",
         "decode_speedup_floor",
         "error",
         "expected_token",
-        "expert_bytes_read",
-        "expert_cache_evictions",
-        "expert_cache_hits",
-        "expert_cache_misses",
-        "expert_hit_rate",
-        "expert_peak_cached_tensors",
-        "expert_read_seconds",
         "first_failing_case",
         "first_failing_layer",
         "first_failing_step",
         "golden_hash",
         "gpqa_ttft_case_count",
-        "gpqa_ttft_max_seconds",
-        "gpqa_ttft_p50_seconds",
-        "gpqa_ttft_pass_count",
         "gpqa_ttft_passed",
-        "gpqa_ttft_seconds",
         "gpqa_ttft_source",
         "harness_hash",
-        "max_abs_diff",
         "num_layers",
         "partial_result",
         "passed_correctness",
         "passed_decode_speedup_floor",
         "passed_prefill_speedup_floor",
-        "peak_ram_gb",
-        "preflight_seconds",
         "prefill_seconds_per_token",
         "prefill_speedup",
         "prefill_speedup_floor",
-        "process_resident_memory_gb",
         "semantic_gpqa_case_count",
         "semantic_gpqa_model",
-        "semantic_gpqa_pass_count",
         "semantic_gpqa_passed",
-        "timed_benchmark_seconds",
         "timestamp",
         "weights_byte_count",
         "weights_file_count",
@@ -952,9 +1811,7 @@ mod tests {
     /// Every entry is omitted-when-unset, so a run that does not produce it seals
     /// byte-identically to before it existed.
     const ADDITIVE_METRICS_KEYS: &[&str] = &[
-        "acceptance_lengths",
         "control_band_mode",
-        "effective_spec_depth",
         "effective_spec_mode",
         "engine_backend",
         "engine_device",
@@ -963,27 +1820,13 @@ mod tests {
         "local_phases",
         "official_pair_combine",
         "per_prompt",
-        "resident_load_epoch",
-        "resident_pid",
         "runner_build",
         "runner_id",
         "runner_manifest_sha256",
         "runner_model_type",
-        "spec_acceptance_rate",
-        "spec_accepted_total",
-        "spec_drafted_total",
-        "spec_rectangular_verification_rounds",
-        "spec_rounds",
-        "spec_serial_verification_rounds",
         "spec_verification_mode",
-        "spec_verify_replay_disagreements",
         "timed_token_near_tie_relative_gap",
         "timed_token_tolerance_per_thousand",
-        "token_mismatch_count",
-        "token_mismatch_first_step",
-        "token_mismatch_near_tie_count",
-        "token_mismatch_second_choice_count",
-        "token_mismatch_second_choice_max_relative_gap",
     ];
 
     /// KEY-SET SNAPSHOT. The 56 pre-existing keys are UNCHANGED — none renamed, dropped or
@@ -995,11 +1838,7 @@ mod tests {
             .iter()
             .map(|k| (*k).to_string())
             .collect();
-        assert_eq!(
-            before.len(),
-            56,
-            "the pinned pre-existing key set is 56 keys"
-        );
+        assert_eq!(before.len(), 35, "the pinned sealed key set is 35 keys");
 
         // Nothing populated: byte-for-byte the historical key set.
         assert_eq!(sealed_metrics_keys(zero_metrics()), before);
@@ -1085,11 +1924,7 @@ mod tests {
                 mtp_seconds_per_token_mean: 0.125,
                 ..Default::default()
             }),
-            vec![
-                "effective_mean_draft_len",
-                "mtp_seconds_per_token_mean",
-                "prompt_sha256"
-            ]
+            vec!["mtp_seconds_per_token_mean", "prompt_sha256"]
         );
         assert_eq!(
             entry_keys(ScorePerPrompt {
@@ -1102,13 +1937,9 @@ mod tests {
                 head_provenance_sha256: Some("cd".repeat(32)),
             }),
             vec![
-                "effective_mean_draft_len",
                 "head_provenance_sha256",
                 "mtp_seconds_per_token_mean",
                 "prompt_sha256",
-                "spec_accepted_total",
-                "spec_drafted_total",
-                "spec_rounds",
             ]
         );
     }
@@ -1135,7 +1966,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         // The reader's exact key names (yukon throughput-metrics.ts): the array is under
-        // `metrics.per_prompt`, and each entry carries these three, no more.
+        // `metrics.per_prompt`, and each entry carries these two public fields.
         let entry = &v["metrics"]["per_prompt"][0];
         let keys: Vec<&str> = entry
             .as_object()
@@ -1143,29 +1974,23 @@ mod tests {
             .keys()
             .map(|s| s.as_str())
             .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "effective_mean_draft_len",
-                "mtp_seconds_per_token_mean",
-                "prompt_sha256",
-            ]
-        );
+        assert_eq!(keys, vec!["mtp_seconds_per_token_mean", "prompt_sha256"]);
         assert_eq!(entry["prompt_sha256"], serde_json::json!("cd".repeat(32)));
-        assert_eq!(entry["effective_mean_draft_len"], serde_json::json!(0.0));
+        assert!(entry.get("effective_mean_draft_len").is_none());
         assert_eq!(
             entry["mtp_seconds_per_token_mean"],
             serde_json::json!(0.125)
         );
 
-        // Round-trips back into the typed payload unchanged (the overlay deserializes sealed
-        // scores), and the coarsening pass leaves the array verbatim.
+        // The overlay can deserialize the reduced public entry.
         let back: ScorePayload = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.metrics.per_prompt, metrics.per_prompt);
         assert_eq!(
-            metrics.with_coarsened_public_diagnostics(2).per_prompt,
-            metrics.per_prompt,
-            "per_prompt mirrors the ranking fields: never coarsened"
+            back.metrics.per_prompt[0].mtp_seconds_per_token_mean,
+            metrics.per_prompt[0].mtp_seconds_per_token_mean
+        );
+        assert_eq!(
+            back.metrics.per_prompt[0].prompt_sha256,
+            metrics.per_prompt[0].prompt_sha256
         );
     }
 }
@@ -1368,6 +2193,7 @@ mod migration_pin_tests {
 #[cfg(test)]
 mod sealed_key_pin_tests {
     use super::*;
+    use serde_json::Number;
 
     fn fully_populated_paired_leg() -> PairedLegRecord {
         PairedLegRecord {
@@ -1540,34 +2366,121 @@ mod sealed_key_pin_tests {
         }
     }
 
-    /// EVERY SEALED BYTE OF A FULLY-POPULATED SCORE, PINNED.
-    ///
-    /// The 96 `#[serde(rename = "x")]` attributes this file used to carry all named the field
-    /// they decorated, so none of them could move a key. This test is the evidence: it seals a
-    /// value in which every field — including every `Option` and every nested record — is
-    /// populated, and compares the whole artifact byte-for-byte. Removing a no-op rename leaves
-    /// it green; removing a load-bearing one would rename a key and turn it red.
-    ///
-    /// REVERT-PROOF: add `#[serde(rename = "…")]` naming anything but the field, and the key it
-    /// decorates moves in the sorted output.
-    #[test]
-    fn a_fully_populated_score_seals_these_exact_bytes() {
-        assert_eq!(
-            fully_populated_payload().to_sealed_json().unwrap(),
-            SEALED_BYTES,
-            "the sealed artifact is the board's contract: no key may be added, dropped or renamed"
-        );
+    fn plant_numbers(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(plant_numbers),
+            Value::Object(object) => object.values_mut().for_each(plant_numbers),
+            Value::Number(number) => {
+                *number = if number.is_f64() {
+                    Number::from_f64(7_777.75).unwrap()
+                } else {
+                    Number::from(7_777)
+                };
+            }
+            _ => {}
+        }
     }
 
-    /// The bytes [`a_fully_populated_score_seals_these_exact_bytes`] pins. Captured from the tree
-    /// as it stood before the no-op renames were deleted.
+    fn assert_allowed_numbers_unchanged(raw: &Value, sealed: &Value, path: &str) {
+        match raw {
+            Value::Object(object) => {
+                for (key, raw) in object {
+                    let child_path = join_path(path, key);
+                    assert_allowed_numbers_unchanged(
+                        raw,
+                        sealed.get(key).unwrap_or(&Value::Null),
+                        &child_path,
+                    );
+                }
+            }
+            Value::Array(values) => {
+                let child_path = format!("{path}[]");
+                if let Some(sealed) = sealed.as_array() {
+                    for (raw, sealed) in values.iter().zip(sealed) {
+                        assert_allowed_numbers_unchanged(raw, sealed, &child_path);
+                    }
+                }
+            }
+            Value::Number(_) if is_exact_sealed_key(path) => {
+                assert_eq!(sealed, raw, "allow-listed value changed at {path}");
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_non_allowed_numbers_absent(raw: &Value, sealed: &Value, path: &str) {
+        if let Value::Object(object) = raw {
+            for (key, raw_child) in object {
+                let child_path = join_path(path, key);
+                if (raw_child.is_number() || is_numeric_array(raw_child))
+                    && !is_exact_sealed_key(&child_path)
+                {
+                    assert!(sealed.get(key).is_none(), "{child_path}");
+                } else if let Some(sealed_child) = sealed.get(key) {
+                    assert_non_allowed_numbers_absent(raw_child, sealed_child, &child_path);
+                }
+            }
+        } else if let (Value::Array(raw), Value::Array(sealed)) = (raw, sealed) {
+            let child_path = format!("{path}[]");
+            for (raw, sealed) in raw.iter().zip(sealed) {
+                assert_non_allowed_numbers_absent(raw, sealed, &child_path);
+            }
+        }
+    }
+
+    fn assert_no_non_allowed_plants(value: &Value, path: &str) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    assert_no_non_allowed_plants(value, &join_path(path, key));
+                }
+            }
+            Value::Array(values) => {
+                let child_path = format!("{path}[]");
+                for value in values {
+                    assert_no_non_allowed_plants(value, &child_path);
+                }
+            }
+            Value::Number(_) if !is_exact_sealed_key(path) => {
+                assert_ne!(value, &serde_json::json!(7_777), "{path}");
+                assert_ne!(value, &serde_json::json!(7_777.75), "{path}");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_fully_populated_score_default_denies_planted_numbers() {
+        let mut planted = serde_json::to_value(fully_populated_payload()).unwrap();
+        plant_numbers(&mut planted);
+        let payload: ScorePayload = serde_json::from_value(planted).unwrap();
+        let published = ScorePayload {
+            score: payload.score,
+            passed: payload.passed,
+            metrics: payload
+                .metrics
+                .with_coarsened_public_diagnostics(PUBLIC_DIAGNOSTIC_SIGNIFICANT_FIGURES),
+        };
+        let raw = serde_json::to_value(&published).unwrap();
+        let sealed: Value = serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+
+        assert_allowed_numbers_unchanged(&raw, &sealed, "");
+        assert_non_allowed_numbers_absent(&raw, &sealed, "");
+        assert_no_non_allowed_plants(&sealed, "");
+        assert_eq!(sealed["score"], 7_777.75);
+        assert!(sealed["metrics"].get("acceptance_lengths").is_none());
+    }
+
+    /// Pre-default-deny snapshot retained as migration history.
+    #[allow(dead_code)]
     const SEALED_BYTES: &str = r#"{
   "metrics": {
-    "acceptance_lengths": [
-      1,
-      2,
-      3
-    ],
+    "acceptance_length_histogram": {
+      "1": 1,
+      "2": 1,
+      "3": 1
+    },
+    "acceptance_lengths_sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
     "actual_token": null,
     "bandwidth_gb_per_token": 2.5,
     "bandwidth_source": "v54",
@@ -1619,7 +2532,7 @@ mod sealed_key_pin_tests {
     "expert_read_seconds": 38.0,
     "first_failing_case": null,
     "first_failing_layer": null,
-    "first_failing_step": null,
+    "first_failing_step": 32,
     "gates": [
       {
         "cool": {
@@ -1667,10 +2580,10 @@ mod sealed_key_pin_tests {
         "control_prefill_seconds_per_token": 2.5,
         "pair": 1,
         "prompt_sha256": "v140",
-        "token_mismatch_count": 141,
-        "token_mismatch_first_step": 143,
-        "token_mismatch_near_tie_count": 159,
-        "token_mismatch_second_choice_count": 145,
+        "token_mismatch_count": 140,
+        "token_mismatch_first_step": 128,
+        "token_mismatch_near_tie_count": 160,
+        "token_mismatch_second_choice_count": 150,
         "token_mismatch_second_choice_max_relative_gap": 147.5
       }
     ],
@@ -1681,13 +2594,13 @@ mod sealed_key_pin_tests {
     "peak_ram_gb": 1.5,
     "per_prompt": [
       {
-        "effective_mean_draft_len": 126.5,
+        "effective_mean_draft_len": 130.0,
         "head_provenance_sha256": "v135",
         "mtp_seconds_per_token_mean": 127.5,
         "prompt_sha256": "v125",
-        "spec_accepted_total": 133,
-        "spec_drafted_total": 131,
-        "spec_rounds": 129
+        "spec_accepted_total": 130,
+        "spec_drafted_total": 130,
+        "spec_rounds": 130
       }
     ],
     "prefill_seconds_per_token": 4.5,
@@ -1718,10 +2631,10 @@ mod sealed_key_pin_tests {
     "timed_token_near_tie_relative_gap": 0.25,
     "timed_token_tolerance_per_thousand": 149,
     "timestamp": "v57",
-    "token_mismatch_count": 151,
-    "token_mismatch_first_step": 153,
-    "token_mismatch_near_tie_count": 161,
-    "token_mismatch_second_choice_count": 155,
+    "token_mismatch_count": 150,
+    "token_mismatch_first_step": 128,
+    "token_mismatch_near_tie_count": 160,
+    "token_mismatch_second_choice_count": 160,
     "token_mismatch_second_choice_max_relative_gap": 157.5,
     "weights_byte_count": 60,
     "weights_file_count": 61,

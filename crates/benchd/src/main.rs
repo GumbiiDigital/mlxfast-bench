@@ -3115,8 +3115,8 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             gate_state: recorded,
             quiesce: recorded_quiesce,
             telemetry: None,
-            // The WIRE engine-echoed effective_spec benchd's runner captured + validated (equal to the
-            // request; a divergence would have already discarded the session above). Sealed per leg.
+            // The WIRE engine-echoed effective_spec benchd's runner captured and validated against
+            // the request. A divergence already discarded the session above. Sealed per leg.
             wire_effective_spec,
             // #109 window-2 finding 3 — the WIRE head echo from this leg's hello.
             wire_head_provenance: wire_head_provenance.into_inner(),

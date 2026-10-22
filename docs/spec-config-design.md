@@ -64,29 +64,87 @@ Rules:
 | **Contract / track fixture** | `speculative: { candidate: <spec>, baseline: <spec> }` | `baseline` defaults to `{"mode":"serial"}`. Ranked shape UNVERIFIED(B-4). |
 | **measure-job CLI** | reads from `--contract`; `--candidate-spec / --baseline-spec <json>` as explicit overrides (recorded as `spec_source: "cli-override"` in provenance) | replaces the R1 point-fix; no `--depth` flag anywhere |
 | **Wire (Engine Protocol v1, additive)** | `decode_begin` request gains optional `spec` object; the **response echoes `effective_spec`** — the module-parsed, default-filled block the engine will actually run. `hello` gains optional `spec_modes: ["serial","mtp",…]` capability list. | Additive like `cache_memory`; absent `spec` = engine default (v1 engines unchanged/valid). Unsupported mode → error + session discard (fail-closed). |
-| **results.json provenance** | seals **only the echoed `effective_spec`** per leg, never the requested config | this is the R1 class-closure: provenance is what the engine acknowledged, not what the caller asked |
-| **score.json `metrics.per_prompt`** | the official path AND the local iterate/submit paths seal one record for each timed prompt they measured: `prompt_sha256`, `effective_mean_draft_len` (the free-run audit value, step 3), `mtp_seconds_per_token_mean` (the same enforced decode seconds-per-token the score uses), the per-prompt `spec_rounds` / `spec_drafted_total` / `spec_accepted_total`, and `head_provenance_sha256` | additive and audit-only; the key is absent when the run measured no timed prompt |
+| **results.json provenance** | keeps the echoed effective mode; omits engine-derived numeric fields | requested config pins stay exact; private audit can retain the full echo |
+| **score.json `metrics.per_prompt`** | the official path and the local paths seal one record for each timed prompt | Score timings stay exact. Engine-derived counters and means are omitted. |
 | **`benchd iterate` CLI** | `--mtp-depth <N>` builds `{"mode":"mtp","mtp":{"depth":N}}` for the TIMED free-run decode window; `--candidate-spec <json>` is the explicit override. The two are mutually exclusive, and the depth obeys the same cap as measure-job | ABSENT = no `spec` on the wire = the engine's default (serial). The teacher-forced correctness gate never carries a spec |
-| **score.json spec + identity seal** | `effective_spec_mode`, `effective_spec_depth`, `spec_rounds`, `spec_drafted_total`, `spec_accepted_total`, `spec_acceptance_rate`, `acceptance_lengths`, `engine_backend`, `engine_device`, `engine_protocol_version`, `head_provenance_sha256` | additive and audit-only; every key is omitted when unset, so a run that produces none seals the historical bytes |
+| **score.json spec + identity seal** | `effective_spec_mode` and text identity fields | Numeric spec audit fields are omitted from the public seal. |
 | **v1.1 free-run mode** | orthogonal; unchanged | scoring any of the three still requires v1.1 (mlxfast-bench#100) |
 
 ### 3.1 The `score.json` speculative-decode and engine-identity keys
 
-The sealed `score.json` records what the timed leg ran. `effective_spec_mode` and
-`effective_spec_depth` come from the engine's own `effective_spec` echo, which benchd has already
-checked against its request; a leg that sent no `spec` seals `serial` and depth `0`, because the
-protocol defines an absent `spec` as the engine's default path. A leg that drafted also seals its
-acceptance facts: `spec_rounds` is the verify-round count R, `spec_drafted_total` and
-`spec_accepted_total` are the engine's own draft counters, `spec_acceptance_rate` is
-accepted/drafted, and `acceptance_lengths` is the per-round committed-token histogram, kept
-verbatim (one entry per round, thus at most as many entries as the decode window has tokens). A
-serial leg drafts nothing, so it seals none of those five keys: its counters are always zero and
-its histogram is always all ones. `spec_acceptance_rate` is also absent when nothing was drafted,
-because a zero denominator has no rate. The `engine_backend`, `engine_device`,
-`engine_protocol_version` and `head_provenance_sha256` keys hold the identity the TIMED worker
-announced in its `hello` — the worker whose leg the score measured. Each of these keys is written
-only when it has a value, so a run that produces none seals exactly the bytes it sealed before
-these keys existed. None of them is an input to any score, speedup, floor or band.
+The sealed `score.json` records the effective mode as text. It omits `effective_spec_depth`,
+spec counters, acceptance rates, verification-round counts, acceptance arrays, resident process
+numbers, and per-prompt draft-length means. Benchd still checks these exact values in memory.
+
+The identity keys come from the timed worker's `hello`. Free-text values use
+`engine-text-sha256` seals. `head_provenance_sha256` and `runner_manifest_sha256` stay verbatim
+only as 64 lowercase hex characters. Other digest text uses an `engine-text-sha256` seal.
+The in-window resident identity check is unchanged. None of these fields changes a score or gate.
+
+### 3.2 Sealed numbers
+
+Benchd applies this rule only during JSON serialization. Checks, gates, decisions, and scores use
+exact in-memory values. The public seal removes each JSON number and numeric array unless its path
+is in this allow-list. The seal also removes an object if number removal leaves it empty.
+
+- Score and score inputs stay exact because readers must recompute the published score:
+  `score`, `metrics.{decode,prefill,baseline_decode,baseline_prefill}_seconds_per_token`,
+  `metrics.{decode,prefill}_speedup`, `metrics.{decode,prefill}_speedup_floor`,
+  `metrics.{baseline,candidate}_leg_{prefill,decode}_seconds_per_token`,
+  `metrics.{baseline,candidate}_leg_decode_window_seconds_per_token`,
+  `metrics.per_prompt[].mtp_seconds_per_token_mean`, and
+  `metrics.paired_legs[].{control,candidate}_{prefill,decode}_seconds_per_token`.
+  The allow-list also includes
+  `metrics.paired_legs[].{control,candidate}_decode_window_seconds_per_token`,
+  `decode_speedup_ceiling`,
+  `cohort.{prefill_gain,decode_gain,composite_score}`,
+  `per_cohort[].composite.{prefill_gain,decode_gain,composite_score}`,
+  `pairs[].{serial,mtp}_seconds_per_token`, `pairs[].raw_ratio`,
+  `pairs[].cohort_phase_windows.{serial,candidate}_{prefill,decode}_window_seconds`,
+  `aggregate.{baseline_serial,candidate_mtp}_seconds_per_token_mean`,
+  `aggregate.{raw_decode_speedup_median,mtp_decode_speedup_median,mtp_decode_speedup_min}`,
+  `per_prompt[].{serial,mtp}_seconds_per_token_mean`, and
+  `per_prompt[].{raw_ratio_of_means,noop_reference_decode_speedup}`,
+  `per_cohort[].{serial,candidate}_seconds_per_token_mean`,
+  `per_cohort[].raw_ratio_of_means`, and
+  `per_cohort[].composite_scored_exponents.{prefill_gain_exponent,decode_gain_exponent}`.
+- Fixture and config pins stay exact because they define the run:
+  `metrics.{gpqa_ttft,semantic_gpqa}_case_count`, `metrics.num_layers`,
+  `metrics.case_count`, `metrics.weights_{byte,file}_count`, `metrics.engine_protocol_version`,
+  `metrics.{timed_token_tolerance_per_thousand,timed_token_near_tie_relative_gap}`, and
+  `decode_tokens`, `{min_pairs,min_pairs_per_prompt,pairs_per_prompt,prompt_count}`,
+  `{serial_control_depth,mtp_depth,scored_batch_size,pairs_per_cohort,min_pairs_per_cohort}`,
+  `{candidate_spec,baseline_spec}.{mtp,dflash}.depth`, `pairs[].prompt_index`,
+  `per_prompt[].prompt_index`, `per_cohort[].cohort_index`,
+  `per_cohort[].members[].{slot_index,bytes}`, and `per_cohort[].batch_size`.
+- Benchd-selected indices and official counts stay exact:
+  `metrics.paired_legs[].pair`,
+  `{accepted_pair_count,per_prompt[].accepted_pair_count,per_cohort[].accepted_pair_count}`,
+  and `cohort.member_count`.
+- Token-window pins stay exact:
+  `pairs[].phase_windows.{prefill,decode}_token_total`,
+  `pairs[].cohort_phase_windows.{prefill,decode}_token_total`, and
+  `per_cohort[].{prefill,decode}_token_total`.
+- Limits stay exact because they define acceptance:
+  `aggregate.{mtp_max_draft_depth,decode_speedup_floor,published_speedup_ceiling}`,
+  `cohort.{composite_speedup_floor,prefill_gain_exponent,decode_gain_exponent}`, and
+  `per_cohort[].composite.composite_speedup_floor`.
+- Gate pins stay exact:
+  `provenance.thermal.{cool_gate_c,clock_floor_mhz,loaded_util}`,
+  `provenance.baseline_calibration.{band_low,band_high,decode_tokens}`, and
+  `provenance.serial_band_outcome.{band_low,band_high,calibration_decode_tokens,run_decode_tokens}`.
+
+This list does not include engine audit counters, rates, non-scoring means, non-scoring medians,
+throttle counts, truncation counts, per-stream ratios, clamp counts, `checked_steps`, or
+`first_failing_step`.
+
+In `error`, `reason`, `detail`, `*_reason`, and `*_refused` text, each digit run becomes `#`.
+The seal does not change digits inside `engine-text-sha256=<hex>` or `engine-text-bytes=<value>`.
+
+If `BENCHD_PRIVATE_AUDIT_PATH` is set, benchd writes the full JSON from before this pass to that
+path. On Unix, benchd creates or resets the file with mode `0600`. If the variable is unset,
+benchd writes no private copy. Benchd never writes the private JSON to standard output or standard
+error.
 
 ## 4. Engine-side module mapping
 

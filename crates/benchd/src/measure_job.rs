@@ -43,6 +43,19 @@ use crate::quiescegate::QuiesceRecord;
 // UNVERIFIED(measure-job): the one-gated-retry-per-leg structure + full-reset-between-attempts.
 const MAX_ATTEMPTS: usize = 2;
 
+/// Preserve a digest-shaped engine value. Seal all other engine text before it reaches an artifact.
+pub(crate) fn seal_engine_digest(value: &str) -> String {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        value.to_string()
+    } else {
+        bench_runner::error::engine_text_seal(value)
+    }
+}
+
 /// The maximum number of pair ATTEMPTS the loop will make before giving up, as a multiple of
 /// `target_pairs`. Bounds a candidate that keeps rejecting so the loop terminates and fails
 /// closed (die 5) rather than spinning. The wrapper's exact budget is un-mirrored.
@@ -1400,12 +1413,12 @@ fn flags_in_args(args: &[String]) -> Vec<&str> {
 pub fn tf_regime_is_serial(wire_effective_spec: Option<&SpecConfig>) -> Result<(), String> {
     if let Some(echo) = wire_effective_spec {
         return Err(format!(
-            "teacher-forced leg carries an engine-echoed effective_spec (mode {:?}), but a TF leg is \
+            "teacher-forced leg carries an engine-echoed effective_spec (mode {}), but a TF leg is \
              spawned WITHOUT {SPECULATIVE_PROTOCOL_FLAG} {SPECULATIVE_PROTOCOL_V1_1} and requests no \
              spec, so a conformant gate-off worker cannot have produced one — refusing the leg \
              fail-closed rather than sealing a regime this process could not have reported. \
              {TF_DOWNGRADE_NOTE}",
-            echo.mode
+            bench_runner::error::engine_text_seal(&echo.mode)
         ));
     }
     Ok(())
@@ -1433,12 +1446,13 @@ pub fn tf_hello_carries_no_head_provenance(
 ) -> Result<(), String> {
     if let Some(hp) = wire_head_provenance {
         return Err(format!(
-            "teacher-forced leg carries a hello head_provenance (sha256 {:?}, {} bytes), but a TF \
+            "teacher-forced leg carries a hello head_provenance (sha256 {}, {} bytes), but a TF \
              leg is spawned WITHOUT {SPECULATIVE_PROTOCOL_FLAG} {SPECULATIVE_PROTOCOL_V1_1} and the \
              engine gates head_provenance behind that flag, so a conformant gate-off worker cannot \
              have produced one — refusing the leg fail-closed rather than sealing a head identity \
              this process could not have reported. {TF_DOWNGRADE_NOTE}",
-            hp.sha256, hp.bytes
+            bench_runner::error::engine_text_seal(&hp.sha256),
+            hp.bytes
         ));
     }
     Ok(())
@@ -3542,9 +3556,8 @@ pub struct LegInvocation {
     /// on-box telemetry stream is deferred — the top-level `telemetry` is then OMITTED honestly).
     pub telemetry: Option<TelemetrySample>,
     /// The WIRE engine-echoed `effective_spec` (`docs/spec-config-design.md`) benchd's runner
-    /// captured from the timed `decode_begin`, ALREADY validated EQUAL to the requested spec
-    /// (spec-never-ignored — a divergence discarded the session upstream, so a present leg's echo
-    /// always matched). `None` for a no-spec (legacy) run. Sealed per leg as the effective spec.
+    /// captured from the timed `decode_begin`, after the spec-never-ignored gate and opaque-key
+    /// projection. `None` for a no-spec (legacy) run. Sealed per leg as the effective spec.
     pub wire_effective_spec: Option<SpecConfig>,
     /// #109 window-2 finding 3 — the WIRE `head_provenance` the engine echoed on its `hello`
     /// (`bench_runner::Hello::head_provenance`): the sha256 of the head bytes it ACTUALLY loaded,
@@ -3885,10 +3898,8 @@ pub struct PairRecord {
     /// being described by it.
     pub serial_timed_mode: &'static str,
     pub candidate_timed_mode: &'static str,
-    /// W3 (§3, RULED OQ4) — the CANDIDATE leg's verbatim per-round `acceptance_lengths[]`, persisted
-    /// as collected (not just the aggregates) so cross-run analysis and any re-check of the §2.6
-    /// triple have the full histogram. OMITTED on a teacher-forced pair — never fabricated.
-    /// AUDIT ONLY: never an input to the score.
+    /// W3 (§3, RULED OQ4) — the candidate leg's exact per-round `acceptance_lengths[]`.
+    /// Checks use this value. The JSON seal replaces it with its length and a hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_spec_acceptance_lengths: Option<Vec<u32>>,
     /// B2 — benchd's own SPLIT of each leg's timed window at the `free_decode_begin` /
@@ -3906,22 +3917,21 @@ pub struct PairRecord {
     /// `audit_spec_acceptance_rate` / `audit_spec_drafted_total` remain engine-self-reported.
     #[serde(flatten)]
     pub audit_spec: BTreeMap<String, f64>,
-    /// COHORT (batch-8 brief D6) — the candidate leg's per-stream PRE-`min` natural accept walks
-    /// (B x R), sealed VERBATIM so straggler throttling is a visible fact rather than a silent
-    /// fold into the common committed width. OMITTED on every non-batched pair. AUDIT ONLY —
-    /// these are correlated readings from one window, never per-stream samples.
+    /// COHORT (batch-8 brief D6) — the exact per-stream pre-`min` natural accept walks.
+    /// Checks use the nested shape. The JSON seal publishes its outer length and hashes this shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_cohort_natural_accepted_by_stream: Option<Vec<Vec<u32>>>,
-    /// COHORT (D4) — streams still generating at each round (length R, non-increasing under the
-    /// closed cohort), sealing the tail. OMITTED off the batched regime. AUDIT ONLY.
+    /// COHORT (D4) — exact active-stream counts for each round. The JSON seal emits its length and
+    /// a hash. The key is absent outside the batched regime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_cohort_active_streams_by_round: Option<Vec<u32>>,
-    /// COHORT (D6) — the engine's depth-clamp reason histogram over the window, sealed VERBATIM:
+    /// COHORT (D6) — the engine's depth-clamp reason histogram over the window. Safe keys stay
+    /// verbatim, and unsafe keys become stable engine-text seals:
     /// the evidence for whether the window ACTUALLY SPECULATED (a cohort clamped to depth zero is
     /// a legitimate outcome the record must be able to state). OMITTED off the batched regime.
     /// AUDIT ONLY.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub audit_cohort_depth_clamp_reasons: Option<BTreeMap<String, u32>>,
+    pub audit_cohort_depth_clamp_reasons: Option<BTreeMap<String, u64>>,
     /// COMPOSITE (Gemma cohort scoring) — this pair's PREFILL/DECODE window split (both legs),
     /// RAW parent-clocked seconds. OMITTED on every non-batched pair (the v1.1 single-stream path
     /// is untouched).
@@ -4133,8 +4143,7 @@ fn per_stream_attestation_seal(m: &LegMeasurement) -> Option<PerStreamAttestatio
 /// [`bench_core::near_tie`].
 #[derive(Debug, Clone, Serialize)]
 pub struct CohortNearTieSeal {
-    /// The oracle's logit provenance tag (e.g. `"post_softcap"`), VERBATIM. Provenance for the
-    /// gaps: a relative gap only means what it says against the logit surface it was taken on.
+    /// The oracle's logit provenance tag. `"post_softcap"` stays verbatim; other text is sealed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_provenance: Option<String>,
     /// The ranked readout depth K the oracle ran at, VERBATIM. K < 2 ⇒ no top-2 gap exists and the
@@ -4170,8 +4179,12 @@ pub struct CohortNearTieSeal {
 /// Slot order is the report's own (the caller already PINNED `stream.slot == i` as an integrity
 /// precondition before this runs), so `stats.per_stream[i]` describes cohort member `i`.
 fn cohort_near_tie_seal(report: &bench_protocol::CohortReferenceReplayReport) -> CohortNearTieSeal {
+    let logit_provenance = report
+        .logit_provenance
+        .as_deref()
+        .map(bench_runner::error::seal_logit_provenance);
     let refuse = |reason: String| CohortNearTieSeal {
-        logit_provenance: report.logit_provenance.clone(),
+        logit_provenance: logit_provenance.clone(),
         logit_topk: report.logit_topk,
         rel_envelope: report.rel_envelope,
         stats: None,
@@ -4238,7 +4251,7 @@ fn cohort_near_tie_seal(report: &bench_protocol::CohortReferenceReplayReport) ->
         bench_core::constants::COHORT_TOKEN_TOLERANCE_PER_THOUSAND,
     ) {
         Ok(stats) => CohortNearTieSeal {
-            logit_provenance: report.logit_provenance.clone(),
+            logit_provenance,
             logit_topk: report.logit_topk,
             rel_envelope: report.rel_envelope,
             stats: Some(stats),
@@ -4804,9 +4817,9 @@ fn validate_leg_report(
     let head = inv
         .wire_head_provenance
         .as_ref()
-        .map(|hp| hp.sha256.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|hp| hp.sha256.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(seal_engine_digest);
     match regime {
         // FREE-RUN (single-stream or batched cohort) — the gate is ON, so the head channel exists.
         // The CANDIDATE leg REQUIRES it (fail-closed, unchanged): it is the identity of the BYO
@@ -5278,7 +5291,8 @@ where
             .unwrap_or_default(),
         // COHORT — the candidate's per-stream / per-round cohort vectors, sealed VERBATIM as
         // diagnostics (never scored; never aggregated as samples — inside one window the streams
-        // are correlated readings). OMITTED on every non-batched pair.
+        // are correlated readings). OMITTED on every non-batched pair. The runner already sealed
+        // unsafe histogram keys at ingestion.
         audit_cohort_natural_accepted_by_stream: candidate
             .cohort_audit
             .as_ref()
@@ -7410,7 +7424,8 @@ fn build_cohort_results(
 impl Results {
     /// Serialize to pretty, sorted-key JSON bytes (matches the `score.json` sealing shape).
     pub fn to_sealed_json(&self) -> Result<String, serde_json::Error> {
-        let value = serde_json::to_value(self)?;
+        let mut value = serde_json::to_value(self)?;
+        crate::score::seal_engine_chosen_numbers(&mut value)?;
         serde_json::to_string_pretty(&value)
     }
 }
@@ -7604,7 +7619,7 @@ mod tests {
     const SERIAL_HEAD_SHA: &str =
         "5e51a10000000000000000000000000000000000000000000000000000000000";
     const CANDIDATE_HEAD_SHA: &str =
-        "ca7d1de00000000000000000000000000000000000000000000000000000000";
+        "ca7d1de000000000000000000000000000000000000000000000000000000000";
     // W3 — the draft depth the v1.1 free-run candidate declares (and echoes on the wire).
     const FREE_RUN_DEPTH: u32 = 4;
     // #109 window-2 finding 3 — the R16 mock report echoes (EFFECTIVE_MEAN_DRAFT_LEN /
@@ -9028,6 +9043,33 @@ mod tests {
     }
 
     #[test]
+    fn tf_reject_reason_seals_engine_echo_mode() {
+        const MARKER: &str = "PLANTED-PROMPT-TEXT 4242";
+        let planted = SpecConfig {
+            mode: MARKER.to_string(),
+            mtp: None,
+            dflash: None,
+            dspark: None,
+        };
+        let out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &test_cfg(1, 1),
+            |_p: &TimingParams| ok_serial(),
+            move |_p: &TimingParams| candidate_tf_echo(planted.clone()),
+        )
+        .unwrap();
+
+        let reject = &out.results.rejected_pairs[0];
+        assert_eq!(reject.class, "non-serial-tf-regime");
+        assert!(reject.reason.contains("engine-text-sha256="), "{reject:?}");
+        assert!(reject.reason.contains("engine-text-bytes=24"), "{reject:?}");
+        assert!(!reject.reason.contains("PLANTED"), "{reject:?}");
+        assert!(!reject.reason.contains("4242"), "{reject:?}");
+    }
+
+    #[test]
     fn legb_tf_pair_with_no_echo_accepts_and_seals_the_gate_off_spawn_source() {
         // COORDINATOR RULING (#109, leg B) — the positive half. A TF pair whose legs carry NO
         // effective-spec echo (the shape a gate-off v1 worker actually produces, which before this
@@ -9235,6 +9277,8 @@ mod tests {
             Some(CANDIDATE_HEAD_SHA),
             "head_provenance_sha256 sealed per prompt from the candidate leg's hello"
         );
+        let json = serde_json::to_string(&out.results).unwrap();
+        assert!(json.contains(CANDIDATE_HEAD_SHA), "{json}");
         // The MTP arm's depth cap is sealed; the dflash-specific field is OMITTED (mirror of the
         // dflash direction in `dflash_run_seals_dflash_depth_and_drops_the_mtp_field`).
         assert_eq!(
@@ -9242,6 +9286,31 @@ mod tests {
             Some(MTP_MAX_DRAFT_DEPTH)
         );
         assert_eq!(out.results.aggregate.dflash_effective_depth, None);
+    }
+
+    #[test]
+    fn planted_pair_head_text_never_reaches_serialized_results_json() {
+        const MARKER: &str = "PLANTED-PROMPT-TEXT 4242";
+        let cfg = free_run_cfg(1, 1);
+        let n = BENCHMARK_DECODE_STEPS;
+        let out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &cfg,
+            |_p| ok_free_run_serial(),
+            move |_p: &TimingParams| {
+                let mut inv = inv_free_run(CANDIDATE_SPT, vec![4; n / 4], n)?;
+                inv.wire_head_provenance = head_prov(MARKER);
+                Ok(inv)
+            },
+        )
+        .unwrap();
+        assert!(out.candidate_accepted);
+        let json = serde_json::to_string(&out.results).unwrap();
+        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
+        assert!(!json.contains("4242"), "{json}");
     }
 
     #[test]
@@ -9344,6 +9413,7 @@ mod tests {
         // field. A gate-off worker is gated out of emitting `head_provenance`, so a present object
         // means the leg was not the process benchd spawned. Refused fail-closed under the same class
         // as a present effective-spec echo — the identical tamper case on the identical surface.
+        const MARKER: &str = "PLANTED-PROMPT-TEXT 4242";
         for leg_under_test in ["candidate", "serial"] {
             let cfg = test_cfg(1, 1);
             let out = run_measure_job(
@@ -9354,14 +9424,14 @@ mod tests {
                 move |_p| {
                     let mut i = ok_serial()?;
                     if leg_under_test == "serial" {
-                        i.wire_head_provenance = head_prov(SERIAL_HEAD_SHA);
+                        i.wire_head_provenance = head_prov(MARKER);
                     }
                     Ok(i)
                 },
                 move |_p: &TimingParams| {
                     let mut i = ok_candidate()?;
                     if leg_under_test == "candidate" {
-                        i.wire_head_provenance = head_prov(CANDIDATE_HEAD_SHA);
+                        i.wire_head_provenance = head_prov(MARKER);
                     }
                     Ok(i)
                 },
@@ -9380,6 +9450,10 @@ mod tests {
                 rej.reason
             );
             assert!(rej.reason.contains(SPECULATIVE_PROTOCOL_FLAG));
+            assert!(rej.reason.contains("engine-text-sha256="), "{rej:?}");
+            assert!(rej.reason.contains("engine-text-bytes=24"), "{rej:?}");
+            assert!(!rej.reason.contains("PLANTED"), "{rej:?}");
+            assert!(!rej.reason.contains("4242"), "{rej:?}");
         }
     }
 
@@ -9389,7 +9463,8 @@ mod tests {
         assert!(tf_hello_carries_no_head_provenance(None).is_ok());
         let hp = head_prov(CANDIDATE_HEAD_SHA).unwrap();
         let err = tf_hello_carries_no_head_provenance(Some(&hp)).unwrap_err();
-        assert!(err.contains(CANDIDATE_HEAD_SHA));
+        assert!(err.contains("engine-text-sha256="));
+        assert!(!err.contains(CANDIDATE_HEAD_SHA));
         assert!(err.contains("gate-off worker cannot have produced one"));
         // The two v1.1-gated hello fields ride the SAME spawn gate, so the two predicates agree
         // about what a gate-off leg may carry: nothing.
@@ -10777,7 +10852,8 @@ mod tests {
 
     #[test]
     fn results_sealed_json_is_sorted_and_pretty() {
-        let out = identity_run(&test_cfg(3, 4));
+        let mut out = identity_run(&test_cfg(3, 4));
+        out.results.per_prompt[0].noop_reference_decode_speedup = Some(0.994);
         let json = out.results.to_sealed_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["track_id"], json!("qwen3.8-27b-mtp-v1"));
@@ -10788,6 +10864,49 @@ mod tests {
             v["provenance"]["thermal"]["cool_gate_c_source"],
             json!("bench-core-COOL_GATE_TEMP_C_MLX")
         );
+        let view = crate::overlay::ResultsView::parse(json.as_bytes()).unwrap();
+        crate::overlay::validate_results(
+            &view,
+            Some(bench_core::constants::TRACK_ID),
+            None,
+            &crate::overlay::PoolExpectation {
+                pool_size: 1,
+                min_per_prompt: 3,
+            },
+            &scored_for(Some(bench_core::constants::TRACK_ID), false),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sealed_cohort_results_pass_overlay_validation() {
+        let out = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
+        let json = out.results.to_sealed_json().unwrap();
+        let view = crate::overlay::ResultsView::parse(json.as_bytes()).unwrap();
+        let scored = bench_core::contract::Contract {
+            track_id: Some(bench_core::constants::TRACK_ID.to_string()),
+            scored_batch_size: Some(COHORT_B as u32),
+            prefill_gain_exponent: Some(PREFILL_GAIN_EXPONENT),
+            decode_gain_exponent: Some(DECODE_GAIN_EXPONENT),
+            scores_against_live_control_leg: Some(false),
+            paired_flow_retired: Some(false),
+            ..bench_core::contract::Contract::NONE_DECLARED
+        };
+        crate::overlay::validate_results(
+            &view,
+            Some(bench_core::constants::TRACK_ID),
+            None,
+            &crate::overlay::PoolExpectation {
+                pool_size: COHORT_B,
+                min_per_prompt: PAIRS_PER_COHORT_TARGET,
+            },
+            &scored,
+        )
+        .unwrap();
     }
 
     /// A SCORED CONTRACT for `resolve_track_id`'s tests: it declares the track (or none), plus the
@@ -12325,18 +12444,12 @@ mod tests {
             Some(&4.0)
         );
 
-        // The sealed JSON carries the audit family FLAT (RULED OQ4 — no nested object).
+        // The sealed JSON omits the engine-derived audit family.
         let v: serde_json::Value =
             serde_json::from_str(&out.results.to_sealed_json().unwrap()).unwrap();
         let p0 = &v["pairs"][0];
-        assert_eq!(p0["audit_spec_rounds"], json!((n / 4) as f64));
-        assert_eq!(
-            p0["audit_spec_acceptance_lengths"]
-                .as_array()
-                .unwrap()
-                .len(),
-            n / 4
-        );
+        assert!(p0.get("audit_spec_rounds").is_none());
+        assert!(p0.get("audit_spec_acceptance_lengths").is_none());
         assert!(
             p0.get("audit").is_none(),
             "flat prefix, never a nested `audit` object"
@@ -12420,6 +12533,299 @@ mod tests {
                 .iter()
                 .any(|r| r.class == RejectClass::PrefillWindowUncertified.as_str()),
             "the prefill-window class must be unreachable on a decode-only track"
+        );
+    }
+
+    fn plant_result_numbers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(plant_result_numbers);
+            }
+            serde_json::Value::Object(object) => {
+                object.values_mut().for_each(plant_result_numbers);
+            }
+            serde_json::Value::Number(number) => {
+                *number = if number.is_f64() {
+                    serde_json::Number::from_f64(7_777.75).unwrap()
+                } else {
+                    serde_json::Number::from(7_777)
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn result_path(parent: &str, key: &str) -> String {
+        if parent.is_empty() {
+            key.to_string()
+        } else {
+            format!("{parent}.{key}")
+        }
+    }
+
+    fn result_path_is_exact(path: &str) -> bool {
+        crate::score::EXACT_SEALED_KEYS
+            .iter()
+            .any(|(allowed, _)| *allowed == path)
+    }
+
+    fn assert_result_exact_values_unchanged(
+        raw: &serde_json::Value,
+        sealed: &serde_json::Value,
+        path: &str,
+    ) {
+        match raw {
+            serde_json::Value::Object(object) => {
+                for (key, raw) in object {
+                    let child_path = result_path(path, key);
+                    if let Some(sealed) = sealed.get(key) {
+                        assert_result_exact_values_unchanged(raw, sealed, &child_path);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                let child_path = format!("{path}[]");
+                if let Some(sealed) = sealed.as_array() {
+                    for (raw, sealed) in values.iter().zip(sealed) {
+                        assert_result_exact_values_unchanged(raw, sealed, &child_path);
+                    }
+                }
+            }
+            serde_json::Value::Number(_) if result_path_is_exact(path) => {
+                assert_eq!(sealed, raw, "allow-listed value changed at {path}");
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_result_has_no_non_exact_plants(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    assert_result_has_no_non_exact_plants(value, &result_path(path, key));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                let child_path = format!("{path}[]");
+                for value in values {
+                    assert_result_has_no_non_exact_plants(value, &child_path);
+                }
+            }
+            serde_json::Value::Number(_) if !result_path_is_exact(path) => {
+                assert_ne!(value, &json!(7_777), "{path}");
+                assert_ne!(value, &json!(7_777.75), "{path}");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn results_default_deny_every_planted_numeric_field() {
+        let outcome = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
+        let mut raw = serde_json::to_value(&outcome.results).unwrap();
+        plant_result_numbers(&mut raw);
+        let mut sealed = raw.clone();
+
+        crate::score::seal_engine_chosen_numbers(&mut sealed).unwrap();
+        let serialized = serde_json::to_string(&sealed).unwrap();
+        let sealed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_result_exact_values_unchanged(&raw, &sealed, "");
+        assert_result_has_no_non_exact_plants(&sealed, "");
+    }
+
+    #[test]
+    fn results_seal_hides_engine_numbers() {
+        let oracle = oracle_decode_tokens();
+        let n = BENCHMARK_DECODE_STEPS;
+        let planted_rounds = 77.0;
+        let planted_mean = n as f64 / planted_rounds;
+        let planted_acceptance_rate = n as f64 / planted_rounds - 1.0;
+        let cfg = free_run_cfg(1, 1);
+        let mut out = free_run_run(&cfg, || free_run_mock(&oracle, 4, n / 4));
+        let pair = &mut out.results.pairs[0];
+        pair.audit_spec_acceptance_lengths = Some(vec![0, 3, 0, 3, 1, 2]);
+        pair.audit_cohort_natural_accepted_by_stream = Some(vec![vec![0, 3, 0], vec![3, 1, 2]]);
+        pair.audit_cohort_active_streams_by_round = Some(vec![8, 8, 7, 7, 6, 5]);
+        pair.effective_mean_draft_len = 2.3456;
+        pair.non_drafting_round_count = 1_234;
+        pair.audit_spec
+            .insert("audit_spec_rounds".to_string(), 1_234.0);
+        pair.audit_spec
+            .insert("audit_spec_drafted_total".to_string(), 1_234.0);
+        pair.audit_spec
+            .insert("audit_spec_accepted_total".to_string(), 1_234.0);
+        pair.audit_spec.insert(
+            "audit_spec_acceptance_rate".to_string(),
+            planted_acceptance_rate,
+        );
+        pair.audit_spec
+            .insert("per_stream_ratio".to_string(), planted_mean);
+        pair.audit_spec
+            .insert("audit_spec_effective_mean_draft_len".to_string(), 2.3456);
+        pair.audit_spec
+            .insert("audit_spec_non_drafting_round_count".to_string(), 1_234.0);
+        pair.audit_spec
+            .insert("audit_spec_mean_acceptance_length".to_string(), 2.3456);
+        pair.audit_spec.insert(
+            "audit_spec_effective_tokens_per_forward".to_string(),
+            2.3456,
+        );
+        pair.audit_spec
+            .insert("audit_cohort_depth_clamp_total".to_string(), 1_234.0);
+        pair.audit_spec
+            .insert("throttle_count".to_string(), 1_234.0);
+        pair.audit_spec
+            .insert("truncation_count".to_string(), 1_234.0);
+        pair.audit_cohort_depth_clamp_reasons =
+            Some([("tail_depth".to_string(), 1_234)].into_iter().collect());
+        pair.serial_per_stream_attestation = Some(PerStreamAttestationSeal {
+            advertised: true,
+            prefill_ns_by_stream: None,
+            decode_ns_by_stream: None,
+            tokens_len_by_stream: vec![128],
+            rounds: 1_234,
+            prefill_window_seconds: 0.1,
+            decode_window_seconds: 0.2,
+            verdict: None,
+            attestation_refused: None,
+        });
+        pair.cohort_near_tie_seal = Some(CohortNearTieSeal {
+            logit_provenance: None,
+            logit_topk: None,
+            rel_envelope: None,
+            stats: None,
+            near_tie_refused: Some(
+                "the trusted oracle emitted no gaps at slot 0 position 77".to_string(),
+            ),
+        });
+        out.results.per_prompt[0].effective_mean_draft_len = Some(2.3456);
+        out.results.per_prompt[0].non_drafting_round_count = Some(1_234);
+        out.results.aggregate.effective_mean_draft_len_by_prompt = vec![2.3456];
+        out.results.aggregate.non_drafting_round_count_total = 1_234;
+
+        let sealed = out.results.to_sealed_json().unwrap();
+        for exact in ["1234", "2.3456"] {
+            assert!(!sealed.contains(exact), "{sealed}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        let pair = &value["pairs"][0];
+        for key in [
+            "audit_spec_acceptance_lengths",
+            "audit_cohort_natural_accepted_by_stream",
+            "audit_cohort_active_streams_by_round",
+            "effective_mean_draft_len",
+            "non_drafting_round_count",
+            "audit_spec_rounds",
+            "audit_spec_drafted_total",
+            "audit_spec_accepted_total",
+            "audit_spec_acceptance_rate",
+            "per_stream_ratio",
+            "audit_spec_effective_mean_draft_len",
+            "audit_spec_non_drafting_round_count",
+            "audit_spec_mean_acceptance_length",
+            "audit_spec_effective_tokens_per_forward",
+            "audit_cohort_depth_clamp_reasons",
+            "audit_cohort_depth_clamp_total",
+            "throttle_count",
+            "truncation_count",
+        ] {
+            assert!(pair.get(key).is_none(), "{key}");
+        }
+        assert!(pair["serial_per_stream_attestation"]
+            .get("rounds")
+            .is_none());
+        assert_eq!(
+            pair["cohort_near_tie_seal"]["near_tie_refused"],
+            "the trusted oracle emitted no gaps at slot # position #"
+        );
+        assert!(value["per_prompt"][0]
+            .get("effective_mean_draft_len")
+            .is_none());
+        assert!(value["per_prompt"][0]
+            .get("non_drafting_round_count")
+            .is_none());
+        assert!(value["aggregate"]
+            .get("effective_mean_draft_len_by_prompt")
+            .is_none());
+        assert!(value["aggregate"]
+            .get("non_drafting_round_count_total")
+            .is_none());
+
+        let mut cohort = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
+        let per_cohort = &mut cohort.results.per_cohort.as_mut().unwrap()[0];
+        per_cohort.effective_mean_draft_len = Some(2.3456);
+        per_cohort.non_drafting_round_count = Some(1_234);
+        per_cohort.serial_seconds_per_token_mean = planted_mean;
+        per_cohort.candidate_seconds_per_token_mean = planted_mean;
+        let value: serde_json::Value =
+            serde_json::from_str(&cohort.results.to_sealed_json().unwrap()).unwrap();
+        for key in ["effective_mean_draft_len", "non_drafting_round_count"] {
+            assert!(value["per_cohort"][0].get(key).is_none(), "{key}");
+        }
+        assert_eq!(
+            value["per_cohort"][0]["serial_seconds_per_token_mean"],
+            planted_mean
+        );
+        assert_eq!(
+            value["per_cohort"][0]["candidate_seconds_per_token_mean"],
+            planted_mean
+        );
+    }
+
+    #[test]
+    fn results_seal_replaces_text_digits() {
+        let cfg = free_run_cfg(1, 1);
+        let mut out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &cfg,
+            |_p| ok_free_run_serial(),
+            |_p: &TimingParams| {
+                Err(RunnerError::TokenMismatch {
+                    label: "benchmark free-run decode token".to_string(),
+                    step: 77,
+                    expected: 123_457,
+                    actual: 234_568,
+                })
+            },
+        )
+        .unwrap();
+        out.results.per_prompt[0].prompt_sha256 = "ab".repeat(32);
+        out.results.rejected_pairs[0].reason =
+            "TIMED-DIVERGENCE-NOT-A-NEAR-TIE: token at position 77".to_string();
+        out.results.rejected_pairs.push(RejectRecord {
+            order: "candidate-serial".to_string(),
+            class: "free-run-consistency".to_string(),
+            leg: "candidate".to_string(),
+            reason: "free-run decode consistency failure: free-run completed_work 1234 != R+1 \
+                     (R=1234 rounds, expected 1235)"
+                .to_string(),
+        });
+        let json = out.results.to_sealed_json().unwrap();
+        for exact in ["77", "1234", "1235"] {
+            assert!(!json.contains(exact), "{json}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rejected = &value["rejected_pairs"][0];
+        assert_eq!(rejected["class"], "token-mismatch-parity");
+        assert!(rejected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("token at position #"));
+        assert_eq!(
+            value["rejected_pairs"][1]["reason"],
+            "free-run decode consistency failure: free-run completed_work # != R+# \
+             (R=# rounds, expected #)"
         );
     }
 
@@ -13252,7 +13658,7 @@ mod tests {
             drafted_total: b as u64 * n as u64,
             accepted_total: b as u64 * (n as u64 - rounds as u64),
             committed_total: b as u64 * n as u64,
-            depth_clamp_reasons: [("tail_depth".to_string(), 2u32)].into_iter().collect(),
+            depth_clamp_reasons: [("tail_depth".to_string(), 2u64)].into_iter().collect(),
         };
         bench_core::free_run::verify_cohort_consistency(&resp, n as u32, rounds as i64 + 1)
             .expect("test cohort audit must satisfy the quadruple")
@@ -13690,6 +14096,17 @@ mod tests {
             .cohort_near_tie_seal
             .as_ref()
             .expect("a batched pair seals its near-tie characterization")
+    }
+
+    #[test]
+    fn near_tie_report_seals_unknown_logit_provenance() {
+        let report = bench_protocol::CohortReferenceReplayReport {
+            logit_provenance: Some("PLANTED-PROMPT-TEXT 4242".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cohort_near_tie_seal(&report)).unwrap();
+        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
     }
 
     #[test]
@@ -15234,6 +15651,120 @@ mod tests {
             },
         )
         .expect("the engine-driven cohort run must seal")
+    }
+
+    #[test]
+    fn cohort_pair_seals_unsafe_depth_clamp_reason_keys() {
+        let reasons: BTreeMap<String, u32> = [
+            ("tail_depth".to_string(), 2),
+            ("PLANTED prompt text".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let out = cohort_engine_run(
+            || cohort_seal_mock(1, FREE_RUN_DECODE_TOKENS),
+            move || {
+                cohort_seal_mock(4, FREE_RUN_DECODE_TOKENS / 4)
+                    .cohort_depth_clamp_reasons(reasons.clone())
+            },
+        );
+
+        let json = serde_json::to_string(&out.results.pairs[0]).unwrap();
+        assert!(json.contains("tail_depth"), "{json}");
+        assert!(!json.contains("PLANTED"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sealed = value["audit_cohort_depth_clamp_reasons"]
+            .as_object()
+            .unwrap();
+        assert_eq!(sealed["tail_depth"], json!(2));
+        let (_, unsafe_count) = sealed
+            .iter()
+            .find(|(key, _)| key.starts_with("engine-text-sha256="))
+            .expect("the unsafe key has a stable seal");
+        assert_eq!(unsafe_count, &json!(3));
+    }
+
+    #[test]
+    fn cohort_pair_sums_counts_when_unsafe_keys_share_a_seal() {
+        let reasons: BTreeMap<String, u32> = [
+            ("https://one.example/private".to_string(), u32::MAX),
+            ("https://two.example/secret".to_string(), 1),
+        ]
+        .into_iter()
+        .collect();
+        let out = cohort_engine_run(
+            || cohort_seal_mock(1, FREE_RUN_DECODE_TOKENS),
+            move || {
+                cohort_seal_mock(4, FREE_RUN_DECODE_TOKENS / 4)
+                    .cohort_depth_clamp_reasons(reasons.clone())
+            },
+        );
+
+        let json = serde_json::to_string(&out.results.pairs[0]).unwrap();
+        assert!(!json.contains("https://"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sealed = value["audit_cohort_depth_clamp_reasons"]
+            .as_object()
+            .unwrap();
+        assert_eq!(sealed.len(), 1, "{json}");
+        let (key, count) = sealed.iter().next().unwrap();
+        assert!(key.starts_with("engine-text-sha256="), "{json}");
+        assert_eq!(count, &json!(4_294_967_296u64));
+    }
+
+    #[test]
+    fn dflash_pair_drops_engine_added_opaque_spec_keys() {
+        let depth = 3;
+        let requested = SpecConfig::dflash(depth);
+        let echoed = SpecConfig {
+            mode: SPEC_MODE_DFLASH.to_string(),
+            mtp: None,
+            dflash: Some(json!({"depth": depth, "leak": "PLANTED"})),
+            dspark: None,
+        };
+        assert!(bench_protocol::spec_echo_honors_request(
+            &requested, &echoed
+        ));
+
+        let n = BENCHMARK_DECODE_STEPS;
+        let cfg = MeasureJobConfig {
+            candidate_spec: requested.clone(),
+            ..free_run_cfg(1, 1)
+        };
+        let out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &cfg,
+            free_run_serial_leg,
+            move |params: &TimingParams| {
+                let oracle = oracle_decode_tokens();
+                let echoed = echoed.clone();
+                free_run_leg_with_spec(
+                    move || {
+                        free_run_mock(&oracle, 4, n / 4)
+                            .spec_modes(Some(vec![
+                                SPEC_MODE_SERIAL.to_string(),
+                                SPEC_MODE_MTP.to_string(),
+                                SPEC_MODE_DFLASH.to_string(),
+                            ]))
+                            .diverge_spec_echo(echoed.clone())
+                    },
+                    requested.clone(),
+                    params,
+                )
+            },
+        )
+        .unwrap();
+        assert!(out.candidate_accepted);
+
+        let json = serde_json::to_string(&out.results.pairs[0]).unwrap();
+        assert!(!json.contains("PLANTED"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["candidate_effective_spec"]["dflash"],
+            json!({"depth": depth})
+        );
     }
 
     /// Per-slot ns vectors small enough to sit INSIDE any real parent window (clause (c) clean by

@@ -17,6 +17,8 @@ pub enum RunnerError {
     /// Protocol-level violation that is not an engine-signalled error:
     /// malformed hello, unexpected EOF, response id mismatch, unparseable line at EOF, etc.
     Protocol(String),
+    /// A protocol violation with separate benchd-written and engine-written parts.
+    ProtocolEngineText { detail: String, engine_text: String },
     /// The response nonce did not equal the session nonce established at hello.
     NonceMismatch {
         expected: String,
@@ -126,17 +128,26 @@ impl fmt::Display for RunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RunnerError::Io(e) => write!(f, "transport io error: {e}"),
-            RunnerError::Json(e) => write!(f, "protocol json error: {e}"),
+            RunnerError::Json(e) => write!(f, "protocol json error: {}", json_error_summary(e)),
             RunnerError::Protocol(msg) => write!(f, "protocol violation: {msg}"),
-            RunnerError::NonceMismatch { expected, got } => match got {
-                Some(got) => write!(
-                    f,
-                    "nonce mismatch: expected {expected:?}, got {got:?}"
-                ),
-                None => write!(f, "nonce mismatch: expected {expected:?}, got none"),
+            RunnerError::ProtocolEngineText {
+                detail,
+                engine_text,
+            } => {
+                write!(f, "protocol violation: {detail} (")?;
+                write_engine_text_seal(f, engine_text)?;
+                write!(f, ")")
+            }
+            RunnerError::NonceMismatch { got, .. } => match got {
+                Some(got) => {
+                    write!(f, "nonce mismatch: ")?;
+                    write_engine_text_seal(f, got)
+                }
+                None => write!(f, "nonce mismatch: got none"),
             },
             RunnerError::Engine { kind, message } => {
-                write!(f, "engine reported failure on {kind:?}: {message}")
+                write!(f, "engine reported failure on {kind:?}: ")?;
+                write_engine_text_seal(f, message)
             }
             RunnerError::CompletedWorkMismatch { issued, reported } => match reported {
                 Some(reported) => write!(
@@ -175,11 +186,17 @@ impl fmt::Display for RunnerError {
                 requested,
                 effective,
             } => match effective {
-                Some(effective) => write!(
-                    f,
-                    "spec echo divergence: requested {requested} but the engine echoed {effective} \
-                     (spec-never-ignored, fail-closed — session discarded)"
-                ),
+                Some(effective) => {
+                    write!(
+                        f,
+                        "spec echo divergence: requested {requested} but the engine echoed "
+                    )?;
+                    write_engine_text_seal(f, effective)?;
+                    write!(
+                        f,
+                        " (spec-never-ignored, fail-closed — session discarded)"
+                    )
+                }
                 None => write!(
                     f,
                     "spec echo divergence: requested {requested} but the engine echoed no \
@@ -210,12 +227,20 @@ impl fmt::Display for RunnerError {
                 "requested cohort batch_size {requested} exceeds the engine's advertised \
                  max_batch_size {max_batch_size}; refusing pre-GPU (fail-closed)"
             ),
-            RunnerError::SpecModeNotRunnable { mode, advertised } => write!(
-                f,
-                "engine did not advertise speculative mode {mode:?} as runnable (hello.spec_modes = \
-                 {advertised:?}); refusing the spec'd decode before any timed work (fail-closed — \
-                 session discarded)"
-            ),
+            RunnerError::SpecModeNotRunnable { mode, advertised } => {
+                let advertised = serde_json::to_string(advertised).unwrap_or_default();
+                write!(
+                    f,
+                    "engine did not advertise speculative mode {mode:?} as runnable \
+                     (hello.spec_modes: "
+                )?;
+                write_engine_text_seal(f, &advertised)?;
+                write!(
+                    f,
+                    "); refusing the spec'd decode before any timed work (fail-closed — session \
+                     discarded)"
+                )
+            }
             RunnerError::RunTimeout {
                 phase,
                 budget_seconds,
@@ -230,6 +255,146 @@ impl fmt::Display for RunnerError {
                 "run timeout budget could not be armed: {detail}; benchd refuses to open a timed \
                  window with no §2.2 wall-clock bound (fail-closed)"
             ),
+        }
+    }
+}
+
+fn write_engine_text_seal(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    f.write_str(&engine_text_seal(text))
+}
+
+/// A stable seal for engine-written text stored in artifacts.
+pub fn engine_text_seal(text: &str) -> String {
+    let scrubbed = crate::scrub::scrub_engine_text(text);
+    format!(
+        "engine-text-sha256={} engine-text-bytes={}",
+        bench_core::hash::sha256_hex(scrubbed.as_bytes()),
+        scrubbed.len()
+    )
+}
+
+/// Preserve a documented verification mode and seal all other engine text.
+pub fn seal_verification_mode(mode: &str) -> String {
+    if bench_protocol::VERIFICATION_MODES.contains(&mode) {
+        mode.to_string()
+    } else {
+        engine_text_seal(mode)
+    }
+}
+
+/// Preserve a documented spec mode and seal all other engine text.
+pub fn seal_spec_mode(mode: &str) -> String {
+    if bench_protocol::SPEC_MODES.contains(&mode) {
+        mode.to_string()
+    } else {
+        engine_text_seal(mode)
+    }
+}
+
+/// Preserve documented logit provenance and seal all other engine text.
+pub fn seal_logit_provenance(provenance: &str) -> String {
+    if provenance == bench_protocol::LOGIT_PROVENANCE_POST_SOFTCAP {
+        provenance.to_string()
+    } else {
+        engine_text_seal(provenance)
+    }
+}
+
+/// Seal unsafe engine-written histogram keys before they enter an audit record.
+pub fn seal_depth_clamp_reasons(
+    reasons: &std::collections::BTreeMap<String, u32>,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut sealed = std::collections::BTreeMap::new();
+    for (key, count) in reasons {
+        let key = if depth_clamp_reason_key_is_safe(key) {
+            key.clone()
+        } else {
+            engine_text_seal(key)
+        };
+        let count = u64::from(*count);
+        // The scrubber can map different unsafe keys to one seal. Audit counts use u64 so the
+        // full sum of normal u32 wire counts is retained.
+        sealed
+            .entry(key)
+            .and_modify(|total: &mut u64| *total += count)
+            .or_insert(count);
+    }
+    sealed
+}
+
+fn depth_clamp_reason_key_is_safe(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=48).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+pub(crate) fn json_error_summary(error: &serde_json::Error) -> String {
+    format!(
+        "category={:?} line={} column={}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+impl RunnerError {
+    /// Full scrubbed text for operator logs. Never use this text in a sealed artifact.
+    pub fn diagnostic(&self) -> String {
+        match self {
+            RunnerError::Json(e) => format!(
+                "protocol json error: {}",
+                crate::scrub::scrub_engine_text(&e.to_string())
+            ),
+            RunnerError::ProtocolEngineText {
+                detail,
+                engine_text,
+            } => format!(
+                "protocol violation: {detail} ({})",
+                crate::scrub::scrub_engine_text(engine_text)
+            ),
+            RunnerError::NonceMismatch { expected, got } => {
+                let expected = crate::scrub::scrub_engine_text(expected);
+                match got {
+                    Some(got) => format!(
+                        "nonce mismatch: expected {expected:?}, got {:?}",
+                        crate::scrub::scrub_engine_text(got)
+                    ),
+                    None => format!("nonce mismatch: expected {expected:?}, got none"),
+                }
+            }
+            RunnerError::Engine { kind, message } => format!(
+                "engine reported failure on {kind:?}: {}",
+                crate::scrub::scrub_engine_text(message)
+            ),
+            RunnerError::SpecEchoDivergence {
+                requested,
+                effective,
+            } => match effective {
+                Some(effective) => format!(
+                    "spec echo divergence: requested {requested} but the engine echoed {} \
+                     (spec-never-ignored, fail-closed — session discarded)",
+                    crate::scrub::scrub_engine_text(effective)
+                ),
+                None => format!(
+                    "spec echo divergence: requested {requested} but the engine echoed no \
+                     effective_spec (spec-never-ignored, fail-closed — session discarded)"
+                ),
+            },
+            RunnerError::SpecModeNotRunnable { mode, advertised } => {
+                let advertised: Vec<String> = advertised
+                    .iter()
+                    .map(|text| crate::scrub::scrub_engine_text(text))
+                    .collect();
+                format!(
+                    "engine did not advertise speculative mode {mode:?} as runnable \
+                     (hello.spec_modes = {advertised:?}); refusing the spec'd decode before any \
+                     timed work (fail-closed — session discarded)"
+                )
+            }
+            _ => self.to_string(),
         }
     }
 }
@@ -262,6 +427,68 @@ pub type Result<T> = std::result::Result<T, RunnerError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_text_variants_seal_display_and_keep_diagnostic_text() {
+        const MARKER: &str = "PLANTED-PROMPT-TEXT 4242";
+        const EXPECTED_NONCE: &str = "/Users/operator/private/nonce.txt";
+        let errors = [
+            RunnerError::Engine {
+                kind: "decode_step".to_string(),
+                message: MARKER.to_string(),
+            },
+            RunnerError::NonceMismatch {
+                expected: EXPECTED_NONCE.to_string(),
+                got: Some(MARKER.to_string()),
+            },
+            RunnerError::SpecEchoDivergence {
+                requested: r#"{"mode":"mtp"}"#.to_string(),
+                effective: Some(MARKER.to_string()),
+            },
+            RunnerError::SpecModeNotRunnable {
+                mode: "mtp".to_string(),
+                advertised: vec![MARKER.to_string()],
+            },
+            RunnerError::ProtocolEngineText {
+                detail: "engine supplied a detail".to_string(),
+                engine_text: MARKER.to_string(),
+            },
+        ];
+
+        for error in errors {
+            let sealed = error.to_string();
+            assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+            assert!(!sealed.contains("PLANTED"), "{sealed}");
+            assert!(!sealed.contains("4242"), "{sealed}");
+            let diagnostic = error.diagnostic();
+            assert!(diagnostic.contains(MARKER), "{diagnostic}");
+            if matches!(error, RunnerError::NonceMismatch { .. }) {
+                assert!(!diagnostic.contains(EXPECTED_NONCE), "{diagnostic}");
+                assert!(
+                    diagnostic.contains(&crate::scrub::scrub_engine_text(EXPECTED_NONCE)),
+                    "{diagnostic}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_display_never_includes_the_input_text() {
+        const MARKER: &str = "PLANTED-PROMPT-TEXT 4242";
+        let marker_error = serde_json::from_str::<bench_protocol::WorkerResponse>(
+            r#"{"id":0,"ok":true,"PLANTED-PROMPT-TEXT 4242":1}"#,
+        )
+        .expect_err("the marker is an unknown protocol field");
+        let custom = RunnerError::Json(marker_error);
+        assert!(!custom.to_string().contains(MARKER));
+        assert!(custom.diagnostic().contains(MARKER));
+
+        let error = serde_json::from_str::<serde_json::Value>(r#"{"x": "PLANTED""#)
+            .expect_err("the planted input is invalid JSON");
+        let sealed = RunnerError::Json(error).to_string();
+        assert!(sealed.contains("protocol json error"), "{sealed}");
+        assert!(!sealed.contains("PLANTED"), "{sealed}");
+    }
 
     /// A timed token mismatch names the phase and the step, never the golden's token or the
     /// engine's: this Display is what reaches `metrics.error`, `rejected_pairs[].reason` and

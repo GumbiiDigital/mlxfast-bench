@@ -24,7 +24,9 @@ use bench_core::free_run::{
 use bench_core::prefill_window::PhaseWindow;
 use bench_protocol::SpecConfig;
 
-use crate::error::{Result, RunnerError};
+use crate::error::{
+    seal_depth_clamp_reasons, seal_spec_mode, seal_verification_mode, Result, RunnerError,
+};
 use crate::session::Session;
 use crate::transport::LineTransport;
 
@@ -81,7 +83,7 @@ pub struct TimingParams {
     /// The per-module speculative configuration (`docs/spec-config-design.md`) carried on the timed
     /// `decode_begin` / `free_decode_begin`. `None` (default) issues the legacy no-spec decode and
     /// does not check the echo; `Some(spec)` enforces SPEC-NEVER-IGNORED (the engine's echoed
-    /// `effective_spec` must equal it, else the session is discarded fail-closed). The echoed spec is
+    /// `effective_spec` must honor it, else the session is discarded fail-closed). The echoed spec is
     /// surfaced on the result ([`TimingResult::effective_spec`]) for benchd to seal.
     pub spec: Option<SpecConfig>,
 }
@@ -221,8 +223,8 @@ pub struct TimingResult {
     pub peak_ram_gb: f64,
     /// The engine's echoed `effective_spec` from the timed `decode_begin` (`docs/spec-config-design.md`).
     /// `None` when the run carried no `spec` (legacy no-spec decode); `Some` carries the module-parsed
-    /// spec the engine actually ran, already validated EQUAL to the request (spec-never-ignored) — this
-    /// is what benchd seals per leg.
+    /// spec the engine actually ran after the spec-never-ignored gate. Opaque blocks contain only
+    /// request keys when benchd seals this per leg.
     pub effective_spec: Option<SpecConfig>,
     /// The timed decode window's WHOLE free-run [`FreeRunAudit`] — the per-round
     /// `acceptance_lengths` benchd collected plus the engine's self-reported drafted/accepted
@@ -361,7 +363,8 @@ pub struct FreeRunTimingResult {
     /// aggregation can never silently mix this number with the v1 teacher-forced series.
     pub timed_mode: &'static str,
     /// The engine's echoed `effective_spec` from `free_decode_begin` (`docs/spec-config-design.md`),
-    /// already validated EQUAL to the request (spec-never-ignored). `None` when no `spec` was carried.
+    /// accepted by the spec-never-ignored gate and projected onto the request's opaque keys. `None`
+    /// when no `spec` was carried.
     pub effective_spec: Option<SpecConfig>,
 }
 
@@ -1116,6 +1119,7 @@ fn measure_decode<T: LineTransport>(
             *peak_ram_gb = ram;
         }
     }
+    let effective_spec = effective_spec_for_audit(params.spec.as_ref(), effective_spec.as_ref());
 
     let seconds_per_token =
         bench_core::score::decode_window_seconds_per_token(elapsed, params.decode_steps);
@@ -1278,7 +1282,10 @@ fn measure_free_run_decode<T: LineTransport>(
         // fault: an engine built before the field existed still conforms.
         verify_replay_disagreements: run.verify_replay_disagreements,
         verification: bench_core::free_run::VerificationReport::from_wire(
-            run.verification_mode.as_deref(),
+            run.verification_mode
+                .as_deref()
+                .map(seal_verification_mode)
+                .as_deref(),
             run.rectangular_verification_rounds,
             run.serial_verification_rounds,
         ),
@@ -1291,6 +1298,7 @@ fn measure_free_run_decode<T: LineTransport>(
             *peak_ram_gb = ram;
         }
     }
+    let effective_spec = effective_spec_for_audit(params.spec.as_ref(), effective_spec.as_ref());
 
     Ok(FreeRunDecodeMeasurement {
         phase_window: PhaseWindow {
@@ -1315,6 +1323,25 @@ struct FreeRunDecodeMeasurement {
     effective_spec: Option<SpecConfig>,
     /// The seed token, then the N committed decode tokens.
     emitted_tokens: Vec<i64>,
+}
+
+fn effective_spec_for_audit(
+    requested: Option<&SpecConfig>,
+    effective: Option<&SpecConfig>,
+) -> Option<SpecConfig> {
+    match (requested, effective) {
+        (Some(requested), Some(effective)) => Some(bench_protocol::project_spec_echo_for_audit(
+            requested, effective,
+        )),
+        (None, Some(effective)) => {
+            let mut sealed = effective.clone();
+            sealed.mode = seal_spec_mode(&effective.mode);
+            sealed.dflash = None;
+            sealed.dspark = None;
+            Some(sealed)
+        }
+        (_, None) => None,
+    }
 }
 
 impl FreeRunDecodeMeasurement {
@@ -1512,7 +1539,8 @@ fn measure_batched_free_run_decode<T: LineTransport>(
     // Assemble the AUDIT counters for the cohort quadruple; a missing counter is a protocol
     // fault. `depth_clamp_reasons` is the one tolerated absence: it is audit-only prose about WHY
     // depth was clamped, carries no cross-checkable accounting, and an engine with nothing to
-    // report may omit the histogram entirely (treated as empty, sealed as such).
+    // report may omit the histogram entirely (treated as empty, sealed as such). Safe keys stay
+    // verbatim. Other keys become stable engine-text seals.
     let acceptance_lengths = run.acceptance_lengths.clone().ok_or_else(|| {
         RunnerError::Protocol(
             "batched free_decode_run response missing acceptance_lengths".to_string(),
@@ -1556,7 +1584,11 @@ fn measure_batched_free_run_decode<T: LineTransport>(
         drafted_total,
         accepted_total,
         committed_total,
-        depth_clamp_reasons: run.depth_clamp_reasons.clone().unwrap_or_default(),
+        depth_clamp_reasons: run
+            .depth_clamp_reasons
+            .as_ref()
+            .map(seal_depth_clamp_reasons)
+            .unwrap_or_default(),
     };
 
     // Phase-close barrier OUTSIDE the timed window: drain assertion + the cohort consistency
@@ -1567,6 +1599,7 @@ fn measure_batched_free_run_decode<T: LineTransport>(
             *peak_ram_gb = ram;
         }
     }
+    let effective_spec = effective_spec_for_audit(params.spec.as_ref(), effective_spec.as_ref());
 
     // The caller (`run_batched_free_run_decode_phase_fresh`) divides the decode window by
     // `decode_token_total` = B * N.
@@ -1639,7 +1672,7 @@ mod tests {
         ) -> std::io::Result<ReadOutcome> {
             self.inner.read_line_deadline(deadline)
         }
-        fn failure_diagnostic(&mut self) -> Option<String> {
+        fn failure_diagnostic(&mut self) -> Option<crate::transport::FailureDiagnostic> {
             self.inner.failure_diagnostic()
         }
     }
@@ -3279,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_free_run_seals_depth_clamp_reasons_verbatim() {
+    fn batched_free_run_seals_safe_depth_clamp_reason_keys_verbatim() {
         // The clamp-reason histogram is what makes "did it actually speculate?" checkable: sealed
         // VERBATIM into the audit when reported, empty when the engine has nothing to report.
         let reasons: std::collections::BTreeMap<String, u32> = [
@@ -3288,7 +3321,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let expected = reasons.clone();
+        let expected = reasons
+            .iter()
+            .map(|(key, count)| (key.clone(), u64::from(*count)))
+            .collect();
         let mut spawn = || -> Result<Session<MockEngine>> {
             let (session, _hello) =
                 Session::connect(cohort_engine(8, 4).cohort_depth_clamp_reasons(reasons.clone()))?;

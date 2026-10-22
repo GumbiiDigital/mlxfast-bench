@@ -269,7 +269,13 @@ fn engine_real_batched_begin_run_seam_and_cohort_quadruple() {
         drafted_total: run.drafted_total.unwrap(),
         accepted_total: run.accepted_total.unwrap(),
         committed_total: run.committed_total.unwrap(),
-        depth_clamp_reasons: run.depth_clamp_reasons.clone().unwrap(),
+        depth_clamp_reasons: run
+            .depth_clamp_reasons
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|(key, count)| (key, u64::from(count)))
+            .collect(),
     };
     let completed_work = phase
         .completed_work
@@ -375,7 +381,13 @@ fn engine_real_batched_mtp_begin_run_seam_and_cohort_quadruple() {
         drafted_total: run.drafted_total.unwrap(),
         accepted_total: run.accepted_total.unwrap(),
         committed_total: run.committed_total.unwrap(),
-        depth_clamp_reasons: run.depth_clamp_reasons.clone().unwrap(),
+        depth_clamp_reasons: run
+            .depth_clamp_reasons
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|(key, count)| (key, u64::from(count)))
+            .collect(),
     };
     // completed_work isn't separately captured for this pair (no dedicated phase_diagnostics
     // line rides with it in this fixture); R=2 rounds (acceptance_lengths [1, 2]) so

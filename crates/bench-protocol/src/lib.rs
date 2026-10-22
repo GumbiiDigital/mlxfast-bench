@@ -39,6 +39,21 @@ pub const SPEC_MODE_MTP: &str = "mtp";
 pub const SPEC_MODE_DFLASH: &str = "dflash";
 /// Speculative-config mode string for the (reserved) DSpark path.
 pub const SPEC_MODE_DSPARK: &str = "dspark";
+/// Documented speculative-config mode strings.
+pub const SPEC_MODES: [&str; 4] = [
+    SPEC_MODE_SERIAL,
+    SPEC_MODE_MTP,
+    SPEC_MODE_DFLASH,
+    SPEC_MODE_DSPARK,
+];
+
+/// Documented wire values for [`WorkerResponse::verification_mode`].
+pub const VERIFICATION_MODE_RECTANGULAR: &str = "rectangular";
+pub const VERIFICATION_MODE_SERIAL: &str = "serial";
+pub const VERIFICATION_MODES: [&str; 2] = [VERIFICATION_MODE_RECTANGULAR, VERIFICATION_MODE_SERIAL];
+
+/// Documented wire value for `CohortReferenceReplayReport::logit_provenance`.
+pub const LOGIT_PROVENANCE_POST_SOFTCAP: &str = "post_softcap";
 
 /// Protocol v1.1 capability advertised on `hello.capabilities` when the engine supports
 /// the oracle-verified free-run timed decode mode (`free_decode_begin` / `free_decode_run`).
@@ -282,6 +297,45 @@ pub fn spec_echo_honors_request(requested: &SpecConfig, effective: &SpecConfig) 
         }
     }
     true
+}
+
+/// Project an accepted spec echo onto the request for an audit record.
+///
+/// The never-ignored gate can accept added keys in opaque blocks. Audit records keep only keys
+/// that the request named, while preserving the echo's values for those keys.
+pub fn project_spec_echo_for_audit(requested: &SpecConfig, effective: &SpecConfig) -> SpecConfig {
+    let mut projected = effective.clone();
+    projected.dflash = project_opaque_block(requested.dflash.as_ref(), effective.dflash.as_ref());
+    projected.dspark = project_opaque_block(requested.dspark.as_ref(), effective.dspark.as_ref());
+    projected
+}
+
+fn project_opaque_block(
+    requested: Option<&serde_json::Value>,
+    effective: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (requested, effective) {
+        (Some(requested), Some(effective)) => Some(project_json(requested, effective)),
+        _ => None,
+    }
+}
+
+fn project_json(requested: &serde_json::Value, effective: &serde_json::Value) -> serde_json::Value {
+    match (requested, effective) {
+        (serde_json::Value::Object(requested), serde_json::Value::Object(effective)) => {
+            serde_json::Value::Object(
+                requested
+                    .iter()
+                    .filter_map(|(key, requested_value)| {
+                        effective
+                            .get(key)
+                            .map(|value| (key.clone(), project_json(requested_value, value)))
+                    })
+                    .collect(),
+            )
+        }
+        _ => effective.clone(),
+    }
 }
 
 /// `a` ⊆ `b`, recursively: objects require every key of `a` present in `b` with a subset value;
@@ -706,7 +760,8 @@ pub struct WorkerResponse {
     pub active_streams_by_round: Option<Vec<u32>>,
     /// v1.2 (additive, COHORT): a histogram of the engine's depth-clamp reasons over the window
     /// (e.g. `automatic_rectangular_limit`, `tail_depth`, `batch_gate`, `step_kv_headroom`,
-    /// `rectangular_cache_unsupported`). AUDIT-only, never scored, sealed VERBATIM.
+    /// `rectangular_cache_unsupported`). AUDIT-only and never scored. Safe snake-case keys seal
+    /// verbatim; other keys seal as engine-text hashes.
     ///
     /// This is what makes "did it actually speculate?" a checkable question rather than a trusted
     /// claim: a cohort that reports zero draft rounds under a clamp reason is a legitimate engine
@@ -762,6 +817,7 @@ pub struct WorkerResponse {
     /// recurrent state captured per position and rolled back to the accepted one) or `"serial"`
     /// (one target forward per candidate token, the fallback oracle). AUDIT-only, never scored.
     /// Absent ⇒ NOT REPORTED (a pre-field engine). Sealed as `spec_verification_mode`.
+    /// See [`VERIFICATION_MODES`] for the documented wire values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_mode: Option<String>,
     /// Spec-decode AUDIT (additive, optional): verify rounds that ran the rectangular path.
