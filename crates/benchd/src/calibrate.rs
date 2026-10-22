@@ -487,6 +487,9 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     // process's socket — which a calibrating box does not have — and every pass would die on
     // `Operation not permitted`.
     let sandboxed = cfg!(target_os = "macos");
+    let mut sandbox_run_inputs: Vec<PathBuf> =
+        args.goldens.iter().map(|(path, _)| path.clone()).collect();
+    sandbox_run_inputs.extend(args.warmup_golden.iter().cloned());
     // The calibration passes run the RANKED leg-1 shape exactly, including its per-leg engine
     // lifecycle: each pass boots the reference tree's OWN resident and tears it down again, on
     // both platforms. An inherited socket is refused for the same reason the ranked path refuses
@@ -539,6 +542,14 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
                 // the `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override is deliberately not honoured.
                 Some(crate::resolve_official_sandbox_from_env(
                     &engine_str,
+                    crate::WorkerSandboxScope {
+                        worker_tree: &args.baseline_workspace,
+                        role: crate::WorkerLegRole::Control {
+                            trusted_reference_tree: &args.baseline_workspace,
+                        },
+                        baseline_workspace: Some(&args.baseline_workspace),
+                        run_input_paths: &sandbox_run_inputs,
+                    },
                     golden_path,
                     false,
                     validated_private_dir.as_deref(),

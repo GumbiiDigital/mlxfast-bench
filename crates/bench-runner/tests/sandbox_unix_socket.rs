@@ -151,6 +151,7 @@ fn profile_for(exe: &Path, socket: Option<&Path>) -> String {
         "/nonexistent/golden.json",
         None,
         socket.map(|s| s.to_string_lossy().into_owned()).as_deref(),
+        &[],
     )
 }
 

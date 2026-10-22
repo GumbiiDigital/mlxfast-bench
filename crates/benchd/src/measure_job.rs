@@ -43,17 +43,13 @@ use crate::quiescegate::QuiesceRecord;
 // UNVERIFIED(measure-job): the one-gated-retry-per-leg structure + full-reset-between-attempts.
 const MAX_ATTEMPTS: usize = 2;
 
-/// Preserve a digest-shaped engine value. Seal all other engine text before it reaches an artifact.
-pub(crate) fn seal_engine_digest(value: &str) -> String {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        value.to_string()
-    } else {
-        bench_runner::error::engine_text_seal(value)
+/// Hash every engine-supplied digest value before it reaches a public artifact. The raw value is
+/// kept only in the organizer's private audit when one is configured.
+pub(crate) fn seal_engine_digest(class: &str, value: &str) -> String {
+    if bench_runner::error::record_private_engine_value(class, value).is_err() {
+        eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
     }
+    bench_core::hash::sha256_hex(value.as_bytes())
 }
 
 /// The maximum number of pair ATTEMPTS the loop will make before giving up, as a multiple of
@@ -4819,7 +4815,7 @@ fn validate_leg_report(
         .as_ref()
         .map(|hp| hp.sha256.as_str())
         .filter(|s| !s.trim().is_empty())
-        .map(seal_engine_digest);
+        .map(|value| seal_engine_digest("head_provenance_sha256", value));
     match regime {
         // FREE-RUN (single-stream or batched cohort) — the gate is ON, so the head channel exists.
         // The CANDIDATE leg REQUIRES it (fail-closed, unchanged): it is the identity of the BYO
@@ -7491,6 +7487,15 @@ mod seal_boundary_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn engine_digest_values_are_always_hashed_again() {
+        let raw = "ab".repeat(32);
+        let public = seal_engine_digest("head_provenance_sha256", &raw);
+        assert_eq!(public, bench_core::hash::sha256_hex(raw.as_bytes()));
+        assert_ne!(public, raw);
+        assert_eq!(public.len(), 64);
+    }
+
+    #[test]
     fn spawn_gate_free_run_legs_carry_the_flag_tf_legs_do_not() {
         // Window-prep gap: the engine's v1.1 fields are spawn-gated. BOTH free-run legs carry
         // --speculative-protocol v1.1 (the depth-0 control speaks the same session shape); TF
@@ -9257,12 +9262,14 @@ mod tests {
         .unwrap();
         assert!(out.candidate_accepted);
         let pair = &out.results.pairs[0];
+        let public_candidate_head = bench_core::hash::sha256_hex(CANDIDATE_HEAD_SHA.as_bytes());
+        let public_serial_head = bench_core::hash::sha256_hex(SERIAL_HEAD_SHA.as_bytes());
         assert_eq!(
-            pair.head_provenance_sha256, CANDIDATE_HEAD_SHA,
-            "head provenance = candidate (declared) head"
+            pair.head_provenance_sha256, public_candidate_head,
+            "head provenance = hash of the candidate-declared head value"
         );
         assert_ne!(
-            pair.head_provenance_sha256, SERIAL_HEAD_SHA,
+            pair.head_provenance_sha256, public_serial_head,
             "NOT the serial pinned head"
         );
         // The free-run series' two echoes: speculating candidate, depth-0 serial control.
@@ -9274,11 +9281,12 @@ mod tests {
         // Sealed per prompt (fills the R7 placeholder).
         assert_eq!(
             out.results.per_prompt[0].head_provenance_sha256.as_deref(),
-            Some(CANDIDATE_HEAD_SHA),
+            Some(public_candidate_head.as_str()),
             "head_provenance_sha256 sealed per prompt from the candidate leg's hello"
         );
         let json = serde_json::to_string(&out.results).unwrap();
-        assert!(json.contains(CANDIDATE_HEAD_SHA), "{json}");
+        assert!(json.contains(&public_candidate_head), "{json}");
+        assert!(!json.contains(CANDIDATE_HEAD_SHA), "{json}");
         // The MTP arm's depth cap is sealed; the dflash-specific field is OMITTED (mirror of the
         // dflash direction in `dflash_run_seals_dflash_depth_and_drops_the_mtp_field`).
         assert_eq!(
@@ -9308,7 +9316,10 @@ mod tests {
         .unwrap();
         assert!(out.candidate_accepted);
         let json = serde_json::to_string(&out.results).unwrap();
-        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(
+            json.contains(&bench_core::hash::sha256_hex(MARKER.as_bytes())),
+            "{json}"
+        );
         assert!(!json.contains("PLANTED"), "{json}");
         assert!(!json.contains("4242"), "{json}");
     }

@@ -7,6 +7,9 @@
 
 use std::fmt;
 
+/// Reserved private-audit key for full scrubbed engine diagnostics.
+pub const PRIVATE_ENGINE_DIAGNOSTICS_KEY: &str = "engine_diagnostics";
+
 /// Everything that can go wrong driving an engine session.
 #[derive(Debug)]
 pub enum RunnerError {
@@ -273,6 +276,63 @@ pub fn engine_text_seal(text: &str) -> String {
     )
 }
 
+/// Keep full scrubbed engine text only in the organizer's private audit, when configured.
+/// Existing private-audit JSON is preserved so the later score writer can add its full payload.
+pub fn record_private_engine_text(class: &str, text: &str) -> std::io::Result<()> {
+    record_private_engine_value(class, &crate::scrub::scrub_engine_text(text))
+}
+
+/// Keep an exact engine-supplied identity value only in the organizer's private audit.
+pub fn record_private_engine_value(class: &str, value: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("BENCHD_PRIVATE_AUDIT_PATH") else {
+        return Ok(());
+    };
+    let mut root = match std::fs::read(&path) {
+        Ok(bytes) if !bytes.is_empty() => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        Ok(_) => serde_json::json!({}),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error),
+    };
+    let object = root.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BENCHD_PRIVATE_AUDIT_PATH must contain a JSON object",
+        )
+    })?;
+    let diagnostics = object
+        .entry(PRIVATE_ENGINE_DIAGNOSTICS_KEY)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "private audit engine_diagnostics must be an array",
+            )
+        })?;
+    diagnostics.push(serde_json::json!({
+        "class": class,
+        "text": value,
+    }));
+    let bytes = serde_json::to_vec_pretty(&root).map_err(std::io::Error::other)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&bytes)
+}
+
 /// Preserve a documented verification mode and seal all other engine text.
 pub fn seal_verification_mode(mode: &str) -> String {
     if bench_protocol::VERIFICATION_MODES.contains(&mode) {
@@ -341,7 +401,20 @@ pub(crate) fn json_error_summary(error: &serde_json::Error) -> String {
 }
 
 impl RunnerError {
-    /// Full scrubbed text for operator logs. Never use this text in a sealed artifact.
+    /// Stable public class for an engine-originated diagnostic.
+    pub fn engine_diagnostic_class(&self) -> &'static str {
+        match self {
+            RunnerError::Json(_) => "protocol-json",
+            RunnerError::ProtocolEngineText { .. } => "protocol-engine-text",
+            RunnerError::NonceMismatch { .. } => "nonce-mismatch",
+            RunnerError::Engine { .. } => "engine-reported-failure",
+            RunnerError::SpecEchoDivergence { .. } => "spec-echo-divergence",
+            RunnerError::SpecModeNotRunnable { .. } => "spec-mode-not-runnable",
+            _ => "runner-error",
+        }
+    }
+
+    /// Full scrubbed text for the private audit and tests. Never print this to a public log.
     pub fn diagnostic(&self) -> String {
         match self {
             RunnerError::Json(e) => format!(

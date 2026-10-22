@@ -8,7 +8,8 @@
 //! An official benchmark run executes the (untrusted, submitted) engine under
 //! `/usr/bin/sandbox-exec -f <profile> <engine> runtime-worker …` with a Seatbelt profile
 //! that denies network, fork, exec (except the engine itself), all file writes (except
-//! `/dev/null`), and reads of the private golden (+ the private dir). The run FAILS CLOSED
+//! `/dev/null`), reads of the private golden (+ the private dir), and reads or writes of the
+//! resolver-supplied evaluator-only paths. The run FAILS CLOSED
 //! — refuses to run at all rather than falling back to an unsandboxed/worker-less path — on
 //! ANY of: the worker disabled, `MLXFAST_NO_SANDBOX=1`, no engine executable, no derivable
 //! sandbox profile, or `/usr/bin/sandbox-exec` missing.
@@ -105,7 +106,8 @@ pub fn validate_resident_socket(socket_path: &str) -> Result<(), OfficialSandbox
 /// Build the Seatbelt profile source that guards the official runtime worker. This follows
 /// Swift `writeRuntimeWorkerSandboxProfile` (main.swift:1237-1256), then adds rules that
 /// block process-persistent IPC and preference writes. The golden deny-read rule and optional
-/// private-dir subpath deny-read rule follow. Lines are joined by `\n` with NO trailing newline.
+/// private-dir subpath deny-read rule follow. Evaluator read+write denies are last so they win
+/// over every allow. Lines are joined by `\n` with NO trailing newline.
 ///
 /// `resident_socket`, when present and non-empty, adds the single resident-socket
 /// `network-outbound` allowance documented at the top of this module, immediately after
@@ -119,6 +121,7 @@ pub fn build_seatbelt_profile(
     golden_path: &str,
     private_dir: Option<&str>,
     resident_socket: Option<&str>,
+    evaluator_paths: &[String],
 ) -> String {
     let mut denied_read_rules = vec![format!(
         "(deny file-read* (literal \"{}\"))",
@@ -165,44 +168,53 @@ pub fn build_seatbelt_profile(
         "(allow file-write* (literal \"/dev/null\"))".to_string(),
     ]);
     lines.extend(denied_read_rules);
+    // Last, so these evaluator-only denies win over every allow above. `subpath` also
+    // covers file paths, matching the resident profile's one rule shape for both.
+    lines.extend(evaluator_paths.iter().map(|path| {
+        format!(
+            "(deny file-read* file-write* (subpath \"{}\"))",
+            seatbelt_escaped(path)
+        )
+    }));
     lines.join("\n")
 }
 
 /// Resolve a path to absolute + symlink-resolved form, matching Swift `absolutePath`
 /// (main.swift:1260-1268: relative-to-cwd, `standardizedFileURL.resolvingSymlinksInPath`).
-/// A non-existent path cannot be symlink-resolved by the OS, so we fall back to a plain
-/// absolutization (join to cwd) — the profile still names a stable absolute path.
-pub fn absolute_path(path: &str) -> String {
+/// For a missing target, resolve the deepest existing ancestor, then append the missing suffix.
+/// Every error other than `NotFound` is returned so an official sandbox can fail closed.
+pub fn absolute_path(path: &str) -> std::io::Result<String> {
     let p = Path::new(path);
     let absolute: PathBuf = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(p)
+        std::env::current_dir()?.join(p)
     };
-    // canonicalize resolves symlinks but requires existence; fall back to the plain
-    // absolute path (lexically normalized) when the target does not exist yet.
-    std::fs::canonicalize(&absolute)
-        .unwrap_or_else(|_| lexically_normalize(&absolute))
-        .to_string_lossy()
-        .to_string()
-}
-
-/// Lexical `.`/`..` normalization for a path that may not exist on disk.
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
+    let mut resolved = PathBuf::new();
+    let mut missing = false;
+    for component in absolute.components() {
         use std::path::Component::*;
-        match comp {
+        match component {
             CurDir => {}
             ParentDir => {
-                out.pop();
+                resolved.pop();
             }
-            other => out.push(other.as_os_str()),
+            Normal(name) => {
+                resolved.push(name);
+                if !missing {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(path) => resolved = path,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            missing = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            RootDir | Prefix(_) => resolved.push(component.as_os_str()),
         }
     }
-    out
+    Ok(resolved.to_string_lossy().to_string())
 }
 
 /// The fail-closed rejection reasons for an official run, each carrying the EXACT Swift
@@ -224,6 +236,9 @@ pub enum OfficialSandboxError {
     /// express (relative, or carrying a control character). Adapter-only: the Swift original
     /// has no resident topology, so this refusal has no Swift twin to byte-match.
     InvalidResidentSocket,
+    /// A sandbox path could not be resolved safely. Adapter-only: fail closed rather than emit a
+    /// profile whose path rule may name a different object.
+    PathResolution,
 }
 
 impl OfficialSandboxError {
@@ -247,6 +262,9 @@ impl OfficialSandboxError {
             }
             OfficialSandboxError::InvalidResidentSocket => {
                 "BENCH_WORKER_RESIDENT_SOCKET must be an absolute path with no control characters"
+            }
+            OfficialSandboxError::PathResolution => {
+                "official benchmark sandbox path could not be resolved safely"
             }
         }
     }
@@ -284,6 +302,8 @@ pub struct OfficialSandboxInputs<'a> {
     pub fallback_executable: &'a str,
     /// The private golden the worker must not read (`blockedGoldenPath`).
     pub golden_path: &'a str,
+    /// Absolute, symlink-resolved evaluator-only paths denied for both reads and writes.
+    pub evaluator_paths: &'a [String],
     /// Whether `/usr/bin/sandbox-exec` exists + is executable (Swift
     /// `FileManager.isExecutableFile`). Injected so the matrix is testable off-box.
     pub sandbox_exec_available: bool,
@@ -340,7 +360,8 @@ pub fn resolve_official_sandbox(
     if executable.is_empty() {
         return Err(OfficialSandboxError::NoExecutable);
     }
-    let executable_path = absolute_path(executable);
+    let executable_path =
+        absolute_path(executable).map_err(|_| OfficialSandboxError::PathResolution)?;
 
     // 4. Resolve the profile (main.swift:1195-1210). An operator override wins; else, when
     //    the sandbox is not disabled and a golden path is present, generate one — which
@@ -352,18 +373,24 @@ pub fn resolve_official_sandbox(
                 if !inputs.sandbox_exec_available {
                     return Err(OfficialSandboxError::SandboxExecNotFound);
                 }
-                let golden = absolute_path(inputs.golden_path);
+                let golden = absolute_path(inputs.golden_path)
+                    .map_err(|_| OfficialSandboxError::PathResolution)?;
                 let private_dir = inputs
                     .private_dir
                     .filter(|d| !d.is_empty())
-                    .map(absolute_path);
+                    .map(absolute_path)
+                    .transpose()
+                    .map_err(|_| OfficialSandboxError::PathResolution)?;
                 // Validate BEFORE absolutizing: `absolute_path` would happily join a
                 // relative socket name onto the cwd and hide the misconfiguration behind a
                 // rule naming a socket that does not exist.
                 let resident_socket = match inputs.resident_socket.filter(|s| !s.is_empty()) {
                     Some(socket) => {
                         validate_resident_socket(socket)?;
-                        Some(absolute_path(socket))
+                        Some(
+                            absolute_path(socket)
+                                .map_err(|_| OfficialSandboxError::PathResolution)?,
+                        )
                     }
                     None => None,
                 };
@@ -372,6 +399,7 @@ pub fn resolve_official_sandbox(
                     &golden,
                     private_dir.as_deref(),
                     resident_socket.as_deref(),
+                    inputs.evaluator_paths,
                 ))
             } else {
                 // No override, and no way to generate one → fail closed below.
@@ -428,6 +456,7 @@ mod tests {
             resident_socket: None,
             fallback_executable: "/opt/mlxfast/engine",
             golden_path: "/private/golden.json",
+            evaluator_paths: &[],
             sandbox_exec_available: true,
         }
     }
@@ -443,7 +472,8 @@ mod tests {
     fn profile_byte_shape_adds_persistence_denies_to_swift_original() {
         // Exact Swift rule order plus the M14 persistence block after the engine allowance.
         // The golden deny-read remains the last line with NO trailing newline.
-        let profile = build_seatbelt_profile("/opt/engine", "/private/golden.json", None, None);
+        let profile =
+            build_seatbelt_profile("/opt/engine", "/private/golden.json", None, None, &[]);
         let expected = "(version 1)\n\
              (allow default)\n\
              (deny network*)\n\
@@ -474,6 +504,7 @@ mod tests {
             "/private/golden.json",
             Some("/private/dir"),
             None,
+            &[],
         );
         assert!(profile.ends_with(
             "(deny file-read* (literal \"/private/golden.json\"))\n\
@@ -481,18 +512,38 @@ mod tests {
         ));
         // An empty private dir does NOT add a rule.
         let profile2 =
-            build_seatbelt_profile("/opt/engine", "/private/golden.json", Some(""), None);
+            build_seatbelt_profile("/opt/engine", "/private/golden.json", Some(""), None, &[]);
         assert_eq!(
             profile2,
-            build_seatbelt_profile("/opt/engine", "/private/golden.json", None, None)
+            build_seatbelt_profile("/opt/engine", "/private/golden.json", None, None, &[])
         );
     }
 
     #[test]
     fn profile_escapes_paths() {
-        let profile = build_seatbelt_profile(r#"/opt/en"gine"#, r#"/priv/g"n.json"#, None, None);
+        let profile =
+            build_seatbelt_profile(r#"/opt/en"gine"#, r#"/priv/g"n.json"#, None, None, &[]);
         assert!(profile.contains(r#"(allow process-exec (literal "/opt/en\"gine"))"#));
         assert!(profile.contains(r#"(deny file-read* (literal "/priv/g\"n.json"))"#));
+    }
+
+    #[test]
+    fn evaluator_read_write_denies_are_last() {
+        let paths = vec![
+            "/private/evaluator-dir".to_string(),
+            r#"/private/evaluator-"file"#.to_string(),
+        ];
+        let profile = build_seatbelt_profile(
+            "/opt/engine",
+            "/private/golden.json",
+            Some("/private/dir"),
+            None,
+            &paths,
+        );
+        assert!(profile.ends_with(
+            "(deny file-read* file-write* (subpath \"/private/evaluator-dir\"))\n\
+             (deny file-read* file-write* (subpath \"/private/evaluator-\\\"file\"))"
+        ));
     }
 
     // ---- Fail-closed matrix (the 5 official refusals) ----
@@ -503,7 +554,10 @@ mod tests {
         assert!(matches!(plan.profile, SandboxProfile::Generated(_)));
         // Even when the caller requests stderr forwarding, official forces it OFF.
         assert!(!plan.forward_worker_stderr);
-        assert_eq!(plan.executable_path, absolute_path("/opt/mlxfast/engine"));
+        assert_eq!(
+            plan.executable_path,
+            absolute_path("/opt/mlxfast/engine").unwrap()
+        );
     }
 
     #[test]
@@ -629,15 +683,15 @@ mod tests {
              (deny file-read* (literal \"/private/golden.json\"))";
         for socket in [None, Some("")] {
             assert_eq!(
-                build_seatbelt_profile("/opt/engine", "/private/golden.json", None, socket),
+                build_seatbelt_profile("/opt/engine", "/private/golden.json", None, socket, &[]),
                 pre_resident,
                 "an absent/empty resident socket must not perturb one byte"
             );
         }
         // ... and the same with a private dir in play.
         assert_eq!(
-            build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), None),
-            build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), Some(""))
+            build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), None, &[]),
+            build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), Some(""), &[],)
         );
     }
 
@@ -658,7 +712,7 @@ mod tests {
             (Some("/private/dir"), Some("/tmp/bw.sock")),
         ] {
             let profile =
-                build_seatbelt_profile("/opt/engine", "/g.json", private_dir, resident_socket);
+                build_seatbelt_profile("/opt/engine", "/g.json", private_dir, resident_socket, &[]);
             for rule in rules {
                 assert!(profile.lines().any(|line| line == rule), "missing {rule}");
             }
@@ -667,8 +721,9 @@ mod tests {
 
     #[test]
     fn profile_with_resident_socket_adds_exactly_one_rule_after_deny_network() {
-        let without = build_seatbelt_profile("/opt/engine", "/g.json", None, None);
-        let with = build_seatbelt_profile("/opt/engine", "/g.json", None, Some("/tmp/bw.sock"));
+        let without = build_seatbelt_profile("/opt/engine", "/g.json", None, None, &[]);
+        let with =
+            build_seatbelt_profile("/opt/engine", "/g.json", None, Some("/tmp/bw.sock"), &[]);
         let rule = "(allow network-outbound (remote unix-socket (path-literal \"/tmp/bw.sock\")))";
         assert!(with.contains(rule), "the allow rule is present: {with}");
         // EXACTLY one extra line, and it sits immediately after `(deny network*)` so the
@@ -695,7 +750,8 @@ mod tests {
 
     #[test]
     fn resident_socket_path_is_seatbelt_escaped() {
-        let profile = build_seatbelt_profile("/opt/e", "/g.json", None, Some(r#"/tmp/b"w.sock"#));
+        let profile =
+            build_seatbelt_profile("/opt/e", "/g.json", None, Some(r#"/tmp/b"w.sock"#), &[]);
         assert!(profile.contains(
             r#"(allow network-outbound (remote unix-socket (path-literal "/tmp/b\"w.sock")))"#
         ));
@@ -734,6 +790,69 @@ mod tests {
     }
 
     #[test]
+    fn missing_path_resolves_through_its_deepest_existing_ancestor() {
+        let missing = format!("/tmp/benchd-missing-{}/child", std::process::id());
+        let resolved = absolute_path(&missing).unwrap();
+        let canonical_tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(
+            PathBuf::from(resolved),
+            canonical_tmp
+                .join(format!("benchd-missing-{}", std::process::id()))
+                .join("child")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_resolved_before_parent_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "benchd-symlink-parent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let target = root.join("real/nested");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+
+        let resolved = absolute_path(&link.join("../missing").to_string_lossy()).unwrap();
+        let expected = std::fs::canonicalize(root.join("real"))
+            .unwrap()
+            .join("missing");
+        assert_eq!(PathBuf::from(resolved), expected);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_suffix_is_normalized_lexically() {
+        let input = format!("/tmp/benchd-missing-{}/gone/../child", std::process::id());
+        let resolved = absolute_path(&input).unwrap();
+        let canonical_tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(
+            PathBuf::from(resolved),
+            canonical_tmp
+                .join(format!("benchd-missing-{}", std::process::id()))
+                .join("child")
+        );
+    }
+
+    #[test]
+    fn path_resolution_fails_closed_on_non_not_found_errors() {
+        let error = absolute_path("/tmp/bad\0path").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let mut inputs = base_inputs();
+        inputs.fallback_executable = "/tmp/bad\0path";
+        assert_eq!(
+            resolve_official_sandbox(&inputs, false).unwrap_err(),
+            OfficialSandboxError::PathResolution
+        );
+    }
+
+    #[test]
     fn resolver_threads_the_resident_socket_into_the_generated_profile() {
         let mut inp = base_inputs();
         inp.resident_socket = Some("/tmp/bench-worker.sock");
@@ -743,7 +862,7 @@ mod tests {
         };
         assert!(profile.contains(&format!(
             "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
-            absolute_path("/tmp/bench-worker.sock")
+            absolute_path("/tmp/bench-worker.sock").unwrap()
         )));
         // An empty value is treated as unset, not as a refusal.
         let mut empty = base_inputs();
