@@ -226,6 +226,60 @@ pub fn passes_speedup_floors(
     clears_floor(decode_speedup, decode_floor) && clears_floor(prefill_speedup, prefill_floor)
 }
 
+/// One paired speedup that exceeds a fixture ceiling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpeedupCeilingFailure {
+    pub axis: &'static str,
+    pub value: f64,
+    pub ceiling: f64,
+}
+
+/// Return the first declared ceiling exceeded by this pair. Absence leaves the old path unchanged;
+/// equality passes. Non-finite gains fail closed when that axis has a ceiling.
+pub fn first_speedup_above_ceiling(
+    decode_speedup: f64,
+    prefill_speedup: f64,
+    decode_ceiling: Option<f64>,
+    prefill_ceiling: Option<f64>,
+) -> Option<SpeedupCeilingFailure> {
+    [
+        ("decode", decode_speedup, decode_ceiling),
+        ("prefill", prefill_speedup, prefill_ceiling),
+    ]
+    .into_iter()
+    .find_map(|(axis, value, ceiling)| {
+        let ceiling = ceiling?;
+        (!value.is_finite() || value > ceiling).then_some(SpeedupCeilingFailure {
+            axis,
+            value,
+            ceiling,
+        })
+    })
+}
+
+#[cfg(test)]
+mod speedup_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn speedup_ceilings_refuse_only_values_above_them() {
+        assert_eq!(
+            first_speedup_above_ceiling(5.0, 4.0, Some(5.0), Some(4.0)),
+            None
+        );
+        assert_eq!(
+            first_speedup_above_ceiling(4.9, 3.9, Some(5.0), Some(4.0)),
+            None
+        );
+        assert_eq!(first_speedup_above_ceiling(99.0, 99.0, None, None), None);
+        let decode = first_speedup_above_ceiling(5.5, 1.0, Some(5.0), None).unwrap();
+        assert_eq!(decode.axis, "decode");
+        assert_eq!(decode.value, 5.5);
+        let prefill = first_speedup_above_ceiling(1.0, 5.5, None, Some(5.0)).unwrap();
+        assert_eq!(prefill.axis, "prefill");
+    }
+}
+
 /// `BenchmarkScore.speedupFloorFailureMessage`: exact POSIX/en_US format, 6 decimals.
 pub fn speedup_floor_failure_message(
     decode_speedup: f64,

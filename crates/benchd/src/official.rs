@@ -35,11 +35,13 @@ use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessSco
 use bench_core::constants::{AcceptanceBands, WindowShape};
 use bench_core::contract::PairCombine;
 use bench_core::golden::GoldenFixture;
-use bench_core::score::{evaluate_timed_run, ScoringWeights, SpeedupFloors};
+use bench_core::score::{
+    evaluate_timed_run, first_speedup_above_ceiling, speedup, ScoringWeights, SpeedupFloors,
+};
 use bench_protocol::SpecConfig;
 use bench_runner::{
-    run_timed_benchmark_persistent_on_session, LineTransport, RunnerError, Session, TimingParams,
-    TimingResult, VerifyMode,
+    run_timed_benchmark_persistent_on_session, scrub_reason_for_seal, LineTransport, RunnerError,
+    Session, TimingParams, TimingResult, VerifyMode,
 };
 
 use crate::iterate::{
@@ -409,6 +411,85 @@ pub fn official_timed_params(
         .with_prefill_timed_runs(window.official_prefill_timed_runs)
 }
 
+/// Build one timed shape with prefill fields from `prefill` and decode fields from `decode`.
+pub fn compose_benchmark_golden(
+    prefill: &bench_core::golden::BenchmarkGolden,
+    decode: &bench_core::golden::BenchmarkGolden,
+) -> bench_core::golden::BenchmarkGolden {
+    bench_core::golden::BenchmarkGolden {
+        prefill_prompt_tokens: prefill.prefill_prompt_tokens.clone(),
+        expected_prefill_token: prefill.expected_prefill_token,
+        decode_seed_tokens: decode.decode_seed_tokens.clone(),
+        expected_decode_seed_token: decode.expected_decode_seed_token,
+        expected_decode_tokens: decode.expected_decode_tokens.clone(),
+        baseline_prefill_seconds_per_token: None,
+        baseline_decode_seconds_per_token: None,
+    }
+}
+
+pub fn validate_decode_golden_offset(offset: usize, golden_count: usize) -> Result<(), String> {
+    if offset == 0 || offset >= golden_count {
+        Err(format!(
+            "decode_golden_offset must be at least 1 and less than the live golden count {golden_count}; got {offset}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub const PROMPT_REUSE_REFUSED: &str = "PROMPT-REUSE-REFUSED";
+
+pub fn validate_prompt_distinctness(
+    candidate_sources: &[&bench_core::golden::BenchmarkGolden],
+    control_sources: &[&bench_core::golden::BenchmarkGolden],
+    candidate_composed: &[bench_core::golden::BenchmarkGolden],
+    control_composed: &[bench_core::golden::BenchmarkGolden],
+    warmup: Option<&bench_core::golden::BenchmarkGolden>,
+    composed: bool,
+) -> Result<(), String> {
+    if let Some(warmup) = warmup {
+        for (leg, sources) in [
+            ("candidate", candidate_sources),
+            ("control", control_sources),
+        ] {
+            for (index, live) in sources.iter().enumerate() {
+                for (warmup_name, warmup_tokens) in [
+                    ("warm-up prefill", &warmup.prefill_prompt_tokens),
+                    ("warm-up seed", &warmup.decode_seed_tokens),
+                ] {
+                    for (live_name, live_tokens) in [
+                        ("live prefill", &live.prefill_prompt_tokens),
+                        ("live seed", &live.decode_seed_tokens),
+                    ] {
+                        if warmup_tokens == live_tokens {
+                            return Err(format!(
+                                "{PROMPT_REUSE_REFUSED}: {warmup_name} equals {leg} golden {} {live_name}",
+                                index + 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if composed {
+        for (leg, shapes) in [
+            ("candidate", candidate_composed),
+            ("control", control_composed),
+        ] {
+            for (index, shape) in shapes.iter().enumerate() {
+                if shape.prefill_prompt_tokens == shape.decode_seed_tokens {
+                    return Err(format!(
+                        "{PROMPT_REUSE_REFUSED}: {leg} pair {} prefill equals its composed decode seed",
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
 /// unmeasured, DISCARDED pass over the SAME benchmark prompt, decode seed and oracle the timed
 /// legs use, at the SAME decode depth and with the SAME spec.
@@ -421,7 +502,7 @@ pub fn official_timed_params(
 ///
 /// WHY IT CANNOT LEAK INTO THE MEASURED NUMBERS. It runs `VerifyMode::TimeOnly`, so a token
 /// divergence does not abort it (catching an oracle mismatch stays the REAL timed legs' job), and
-/// its `TimingResult` is DISCARDED on the spot — it never reaches any baseline, speedup, floor,
+/// its `TimingResult` reaches only the private audit. It never reaches a baseline, speedup, floor,
 /// band or score. The depth matches the timed window (`Mode::Official.decode_steps(&test_window())`) because a
 /// shorter warmup left the timed decode measurably colder. The SPEC matches the timed leg's,
 /// because a speculating window JITs different shapes than a serial one.
@@ -453,6 +534,11 @@ enum TimedWindowFailure {
     Timed(RunnerError),
 }
 
+struct WarmupRecord {
+    timing: TimingResult,
+    wall_seconds: f64,
+}
+
 /// ONE window's WARMUP leg and TIMED prefill+decode legs. This is the shared measurement body: the
 /// ranked candidate leg ([`official_core_windowed`]), the SERIAL-CONTROL leg of a paired run and
 /// every `calibrate-baseline` pass all run through it, so the three cannot drift apart.
@@ -472,7 +558,7 @@ fn run_timed_window<T, FT, G>(
     spawn_timed: &mut FT,
     cool_gate: &mut G,
     verify: VerifyMode,
-) -> Result<(TimingResult, Session<T>), TimedWindowFailure>
+) -> Result<(TimingResult, Option<WarmupRecord>, Session<T>), TimedWindowFailure>
 where
     T: LineTransport,
     FT: FnMut() -> bench_runner::Result<Session<T>>,
@@ -480,21 +566,28 @@ where
 {
     let mut no_cool_gate = |_phase: &str| -> bench_runner::Result<()> { Ok(()) };
     let mut session = spawn_timed().map_err(TimedWindowFailure::Timed)?;
-    if let Some(wp) = warmup_params {
+    let warmup = if let Some(wp) = warmup_params {
         // A warmup fault discards the session, so fail closed here rather than let the measured leg
         // report a bare SessionDiscarded.
-        run_timed_benchmark_persistent_on_session(
+        let started = std::time::Instant::now();
+        let timing = run_timed_benchmark_persistent_on_session(
             &mut session,
             &mut no_cool_gate,
             wp,
             VerifyMode::TimeOnly,
         )
         .map_err(TimedWindowFailure::Warmup)?;
-    }
+        Some(WarmupRecord {
+            timing,
+            wall_seconds: started.elapsed().as_secs_f64(),
+        })
+    } else {
+        None
+    };
     let measured =
         run_timed_benchmark_persistent_on_session(&mut session, cool_gate, params, verify)
             .map_err(TimedWindowFailure::Timed)?;
-    Ok((measured, session))
+    Ok((measured, warmup, session))
 }
 
 /// The CANDIDATE leg's timed window (warmup + prefill + decode, every token oracle-checked), or the
@@ -508,10 +601,11 @@ where
 fn measure_candidate_window<T, FT, G>(
     run: OfficialParams<'_>,
     benchmark: &bench_core::golden::BenchmarkGolden,
+    warmup_benchmark: Option<&bench_core::golden::BenchmarkGolden>,
     spawn_timed: &mut FT,
     cool_gate: &mut G,
     verify: VerifyMode,
-) -> Result<(TimingResult, Session<T>), Box<ScorePayload>>
+) -> Result<(TimingResult, Option<WarmupRecord>, Session<T>), Box<ScorePayload>>
 where
     T: LineTransport,
     FT: FnMut() -> bench_runner::Result<Session<T>>,
@@ -529,13 +623,17 @@ where
         spec,
         window,
     } = run;
-    let params = official_timed_params(benchmark, spec.clone(), window);
+    let params = official_timed_params(benchmark, spec.clone(), window)
+        .with_prefill_warmup_prompt_tokens(
+            warmup_benchmark.map(|warmup| warmup.prefill_prompt_tokens.clone()),
+        );
 
     // MEASUREMENT-INTEGRITY WARMUP + the TIMED legs, in the window shape this run measures
     // ([`run_timed_window`], which carries the whole rationale). The warmup leg is unmeasured and
     // discarded; the timed legs pass the caller's cool gate; the held session comes back so the
     // correctness phase below can reuse the ONE model residency.
-    let warmup_params = official_warmup_params(benchmark, spec.clone(), window);
+    let warmup_params =
+        official_warmup_params(warmup_benchmark.unwrap_or(benchmark), spec.clone(), window);
     let measured_result = run_timed_window(
         &params,
         warmup_params.as_ref(),
@@ -543,7 +641,7 @@ where
         cool_gate,
         verify,
     );
-    let (measured, held_session) = match measured_result {
+    let (measured, warmup, held_session) = match measured_result {
         Ok(t) => t,
         Err(TimedWindowFailure::Warmup(e)) => {
             return Err(Box::new(official_failed(
@@ -618,7 +716,7 @@ where
     // TimingResult (a mock's ~0 wall-clock can never sit inside the acceptance band). The
     // correctness worker is the ONE resident session the timed phases ran on (load-once), so the
     // window never loads the model twice and never holds two residencies.
-    Ok((measured, held_session))
+    Ok((measured, warmup, held_session))
 }
 
 pub fn official_core_windowed<T, FT, G>(
@@ -661,7 +759,7 @@ where
     // being scored against the MTP oracle. The resolved spec now rides the timed window, and the
     // engine's `effective_spec` echo must honor it or the leg is discarded (spec-never-ignored,
     // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
-    let (measured, held_session) = match measure_candidate_window(
+    let (measured, _warmup, held_session) = match measure_candidate_window(
         OfficialParams {
             golden,
             scoring,
@@ -671,6 +769,7 @@ where
             window,
         },
         benchmark,
+        None,
         &mut spawn_timed,
         &mut cool_gate,
         VerifyMode::Verify,
@@ -727,7 +826,8 @@ pub const SERIAL_CONTROL_LEG_FAILED: &str = "SERIAL-CONTROL-LEG-FAILED";
 /// Every failure refuses BY NAME ([`SERIAL_CONTROL_LEG_FAILED`]): the reference tree is the
 /// organizer's, so a fault here is never the candidate's fault and must not be reported as one.
 pub fn run_serial_control_leg<T, FB, G>(
-    golden: &GoldenFixture,
+    benchmark: Option<&bench_core::golden::BenchmarkGolden>,
+    warmup_benchmark: Option<&bench_core::golden::BenchmarkGolden>,
     window: &WindowShape,
     mut spawn_baseline: FB,
     mut cool_gate: G,
@@ -737,15 +837,39 @@ where
     FB: FnMut() -> bench_runner::Result<Session<T>>,
     G: FnMut(&str) -> bench_runner::Result<()>,
 {
-    let benchmark = golden.benchmark.as_ref().ok_or_else(|| {
+    run_serial_control_leg_with_warmup(
+        benchmark,
+        warmup_benchmark,
+        window,
+        &mut spawn_baseline,
+        &mut cool_gate,
+    )
+    .map(|(measured, _warmup)| measured)
+}
+
+fn run_serial_control_leg_with_warmup<T, FB, G>(
+    benchmark: Option<&bench_core::golden::BenchmarkGolden>,
+    warmup_benchmark: Option<&bench_core::golden::BenchmarkGolden>,
+    window: &WindowShape,
+    mut spawn_baseline: FB,
+    mut cool_gate: G,
+) -> Result<(TimingResult, Option<WarmupRecord>), String>
+where
+    T: LineTransport,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let benchmark = benchmark.ok_or_else(|| {
         format!(
             "{SERIAL_CONTROL_LEG_FAILED}: the golden carries no benchmark oracle, so there is no \
              prompt for the control leg to measure"
         )
     })?;
     // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire.
-    let params = official_timed_params(benchmark, None, window);
-    let warmup_params = official_warmup_params(benchmark, None, window);
+    let params = official_timed_params(benchmark, None, window).with_prefill_warmup_prompt_tokens(
+        warmup_benchmark.map(|warmup| warmup.prefill_prompt_tokens.clone()),
+    );
+    let warmup_params = official_warmup_params(warmup_benchmark.unwrap_or(benchmark), None, window);
     // EXACT in every mode: the reference tree must reproduce its own golden.
     let measured = run_timed_window(
         &params,
@@ -757,9 +881,9 @@ where
     // Reap leg 1's residency before returning: leg 2 loads next, and two model residencies must
     // never be live at once.
     measured
-        .map(|(timing, session)| {
+        .map(|(timing, warmup, session)| {
             drop(session);
-            timing
+            (timing, warmup)
         })
         .map_err(|e| match e {
             TimedWindowFailure::Warmup(e) => {
@@ -791,10 +915,9 @@ pub struct PairedBaselineSeal<'a> {
 ///
 /// The CANDIDATE leg's numbers are READ BACK from the enforced fields
 /// (`prefill_seconds_per_token` / `decode_seconds_per_token`) rather than passed in again, so the
-/// named copies cannot drift from the numbers that were scored. Decode is the decode window, so
-/// each role's `*_leg_decode_window_seconds_per_token` is the same value as its
-/// `*_leg_decode_seconds_per_token` — the same discipline
-/// `per_prompt.mtp_seconds_per_token_mean` follows. A payload with no candidate timing (a
+/// named copies cannot drift from the numbers that were scored. The explicit
+/// `*_leg_decode_window_seconds_per_token` fields are later replaced from the raw clock split when
+/// seed-inclusive decode is armed. A payload with no candidate timing (a
 /// preflight or control-leg refusal) seals no candidate keys: absent is "no leg ran", which is a
 /// different claim from zero.
 ///
@@ -885,6 +1008,24 @@ pub struct PairedLegs<LB, LC, FB, FT> {
     pub spawn_timed: FT,
 }
 
+/// A paired resident guard whose normal end is checked. Dropping it remains the failure-path
+/// fallback.
+pub trait FinishLeg {
+    fn finish(self) -> Result<(), String>;
+}
+
+impl FinishLeg for () {
+    fn finish(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl FinishLeg for crate::legserve::LegServe {
+    fn finish(self) -> Result<(), String> {
+        self.stop()
+    }
+}
+
 /// WHAT window a paired run measures: the acceptance bands, the candidate leg's requested spec, the
 /// measured/checked window shape, and the per-phase cool gate both legs pass.
 ///
@@ -892,7 +1033,7 @@ pub struct PairedLegs<LB, LC, FB, FT> {
 /// That count is now part of the RESOLVED window below (STEP 1 of the constants→contract
 /// migration, David 2026-09-15), resolved once before the run, so the platform has nothing left to
 /// decide here and is gone rather than carried unused.
-pub struct PairedWindow<G> {
+pub struct PairedWindow<'a, G> {
     /// THE CONTROL HEALTH GATE resolved from the track fixture. `PerLeg` is the default and can
     /// refuse before a candidate runs. `MeanOfLegs` runs every pair, then checks the mean ratio.
     pub control_band_mode: bench_core::contract::ControlBandMode,
@@ -920,6 +1061,14 @@ pub struct PairedWindow<G> {
     /// (`decode_speedup_floor` / `prefill_speedup_floor`; David 2026-09-09 ruled 0.95 / 0.95,
     /// configurable per project). The fixture is the only source on the scored path.
     pub floors: SpeedupFloors,
+    pub decode_speedup_ceiling: Option<f64>,
+    pub prefill_speedup_ceiling: Option<f64>,
+    pub seed_window_max_ratio: Option<f64>,
+    pub decode_window_includes_seed: Option<bool>,
+    /// Extra golden used only by the two warm-up forms. Absent keeps the legacy same-golden path.
+    pub warmup_golden: Option<&'a GoldenFixture>,
+    /// Decode displacement in the live golden set. Absent keeps the legacy same-golden path.
+    pub decode_golden_offset: Option<usize>,
     /// The composite weights this run scores and gates under, from the pinned track fixture
     /// (`score_decode_weight` / `score_prefill_weight`; STEP 1 of the constants→contract
     /// migration, David 2026-09-15), falling back to the 0.75/0.25 constants while no fixture
@@ -980,10 +1129,11 @@ pub fn official_core_paired<T, L, LB, LC, FB, FT, G>(
     digests: RunDigests<'_>,
     commit: &str,
     legs: PairedLegs<LB, LC, FB, FT>,
-    window: PairedWindow<G>,
+    window: PairedWindow<'_, G>,
 ) -> ScorePayload
 where
     T: LineTransport,
+    L: FinishLeg,
     LB: FnMut(usize) -> Result<L, String>,
     LC: FnMut(usize) -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
@@ -998,6 +1148,9 @@ where
     let near_tie_gap = window.near_tie_relative_gap;
     let combine = window.combine;
     let control_band_mode = window.control_band_mode;
+    let decode_ceiling = window.decode_speedup_ceiling;
+    let prefill_ceiling = window.prefill_speedup_ceiling;
+    let decode_window_includes_seed = window.decode_window_includes_seed;
     let mut payload =
         official_core_paired_inner(goldens, calibration, seal, digests, commit, legs, window);
     payload.metrics.gates = gate_log.records();
@@ -1007,6 +1160,9 @@ where
     payload.metrics.control_band_mode = (control_band_mode
         == bench_core::contract::ControlBandMode::MeanOfLegs)
         .then_some(control_band_mode);
+    payload.metrics.decode_speedup_ceiling = decode_ceiling;
+    payload.metrics.prefill_speedup_ceiling = prefill_ceiling;
+    payload.metrics.decode_window_includes_seed = decode_window_includes_seed;
     // The token rule the run applied rides on every payload, so a reader of the score sees it.
     payload.metrics.timed_token_tolerance_per_thousand = tolerance;
     payload.metrics.timed_token_near_tie_relative_gap = near_tie_gap;
@@ -1022,10 +1178,11 @@ fn official_core_paired_inner<T, L, LB, LC, FB, FT, G>(
     digests: RunDigests<'_>,
     commit: &str,
     legs: PairedLegs<LB, LC, FB, FT>,
-    window: PairedWindow<G>,
+    window: PairedWindow<'_, G>,
 ) -> ScorePayload
 where
     T: LineTransport,
+    L: FinishLeg,
     LB: FnMut(usize) -> Result<L, String>,
     LC: FnMut(usize) -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
@@ -1048,6 +1205,12 @@ where
         pairs,
         combine,
         floors,
+        decode_speedup_ceiling,
+        prefill_speedup_ceiling,
+        seed_window_max_ratio,
+        decode_window_includes_seed,
+        warmup_golden,
+        decode_golden_offset,
         weights,
         token_tolerance_per_thousand,
         near_tie_relative_gap,
@@ -1070,23 +1233,99 @@ where
             ScoringInputs::no_denominator(floors, weights),
         );
     }
-    // Every candidate golden must carry its oracle before the first leg runs.
-    let mut benchmarks = Vec::with_capacity(goldens.len());
+    // Build every timed shape before the first leg boots.
+    let mut candidate_sources = Vec::with_capacity(goldens.len());
+    let mut control_sources = Vec::with_capacity(goldens.len());
     for pair_goldens in goldens {
-        match &pair_goldens.candidate.benchmark {
-            Some(b) => benchmarks.push(b),
+        let Some(candidate) = pair_goldens.candidate.benchmark.as_ref() else {
+            return paired_refusal(
+                *pair_goldens,
+                digests,
+                commit,
+                "benchmark golden file must contain a benchmark oracle".to_string(),
+                seal,
+                None,
+                ScoringInputs::no_denominator(floors, weights),
+            );
+        };
+        let Some(control) = pair_goldens.control.benchmark.as_ref() else {
+            return paired_refusal(
+                *pair_goldens,
+                digests,
+                commit,
+                "control golden file must contain a benchmark oracle".to_string(),
+                seal,
+                None,
+                ScoringInputs::no_denominator(floors, weights),
+            );
+        };
+        candidate_sources.push(candidate);
+        control_sources.push(control);
+    }
+    let warmup_benchmark = match warmup_golden {
+        Some(golden) => match golden.benchmark.as_ref() {
+            Some(benchmark) => Some(benchmark),
             None => {
                 return paired_refusal(
-                    *pair_goldens,
+                    goldens[0],
                     digests,
                     commit,
-                    "benchmark golden file must contain a benchmark oracle".to_string(),
+                    "warm-up golden file must contain a benchmark oracle".to_string(),
                     seal,
                     None,
                     ScoringInputs::no_denominator(floors, weights),
                 )
             }
+        },
+        None => None,
+    };
+    let offset = decode_golden_offset.unwrap_or(0);
+    if let Some(offset) = decode_golden_offset {
+        if let Err(error) = validate_decode_golden_offset(offset, goldens.len()) {
+            return paired_refusal(
+                goldens[0],
+                digests,
+                commit,
+                error,
+                seal,
+                None,
+                ScoringInputs::no_denominator(floors, weights),
+            );
         }
+    }
+    let candidate_benchmarks: Vec<_> = (0..goldens.len())
+        .map(|g| {
+            compose_benchmark_golden(
+                candidate_sources[g],
+                candidate_sources[(g + offset) % goldens.len()],
+            )
+        })
+        .collect();
+    let control_benchmarks: Vec<_> = (0..goldens.len())
+        .map(|g| {
+            compose_benchmark_golden(
+                control_sources[g],
+                control_sources[(g + offset) % goldens.len()],
+            )
+        })
+        .collect();
+    if let Err(error) = validate_prompt_distinctness(
+        &candidate_sources,
+        &control_sources,
+        &candidate_benchmarks,
+        &control_benchmarks,
+        warmup_benchmark,
+        decode_golden_offset.is_some(),
+    ) {
+        return paired_refusal(
+            goldens[0],
+            digests,
+            commit,
+            error,
+            seal,
+            None,
+            ScoringInputs::no_denominator(floors, weights),
+        );
     }
 
     // PAIR LOOP. Every pair is the same two legs in the same order: the serial-control leg on the
@@ -1106,7 +1345,8 @@ where
         let golden_index = (pair - 1) % goldens.len();
         let pair_goldens = goldens[golden_index];
         let golden = pair_goldens.candidate;
-        let benchmark = benchmarks[golden_index];
+        let benchmark = &candidate_benchmarks[golden_index];
+        let control_benchmark = &control_benchmarks[golden_index];
         let baseline_leg = match open_baseline_leg(golden_index) {
             Ok(guard) => guard,
             Err(e) => {
@@ -1127,16 +1367,17 @@ where
         // NAME THE GATE POINTS this leg is about to make: pair N, the control leg. Every gate the
         // leg's timed phases run is recorded under that name (David 2026-09-17).
         gate_log.enter_leg(pair, crate::quiescegate::LEG_CONTROL);
-        let control_result = run_serial_control_leg(
-            pair_goldens.control,
+        let control_result = run_serial_control_leg_with_warmup(
+            Some(control_benchmark),
+            warmup_benchmark,
             &window_shape,
             &mut spawn_baseline,
             &mut cool_gate,
         );
-        drop(baseline_leg);
-        let control = match control_result {
+        let (mut control, control_warmup) = match control_result {
             Ok(t) => t,
             Err(e) => {
+                drop(baseline_leg);
                 return with_measured_pairs(
                     paired_refusal(
                         pair_goldens,
@@ -1148,9 +1389,77 @@ where
                         ScoringInputs::no_denominator(floors, weights),
                     ),
                     records,
-                )
+                );
             }
         };
+        control.decode_seconds_per_token = match decode_seconds_per_token_for_scoring(
+            &control,
+            decode_window_includes_seed == Some(true),
+            pair,
+            pairs,
+            "control",
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(baseline_leg);
+                return with_measured_pairs(
+                    paired_refusal(
+                        pair_goldens,
+                        digests,
+                        commit,
+                        error,
+                        seal,
+                        None,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                );
+            }
+        };
+        let control_seed_window_ratio = match checked_seed_window_ratio(
+            &control,
+            seed_window_max_ratio,
+            pair,
+            pairs,
+            "control",
+        ) {
+            Ok(ratio) => ratio,
+            Err(error) => {
+                drop(baseline_leg);
+                return with_measured_pairs(
+                    paired_refusal(
+                        pair_goldens,
+                        digests,
+                        commit,
+                        error,
+                        seal,
+                        Some((
+                            control.prefill_seconds_per_token,
+                            control.decode_seconds_per_token,
+                        )),
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                );
+            }
+        };
+        if let Err(error) = baseline_leg.finish() {
+            return with_measured_pairs(
+                paired_refusal(
+                    pair_goldens,
+                    digests,
+                    commit,
+                    teardown_failure(pair, pairs, "control", error),
+                    seal,
+                    Some((
+                        control.prefill_seconds_per_token,
+                        control.decode_seconds_per_token,
+                    )),
+                    ScoringInputs::no_denominator(floors, weights),
+                ),
+                records,
+            );
+        }
         let measured_leg = Some((
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
@@ -1208,7 +1517,7 @@ where
             }
         };
         gate_log.enter_leg(pair, crate::quiescegate::LEG_CANDIDATE);
-        let (timing, session) = match measure_candidate_window(
+        let (mut timing, candidate_warmup, session) = match measure_candidate_window(
             OfficialParams {
                 golden,
                 // THE LIVE DENOMINATOR: this pair's own control leg, with the track's floors.
@@ -1224,6 +1533,7 @@ where
                 window: &window_shape,
             },
             benchmark,
+            warmup_benchmark,
             &mut spawn_timed,
             &mut cool_gate,
             candidate_verify,
@@ -1241,20 +1551,95 @@ where
                 return payload;
             }
         };
+        timing.decode_seconds_per_token = match decode_seconds_per_token_for_scoring(
+            &timing,
+            decode_window_includes_seed == Some(true),
+            pair,
+            pairs,
+            "candidate",
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(session);
+                drop(candidate_leg);
+                return with_measured_pairs(
+                    paired_refusal(
+                        pair_goldens,
+                        digests,
+                        commit,
+                        error,
+                        seal,
+                        measured_leg,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                );
+            }
+        };
+        let candidate_seed_window_ratio = match checked_seed_window_ratio(
+            &timing,
+            seed_window_max_ratio,
+            pair,
+            pairs,
+            "candidate",
+        ) {
+            Ok(ratio) => ratio,
+            Err(error) => {
+                drop(session);
+                drop(candidate_leg);
+                return with_measured_pairs(
+                    paired_refusal(
+                        pair_goldens,
+                        digests,
+                        commit,
+                        error,
+                        seal,
+                        measured_leg,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                );
+            }
+        };
         // Tokens equal to the golden's oracle have no mismatch, and no replay runs for them. The
         // counts of any other pair stay unset until [`judge_candidate_tokens`] replays it.
         let exact = timing.emitted_tokens == oracle_tokens(benchmark, timing.decode_steps);
         let exact_count = exact.then_some(0);
-        records.push(PairedLegRecord {
+        let decode_index = (golden_index + offset) % goldens.len();
+        let mut record = PairedLegRecord {
             token_mismatch_count: exact_count,
             token_mismatch_near_tie_count: near_tie_relative_gap.and(exact_count),
             token_mismatch_second_choice_count: exact_count,
-            ..paired_leg_record(pair, &golden.sha256, &control, &timing)
-        });
+            ..paired_leg_record(
+                pair,
+                &golden.sha256,
+                decode_golden_offset.map(|_| golden.sha256.as_str()),
+                decode_golden_offset.map(|_| goldens[decode_index].candidate.sha256.as_str()),
+                &control,
+                &timing,
+                (control_warmup.as_ref(), candidate_warmup.as_ref()),
+            )
+        };
+        record.control_seed_window_ratio = control_seed_window_ratio;
+        record.candidate_seed_window_ratio = candidate_seed_window_ratio;
+        records.push(record);
         candidate_timings.push(timing);
         if pair < pairs {
             drop(session);
-            drop(candidate_leg);
+            if let Err(error) = candidate_leg.finish() {
+                return with_measured_pairs(
+                    paired_refusal(
+                        pair_goldens,
+                        digests,
+                        commit,
+                        teardown_failure(pair, pairs, "candidate", error),
+                        seal,
+                        measured_leg,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                );
+            }
         } else {
             held_session = Some(session);
             held_candidate_leg = Some(candidate_leg);
@@ -1289,8 +1674,13 @@ where
     // carries that pair's figures. Every pair stays in `paired_legs` as measured.
     let scored = scored_pair_index(&records, weights);
     let failing = match combine {
-        PairCombine::LowerMedian => None,
-        PairCombine::Mean => first_failing_pair(&records, bands, floors, weights),
+        PairCombine::LowerMedian => {
+            first_ceiling_failure(&records, decode_speedup_ceiling, prefill_speedup_ceiling)
+        }
+        PairCombine::Mean => {
+            first_ceiling_failure(&records, decode_speedup_ceiling, prefill_speedup_ceiling)
+                .or_else(|| first_failing_pair(&records, bands, floors, weights, None, None))
+        }
     };
     let sealed = failing.as_ref().map_or(scored, |(pair, _)| *pair);
     let sealed_record = records[sealed].clone();
@@ -1337,48 +1727,75 @@ where
             },
         )
     };
-    drop(held_candidate_leg);
+    if payload.passed {
+        if let Some(leg) = held_candidate_leg.take() {
+            if let Err(error) = leg.finish() {
+                payload.score = None;
+                payload.passed = false;
+                payload.metrics.error = teardown_failure(pairs, pairs, "candidate", error);
+            }
+        }
+    } else {
+        drop(held_candidate_leg.take());
+    }
+
+    if payload.metrics.error.starts_with("LEG-TEARDOWN-FAILED") {
+        let mut seal = seal;
+        seal.band_passed = true;
+        seal.leg = Some((control_prefill, control_decode));
+        seal_paired_baseline(&mut payload.metrics, &seal, &sealed_goldens.control.sha256);
+        seal_seed_prefill_windows(&mut payload.metrics, &sealed_record);
+        seal_token_counts(&mut payload.metrics, &records[sealed]);
+        payload.metrics.paired_legs = records;
+        return payload;
+    }
 
     // THE TIMED TOKEN TOLERANCE (David 2026-09-28). The candidate's residency is gone, so the
     // reference engine can load. A pair over the limit, or a replay that did not complete, refuses
-    // the whole run by name. The refusal replaces the payload above: the token verdict comes
-    // first, as it did when one different token stopped the candidate leg.
+    // the whole run by name. A substantive token refusal still replaces the payload above, as it
+    // did when one different token stopped the candidate leg. A teardown failure can replace only
+    // a passing payload; when a substantive refusal already exists, it is logged and preserved.
     if let Some(limit) = token_tolerance_per_thousand {
+        let benchmark_refs: Vec<_> = candidate_benchmarks.iter().collect();
         if let Err((failing, error)) = judge_candidate_tokens(
             limit,
             near_tie_relative_gap,
-            &benchmarks,
+            &benchmark_refs,
             &candidate_timings,
             &mut records,
             &mut open_baseline_leg,
             &mut spawn_baseline,
         ) {
-            let record = records[failing].clone();
-            let failing_goldens = goldens[failing % goldens.len()];
-            let control_leg = (
-                record.control_prefill_seconds_per_token,
-                record.control_decode_seconds_per_token,
-            );
-            let mut payload = official_failed_timed_oracle(
-                failing_goldens.candidate,
-                digests,
-                commit,
-                error,
-                record.token_mismatch_first_step,
-                ScoringInputs {
-                    baseline_prefill_spt: control_leg.0,
-                    baseline_decode_spt: control_leg.1,
-                    floors,
-                    weights,
-                },
-            );
-            let mut seal = seal;
-            seal.band_passed = true;
-            seal.leg = Some(control_leg);
-            seal_paired_baseline(&mut payload.metrics, &seal, &failing_goldens.control.sha256);
-            seal_token_counts(&mut payload.metrics, &record);
-            payload.metrics.paired_legs = records;
-            return payload;
+            if error.starts_with("LEG-TEARDOWN-FAILED") && !payload.passed {
+                eprintln!("benchd: cleanup after existing refusal: {error}");
+            } else {
+                let record = records[failing].clone();
+                let failing_goldens = goldens[failing % goldens.len()];
+                let control_leg = (
+                    record.control_prefill_seconds_per_token,
+                    record.control_decode_seconds_per_token,
+                );
+                let mut payload = official_failed_timed_oracle(
+                    failing_goldens.candidate,
+                    digests,
+                    commit,
+                    error,
+                    record.token_mismatch_first_step,
+                    ScoringInputs {
+                        baseline_prefill_spt: control_leg.0,
+                        baseline_decode_spt: control_leg.1,
+                        floors,
+                        weights,
+                    },
+                );
+                let mut seal = seal;
+                seal.band_passed = true;
+                seal.leg = Some(control_leg);
+                seal_paired_baseline(&mut payload.metrics, &seal, &failing_goldens.control.sha256);
+                seal_token_counts(&mut payload.metrics, &record);
+                payload.metrics.paired_legs = records;
+                return payload;
+            }
         }
     }
 
@@ -1441,32 +1858,117 @@ fn paired_per_prompt(
 /// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
 pub use crate::score::PairedLegRecord;
 
-/// One pair's timing record from its two measured legs, with no token counts yet. Every decode
-/// figure is the leg's decode window (`TimingResult::decode_seconds_per_token`); the seed prefill
-/// goes to the seed-named keys only.
+/// One pair's timing record from its two measured legs, with no token counts yet. The scored
+/// decode figure may include the seed window when the fixture opts in. The explicit decode-window
+/// keys always keep the raw decode half of benchd's split.
 fn paired_leg_record(
     pair: usize,
     prompt_sha256: &str,
+    prefill_golden_sha256: Option<&str>,
+    decode_golden_sha256: Option<&str>,
     control: &TimingResult,
     candidate: &TimingResult,
+    warmups: (Option<&WarmupRecord>, Option<&WarmupRecord>),
 ) -> PairedLegRecord {
+    let (control_warmup, candidate_warmup) = warmups;
     PairedLegRecord {
         pair: pair as i64,
         prompt_sha256: prompt_sha256.to_string(),
+        prefill_golden_sha256: prefill_golden_sha256.map(str::to_string),
+        decode_golden_sha256: decode_golden_sha256.map(str::to_string),
         control_prefill_seconds_per_token: control.prefill_seconds_per_token,
         control_decode_seconds_per_token: control.decode_seconds_per_token,
         candidate_prefill_seconds_per_token: candidate.prefill_seconds_per_token,
         candidate_decode_seconds_per_token: candidate.decode_seconds_per_token,
+        control_seed_window_ratio: None,
+        candidate_seed_window_ratio: None,
         control_seed_prefill_window_seconds_per_token: seed_prefill_window_per_token(control),
-        control_decode_window_seconds_per_token: Some(control.decode_seconds_per_token),
+        control_decode_window_seconds_per_token: Some(raw_decode_window_per_token(control)),
         candidate_seed_prefill_window_seconds_per_token: seed_prefill_window_per_token(candidate),
-        candidate_decode_window_seconds_per_token: Some(candidate.decode_seconds_per_token),
+        candidate_decode_window_seconds_per_token: Some(raw_decode_window_per_token(candidate)),
+        control_warmup_wall_seconds: control_warmup.map(|warmup| warmup.wall_seconds),
+        control_warmup_prefill_seconds_per_token: control_warmup
+            .map(|warmup| warmup.timing.prefill_seconds_per_token),
+        control_warmup_decode_seconds_per_token: control_warmup
+            .map(|warmup| warmup.timing.decode_seconds_per_token),
+        control_warmup_seed_prefill_window_seconds_per_token: control_warmup
+            .and_then(|warmup| seed_prefill_window_per_token(&warmup.timing)),
+        candidate_warmup_wall_seconds: candidate_warmup.map(|warmup| warmup.wall_seconds),
+        candidate_warmup_prefill_seconds_per_token: candidate_warmup
+            .map(|warmup| warmup.timing.prefill_seconds_per_token),
+        candidate_warmup_decode_seconds_per_token: candidate_warmup
+            .map(|warmup| warmup.timing.decode_seconds_per_token),
+        candidate_warmup_seed_prefill_window_seconds_per_token: candidate_warmup
+            .and_then(|warmup| seed_prefill_window_per_token(&warmup.timing)),
         token_mismatch_count: None,
         token_mismatch_first_step: None,
         token_mismatch_near_tie_count: None,
         token_mismatch_second_choice_count: None,
         token_mismatch_second_choice_max_relative_gap: None,
     }
+}
+
+fn raw_decode_window_per_token(timing: &TimingResult) -> f64 {
+    bench_core::score::decode_window_seconds_per_token(
+        timing.decode_elapsed_seconds,
+        timing.decode_steps,
+    )
+}
+
+/// The one decode accounting rule shared by ranked paired legs and baseline calibration.
+pub(crate) fn decode_seconds_per_token_for_scoring(
+    timing: &TimingResult,
+    includes_seed: bool,
+    item: usize,
+    items: usize,
+    leg: &str,
+) -> Result<f64, String> {
+    if !includes_seed {
+        return Ok(timing.decode_seconds_per_token);
+    }
+    let phase = timing.phase_window.ok_or_else(|| {
+        format!(
+            "SEED-WINDOW-NOT-OBSERVED: pair {item} of {items}, {leg} leg has no phase window to charge to decode"
+        )
+    })?;
+    Ok(bench_core::score::decode_window_seconds_per_token(
+        phase.seed_prefill_elapsed_seconds + timing.decode_elapsed_seconds,
+        timing.decode_steps,
+    ))
+}
+
+fn checked_seed_window_ratio(
+    timing: &TimingResult,
+    limit: Option<f64>,
+    pair: usize,
+    pairs: usize,
+    leg: &str,
+) -> Result<Option<f64>, String> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let ratio = seed_prefill_window_per_token(timing)
+        .map(|seed| seed / timing.prefill_seconds_per_token)
+        .filter(|ratio| ratio.is_finite())
+        .ok_or_else(|| {
+            format!(
+                "SEED-WINDOW-NOT-OBSERVED: pair {pair} of {pairs}, {leg} leg has no finite seed \
+                 window ratio"
+            )
+        })?;
+    if ratio > limit {
+        return Err(format!(
+            "SEED-WINDOW-ABOVE-LIMIT: pair {pair} of {pairs}, {leg} leg ratio {ratio:.6} exceeds \
+             limit {limit:.6}"
+        ));
+    }
+    Ok(Some(ratio))
+}
+
+fn teardown_failure(pair: usize, pairs: usize, leg: &str, error: String) -> String {
+    scrub_reason_for_seal(&format!(
+        "LEG-TEARDOWN-FAILED: pair {pair} of {pairs}, {leg} leg: {error}"
+    ))
 }
 
 /// Seal the SCORED pair's seed prefill windows onto the flat metrics
@@ -1477,6 +1979,10 @@ fn seal_seed_prefill_windows(metrics: &mut ScoreMetrics, record: &PairedLegRecor
         record.control_seed_prefill_window_seconds_per_token;
     metrics.candidate_leg_seed_prefill_window_seconds_per_token =
         record.candidate_seed_prefill_window_seconds_per_token;
+    metrics.baseline_leg_decode_window_seconds_per_token =
+        record.control_decode_window_seconds_per_token;
+    metrics.candidate_leg_decode_window_seconds_per_token =
+        record.candidate_decode_window_seconds_per_token;
 }
 
 /// The index of the pair the run scores under `lower_median` (David ruling 2026-09-17, the Laguna
@@ -1516,8 +2022,20 @@ fn first_failing_pair(
     bands: AcceptanceBands,
     floors: SpeedupFloors,
     weights: ScoringWeights,
+    decode_ceiling: Option<f64>,
+    prefill_ceiling: Option<f64>,
 ) -> Option<(usize, String)> {
     records.iter().enumerate().find_map(|(i, r)| {
+        if let Some(reason) = pair_ceiling_failure(r, decode_ceiling, prefill_ceiling) {
+            return Some((
+                i,
+                format!(
+                    "SPEEDUP-ABOVE-CEILING: pair {} of {}: {reason}",
+                    i + 1,
+                    records.len()
+                ),
+            ));
+        }
         evaluate_timed_run(
             r.candidate_decode_seconds_per_token,
             r.candidate_prefill_seconds_per_token,
@@ -1530,6 +2048,48 @@ fn first_failing_pair(
         .first_failure_reason()
         .map(|reason| (i, format!("pair {} of {}: {reason}", i + 1, records.len())))
     })
+}
+
+fn first_ceiling_failure(
+    records: &[PairedLegRecord],
+    decode_ceiling: Option<f64>,
+    prefill_ceiling: Option<f64>,
+) -> Option<(usize, String)> {
+    records.iter().enumerate().find_map(|(i, record)| {
+        pair_ceiling_failure(record, decode_ceiling, prefill_ceiling).map(|reason| {
+            (
+                i,
+                format!(
+                    "SPEEDUP-ABOVE-CEILING: pair {} of {}: {reason}",
+                    i + 1,
+                    records.len()
+                ),
+            )
+        })
+    })
+}
+
+fn pair_ceiling_failure(
+    record: &PairedLegRecord,
+    decode_ceiling: Option<f64>,
+    prefill_ceiling: Option<f64>,
+) -> Option<String> {
+    let failure = first_speedup_above_ceiling(
+        speedup(
+            record.control_decode_seconds_per_token,
+            record.candidate_decode_seconds_per_token,
+        ),
+        speedup(
+            record.control_prefill_seconds_per_token,
+            record.candidate_prefill_seconds_per_token,
+        ),
+        decode_ceiling,
+        prefill_ceiling,
+    )?;
+    Some(format!(
+        "{} speedup {:.6} exceeds ceiling {:.6}",
+        failure.axis, failure.value, failure.ceiling
+    ))
 }
 
 /// THE MEAN RULE'S SEAL (`official_pair_combine: "mean"`, David 2026-10-06): the score is the
@@ -1578,8 +2138,10 @@ fn seal_pair_means(
     m.candidate_leg_prefill_seconds_per_token = Some(m.prefill_seconds_per_token);
     m.baseline_leg_decode_seconds_per_token = Some(m.baseline_decode_seconds_per_token);
     m.baseline_leg_prefill_seconds_per_token = Some(m.baseline_prefill_seconds_per_token);
-    m.candidate_leg_decode_window_seconds_per_token = Some(m.decode_seconds_per_token);
-    m.baseline_leg_decode_window_seconds_per_token = Some(m.baseline_decode_seconds_per_token);
+    m.candidate_leg_decode_window_seconds_per_token =
+        mean_of_splits(&|r| r.candidate_decode_window_seconds_per_token);
+    m.baseline_leg_decode_window_seconds_per_token =
+        mean_of_splits(&|r| r.control_decode_window_seconds_per_token);
     m.candidate_leg_seed_prefill_window_seconds_per_token =
         mean_of_splits(&|r| r.candidate_seed_prefill_window_seconds_per_token);
     m.baseline_leg_seed_prefill_window_seconds_per_token =
@@ -1703,6 +2265,7 @@ fn judge_candidate_tokens<T, L, LB, FB>(
 ) -> Result<(), (usize, String)>
 where
     T: LineTransport,
+    L: FinishLeg,
     LB: FnMut(usize) -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
 {
@@ -1775,35 +2338,61 @@ where
             reference[p] = choices.iter().map(|c| c.first).collect();
         }
         drop(session);
-        drop(leg);
+        let verdict = match bench_core::cohort_tolerance::evaluate_cohort_token_tolerance(
+            &committed, &reference, limit,
+        ) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                let refusal = replay_failed(0, error.to_string());
+                if let Err(teardown) = leg.finish() {
+                    eprintln!(
+                        "benchd: cleanup after {}: {}",
+                        refusal.1,
+                        teardown_failure(first + 1, records.len(), "control", teardown)
+                    );
+                }
+                return Err(refusal);
+            }
+        };
+        for count in &verdict.per_stream {
+            records[count.slot].token_mismatch_count = Some(count.mismatches as i64);
+        }
+        let substantive = not_a_near_tie.take().or_else(|| {
+            verdict.first_failing.as_ref().map(|f| {
+                (
+                    f.slot,
+                    format!(
+                        "{TIMED_DIVERGENCE_OVER_TOLERANCE}: pair {} of {}: {} of the candidate's {} timed \
+                         tokens differ from the reference engine's choice for the same prefix; the track \
+                         fixture allows at most {limit} per thousand ({} * 1000 > {limit} * {})",
+                        f.slot + 1,
+                        records.len(),
+                        f.mismatches,
+                        f.committed_len,
+                        f.mismatches,
+                        f.committed_len,
+                    ),
+                )
+            })
+        });
+        if let Some(refusal) = substantive {
+            if let Err(teardown) = leg.finish() {
+                eprintln!(
+                    "benchd: cleanup after {}: {}",
+                    refusal.1,
+                    teardown_failure(first + 1, records.len(), "control", teardown)
+                );
+            }
+            return Err(refusal);
+        }
+        leg.finish().map_err(|error| {
+            (
+                first,
+                teardown_failure(first + 1, records.len(), "control", error),
+            )
+        })?;
     }
-    let verdict = bench_core::cohort_tolerance::evaluate_cohort_token_tolerance(
-        &committed, &reference, limit,
-    )
-    .map_err(|e| replay_failed(0, e.to_string()))?;
-    for count in &verdict.per_stream {
-        records[count.slot].token_mismatch_count = Some(count.mismatches as i64);
-    }
-    if let Some(refusal) = not_a_near_tie {
-        return Err(refusal);
-    }
-    match verdict.first_failing {
-        Some(f) => Err((
-            f.slot,
-            format!(
-                "{TIMED_DIVERGENCE_OVER_TOLERANCE}: pair {} of {}: {} of the candidate's {} timed \
-                 tokens differ from the reference engine's choice for the same prefix; the track \
-                 fixture allows at most {limit} per thousand ({} * 1000 > {limit} * {})",
-                f.slot + 1,
-                records.len(),
-                f.mismatches,
-                f.committed_len,
-                f.mismatches,
-                f.committed_len,
-            ),
-        )),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 /// Seal one pair's token counts as the run-level figures.
@@ -2547,7 +3136,99 @@ mod tests {
     use bench_core::golden::load_golden_fixture;
     use bench_runner::mock::MockEngine;
     use serde_json::json;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone)]
+    struct ReceivedSequence {
+        kind: String,
+        tokens: Vec<i64>,
+        seen_before: bool,
+    }
+
+    type SessionLog = Rc<RefCell<Vec<ReceivedSequence>>>;
+    type SessionLogs = Rc<RefCell<Vec<SessionLog>>>;
+
+    struct RecordingTransport {
+        inner: MockEngine,
+        received: SessionLog,
+        honest_delay: Option<std::time::Duration>,
+        last_seed_was_new: bool,
+    }
+
+    impl LineTransport for RecordingTransport {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            let request: bench_protocol::WorkerRequest = serde_json::from_str(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let tokens = match request.kind.as_str() {
+                "prefill" => request.prompt_tokens.clone(),
+                "free_decode_begin" => request.seed_tokens.clone(),
+                _ => None,
+            };
+            if let Some(tokens) = tokens {
+                let mut received = self.received.borrow_mut();
+                let seen_before = received.iter().any(|item| item.tokens == tokens);
+                if !seen_before && request.kind == "prefill" {
+                    if let Some(delay) = self.honest_delay {
+                        std::thread::sleep(delay);
+                    }
+                }
+                if request.kind == "free_decode_begin" {
+                    self.last_seed_was_new = !seen_before;
+                }
+                received.push(ReceivedSequence {
+                    kind: request.kind.clone(),
+                    tokens,
+                    seen_before,
+                });
+            }
+            if request.kind == "free_decode_run" && self.last_seed_was_new {
+                if let Some(delay) = self.honest_delay {
+                    std::thread::sleep(delay);
+                }
+            }
+            self.inner.write_line(line)
+        }
+
+        fn read_line(&mut self) -> std::io::Result<Option<String>> {
+            self.inner.read_line()
+        }
+    }
+
+    struct DelayedTransport {
+        inner: MockEngine,
+        prefill: std::time::Duration,
+        seed: std::time::Duration,
+        decode: std::time::Duration,
+    }
+
+    impl LineTransport for DelayedTransport {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            let request: bench_protocol::WorkerRequest = serde_json::from_str(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let delay = match request.kind.as_str() {
+                "prefill" => self.prefill,
+                "free_decode_begin" => self.seed,
+                "free_decode_run" => self.decode,
+                _ => std::time::Duration::ZERO,
+            };
+            std::thread::sleep(delay);
+            self.inner.write_line(line)
+        }
+
+        fn read_line(&mut self) -> std::io::Result<Option<String>> {
+            self.inner.read_line()
+        }
+    }
+
+    fn delayed_engine(prefill_ms: u64, seed_ms: u64, decode_ms: u64) -> DelayedTransport {
+        DelayedTransport {
+            inner: conformant_engine(),
+            prefill: std::time::Duration::from_millis(prefill_ms),
+            seed: std::time::Duration::from_millis(seed_ms),
+            decode: std::time::Duration::from_millis(decode_ms),
+        }
+    }
 
     /// THE [`OfficialParams`] THESE TESTS RUN UNDER: the shared `TEST_BASELINE` pair against the
     /// in-tree window, the stub commit, and no spec — the historical defaults the deleted
@@ -5487,7 +6168,7 @@ mod tests {
 
     /// The paired WINDOW every paired test drives: the test bands, the load-once residency, no
     /// spec, MLX, and the caller's cool gate.
-    fn paired_window_for_test<G>(cool_gate: G) -> PairedWindow<G>
+    fn paired_window_for_test<G>(cool_gate: G) -> PairedWindow<'static, G>
     where
         G: FnMut(&str) -> bench_runner::Result<()>,
     {
@@ -5502,6 +6183,12 @@ mod tests {
             combine: PairCombine::LowerMedian,
             // The tests drive the ruled floors; the per-project arms set their own.
             floors: SpeedupFloors::DEFAULT,
+            decode_speedup_ceiling: None,
+            prefill_speedup_ceiling: None,
+            seed_window_max_ratio: None,
+            decode_window_includes_seed: None,
+            warmup_golden: None,
+            decode_golden_offset: None,
             weights: ScoringWeights::DEFAULT,
             token_tolerance_per_thousand: None,
             near_tie_relative_gap: None,
@@ -5640,6 +6327,11 @@ mod tests {
                 self.events.borrow_mut().push(self.label);
             }
         }
+        impl FinishLeg for LegGuard {
+            fn finish(self) -> Result<(), String> {
+                Ok(())
+            }
+        }
 
         let payload = official_core_paired(
             &[PairedGoldens {
@@ -5755,6 +6447,11 @@ mod tests {
         impl Drop for LegGuard {
             fn drop(&mut self) {
                 self.events.borrow_mut().push(self.label);
+            }
+        }
+        impl FinishLeg for LegGuard {
+            fn finish(self) -> Result<(), String> {
+                Ok(())
             }
         }
         let mut window = paired_window_for_test(|_phase: &str| Ok(()));
@@ -5883,20 +6580,324 @@ mod tests {
         PairedLegRecord {
             pair,
             prompt_sha256: String::new(),
+            prefill_golden_sha256: None,
+            decode_golden_sha256: None,
             control_prefill_seconds_per_token: 1.0,
             control_decode_seconds_per_token: 1.0,
             candidate_prefill_seconds_per_token: 1.0,
             candidate_decode_seconds_per_token: 1.0 / decode_gain,
+            control_seed_window_ratio: None,
+            candidate_seed_window_ratio: None,
             control_seed_prefill_window_seconds_per_token: None,
             control_decode_window_seconds_per_token: Some(1.0),
             candidate_seed_prefill_window_seconds_per_token: None,
             candidate_decode_window_seconds_per_token: Some(1.0 / decode_gain),
+            control_warmup_wall_seconds: None,
+            control_warmup_prefill_seconds_per_token: None,
+            control_warmup_decode_seconds_per_token: None,
+            control_warmup_seed_prefill_window_seconds_per_token: None,
+            candidate_warmup_wall_seconds: None,
+            candidate_warmup_prefill_seconds_per_token: None,
+            candidate_warmup_decode_seconds_per_token: None,
+            candidate_warmup_seed_prefill_window_seconds_per_token: None,
             token_mismatch_count: Some(0),
             token_mismatch_first_step: None,
             token_mismatch_near_tie_count: None,
             token_mismatch_second_choice_count: Some(0),
             token_mismatch_second_choice_max_relative_gap: None,
         }
+    }
+
+    #[test]
+    fn paired_speedup_ceilings_cover_both_axes_both_combine_modes_and_equality() {
+        let w = ScoringWeights::DEFAULT;
+        for gain in [4.9, 5.0] {
+            let record = pair_with_composite(1, gain);
+            assert_eq!(
+                first_ceiling_failure(std::slice::from_ref(&record), Some(5.0), None),
+                None
+            );
+            assert_eq!(
+                first_failing_pair(
+                    &[record],
+                    PAIRED_TEST_BANDS,
+                    SpeedupFloors::DEFAULT,
+                    w,
+                    Some(5.0),
+                    None,
+                ),
+                None
+            );
+        }
+        let record = pair_with_composite(1, 5.5);
+        for failure in [
+            first_ceiling_failure(std::slice::from_ref(&record), Some(5.0), None),
+            first_failing_pair(
+                std::slice::from_ref(&record),
+                PAIRED_TEST_BANDS,
+                SpeedupFloors::DEFAULT,
+                w,
+                Some(5.0),
+                None,
+            ),
+        ] {
+            let (_, error) = failure.unwrap();
+            assert!(error.starts_with("SPEEDUP-ABOVE-CEILING"), "{error}");
+            assert!(
+                error.contains("pair 1 of 1") && error.contains("decode"),
+                "{error}"
+            );
+        }
+
+        for gain in [4.9, 5.0, 5.5] {
+            let mut record = pair_with_composite(1, 1.0);
+            record.candidate_prefill_seconds_per_token = 1.0 / gain;
+            let failure = first_failing_pair(
+                &[record],
+                PAIRED_TEST_BANDS,
+                SpeedupFloors::DEFAULT,
+                w,
+                None,
+                Some(5.0),
+            );
+            assert_eq!(failure.is_some(), gain > 5.0);
+            if let Some((_, error)) = failure {
+                assert!(error.starts_with("SPEEDUP-ABOVE-CEILING"), "{error}");
+                assert!(error.contains("prefill"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn lower_median_refuses_a_ceiling_violation_on_an_off_median_pair() {
+        let records = vec![
+            pair_with_composite(1, 6.0),
+            pair_with_composite(2, 1.0),
+            pair_with_composite(3, 2.0),
+        ];
+        assert_eq!(scored_pair_index(&records, ScoringWeights::DEFAULT), 2);
+        let (failing, error) = first_ceiling_failure(&records, Some(5.0), None).unwrap();
+        assert_eq!(failing, 0, "the violating pair is not the scored median");
+        assert!(error.starts_with("SPEEDUP-ABOVE-CEILING"), "{error}");
+        assert!(error.contains("pair 1 of 3"), "{error}");
+    }
+
+    #[test]
+    fn paired_speedup_ceiling_refusal_seals_no_score_end_to_end() {
+        for combine in [PairCombine::LowerMedian, PairCombine::Mean] {
+            for (axis, request) in [("decode", "free_decode_run"), ("prefill", "prefill")] {
+                let golden = official_golden(None);
+                let calibration = wide_calibration();
+                let mut window = open_paired_window(1, combine);
+                if axis == "decode" {
+                    window.decode_speedup_ceiling = Some(5.0);
+                } else {
+                    window.prefill_speedup_ceiling = Some(5.0);
+                }
+                let payload = official_core_paired(
+                    &[PairedGoldens {
+                        candidate: &golden,
+                        control: &golden,
+                        prompt: "botany",
+                    }],
+                    &calibration,
+                    paired_seal_for_test(&calibration),
+                    RunDigests::for_test(&DirDigest::empty()),
+                    "deadbeef",
+                    PairedLegs {
+                        open_baseline_leg: |_| Ok(()),
+                        open_candidate_leg: |_| Ok(()),
+                        spawn_baseline: || {
+                            Session::connect(
+                                conformant_engine()
+                                    .sleep_on(request, std::time::Duration::from_millis(40)),
+                            )
+                            .map(|(s, _)| s)
+                        },
+                        spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                    },
+                    window,
+                );
+                assert!(payload.score.is_none(), "{combine:?} {axis}");
+                assert!(!payload.passed, "{combine:?} {axis}");
+                assert!(
+                    payload.metrics.error.starts_with("SPEEDUP-ABOVE-CEILING"),
+                    "{combine:?} {axis}: {}",
+                    payload.metrics.error
+                );
+                assert!(payload.metrics.error.contains(axis));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_seed_window_limit_checks_each_leg_and_missing_window() {
+        let timing_with_ratio = |ratio: f64| {
+            let mut timing = crate::testgolden::leg_timing(0.001, 0.0, 1.0);
+            let phase = timing.phase_window.as_mut().unwrap();
+            phase.seed_prefill_elapsed_seconds =
+                timing.prefill_seconds_per_token * phase.prefill_token_total as f64 * ratio;
+            timing
+        };
+        let honest = timing_with_ratio(1.0);
+        assert_eq!(
+            checked_seed_window_ratio(&honest, Some(1.25), 1, 2, "candidate"),
+            Ok(Some(1.0))
+        );
+        for leg in ["control", "candidate"] {
+            let slow_seed = timing_with_ratio(3.0);
+            let error = checked_seed_window_ratio(&slow_seed, Some(1.25), 2, 2, leg).unwrap_err();
+            assert!(error.starts_with("SEED-WINDOW-ABOVE-LIMIT"), "{error}");
+            assert!(error.contains(leg) && error.contains("3.000000"), "{error}");
+        }
+        let missing = in_band_timing();
+        let error = checked_seed_window_ratio(&missing, Some(1.25), 1, 1, "candidate").unwrap_err();
+        assert!(error.starts_with("SEED-WINDOW-NOT-OBSERVED"), "{error}");
+        assert_eq!(
+            checked_seed_window_ratio(&missing, None, 1, 1, "candidate"),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_seconds_per_token_for_scoring(&missing, false, 1, 1, "candidate")
+                .unwrap()
+                .to_bits(),
+            missing.decode_seconds_per_token.to_bits()
+        );
+        let error =
+            decode_seconds_per_token_for_scoring(&missing, true, 1, 1, "candidate").unwrap_err();
+        assert!(error.starts_with("SEED-WINDOW-NOT-OBSERVED"), "{error}");
+    }
+
+    #[test]
+    fn paired_seed_window_limit_refuses_slow_control_and_candidate_end_to_end() {
+        let run = |slow_control: bool, slow_candidate: bool, limit: f64| {
+            let golden = official_golden(None);
+            let calibration = wide_calibration();
+            let mut window = open_paired_window(1, PairCombine::LowerMedian);
+            window.seed_window_max_ratio = Some(limit);
+            official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || {
+                        let seed_ms = if slow_control { 250 } else { 20 };
+                        Session::connect(delayed_engine(80, seed_ms, 0)).map(|(s, _)| s)
+                    },
+                    spawn_timed: || {
+                        let seed_ms = if slow_candidate { 250 } else { 20 };
+                        Session::connect(delayed_engine(80, seed_ms, 0)).map(|(s, _)| s)
+                    },
+                },
+                window,
+            )
+        };
+
+        let honest = run(false, false, 1.25);
+        assert!(honest.passed, "{}", honest.metrics.error);
+        assert!(honest.metrics.paired_legs[0]
+            .control_seed_window_ratio
+            .is_some());
+        assert!(honest.metrics.paired_legs[0]
+            .candidate_seed_window_ratio
+            .is_some());
+
+        for (slow_control, slow_candidate, leg) in
+            [(true, false, "control"), (false, true, "candidate")]
+        {
+            let payload = run(slow_control, slow_candidate, 1.25);
+            assert!(
+                payload.score.is_none(),
+                "{leg}: error={:?} records={:?}",
+                payload.metrics.error,
+                payload.metrics.paired_legs
+            );
+            assert!(
+                payload.metrics.error.starts_with("SEED-WINDOW-ABOVE-LIMIT"),
+                "{}",
+                payload.metrics.error
+            );
+            assert!(payload.metrics.error.contains(leg));
+        }
+    }
+
+    #[test]
+    fn checked_teardown_refuses_control_and_held_last_candidate() {
+        #[derive(Clone)]
+        struct Guard {
+            fail: bool,
+            finishes: std::rc::Rc<Cell<usize>>,
+        }
+        impl FinishLeg for Guard {
+            fn finish(self) -> Result<(), String> {
+                self.finishes.set(self.finishes.get() + 1);
+                if self.fail {
+                    Err("stop script failed AWS_SECRET_ACCESS_KEY=planted-secret".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let run = |control_fails: bool, candidate_fails: bool| {
+            let golden = official_golden(None);
+            let calibration = wide_calibration();
+            let finishes = std::rc::Rc::new(Cell::new(0));
+            let candidate_opens = Cell::new(0);
+            let payload = official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| {
+                        Ok(Guard {
+                            fail: control_fails,
+                            finishes: std::rc::Rc::clone(&finishes),
+                        })
+                    },
+                    open_candidate_leg: |_| {
+                        candidate_opens.set(candidate_opens.get() + 1);
+                        Ok(Guard {
+                            fail: candidate_fails,
+                            finishes: std::rc::Rc::clone(&finishes),
+                        })
+                    },
+                    spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                    spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                },
+                open_paired_window(1, PairCombine::LowerMedian),
+            );
+            (payload, finishes.get(), candidate_opens.get())
+        };
+
+        let (control, finishes, candidate_opens) = run(true, false);
+        assert!(control.score.is_none());
+        assert!(control.metrics.error.starts_with("LEG-TEARDOWN-FAILED"));
+        assert!(control.metrics.error.contains("control"));
+        assert_eq!(finishes, 1);
+        assert_eq!(candidate_opens, 0);
+
+        let (candidate, finishes, candidate_opens) = run(false, true);
+        assert!(candidate.score.is_none());
+        assert!(candidate.metrics.error.starts_with("LEG-TEARDOWN-FAILED"));
+        assert!(candidate.metrics.error.contains("candidate"));
+        assert!(!candidate.metrics.error.contains("planted-secret"));
+        assert_eq!(finishes, 2);
+        assert_eq!(candidate_opens, 1);
     }
 
     /// THE SCORED PAIR IS THE LOWER MEDIAN, NEVER A MEAN: on an odd count the middle pair, on an
@@ -5957,7 +6958,14 @@ mod tests {
             pair_with_composite(3, 1.20),
         ];
         assert_eq!(
-            first_failing_pair(&fine, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w),
+            first_failing_pair(
+                &fine,
+                PAIRED_TEST_BANDS,
+                SpeedupFloors::DEFAULT,
+                w,
+                None,
+                None,
+            ),
             None
         );
         // Pair 2 decodes at 0.90 of its control leg: under the 0.95 floor. Pair 3 is under it
@@ -5967,8 +6975,15 @@ mod tests {
             pair_with_composite(2, 0.90),
             pair_with_composite(3, 0.80),
         ];
-        let (pair, reason) =
-            first_failing_pair(&slow, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w).unwrap();
+        let (pair, reason) = first_failing_pair(
+            &slow,
+            PAIRED_TEST_BANDS,
+            SpeedupFloors::DEFAULT,
+            w,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(pair, 1);
         assert!(reason.starts_with("pair 2 of 3: "), "{reason}");
         assert!(reason.contains("decode_speedup=0.900000"), "{reason}");
@@ -5976,9 +6991,15 @@ mod tests {
         // a gain of 0.909, under the 0.95 prefill floor.
         let mut prefill_slow = fine.clone();
         prefill_slow[0].candidate_prefill_seconds_per_token = 1.10;
-        let (pair, reason) =
-            first_failing_pair(&prefill_slow, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w)
-                .unwrap();
+        let (pair, reason) = first_failing_pair(
+            &prefill_slow,
+            PAIRED_TEST_BANDS,
+            SpeedupFloors::DEFAULT,
+            w,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(pair, 0);
         assert!(reason.starts_with("pair 1 of 3: "), "{reason}");
     }
@@ -5986,14 +7007,10 @@ mod tests {
     /// THE MEAN RULE'S SEAL: the score is the mean of the per-pair composites, the two speedups
     /// are the means of the per-pair gains, and each seconds-per-token figure is the mean of the
     /// per-pair figure. The window split is the mean when every pair carried one, else absent.
-    /// DECODE MEANS THE DECODE WINDOW ON THE PAIRED PATH (David 2026-10-07). Three pairs with
-    /// the SAME prefill and decode windows and three different seed prefills seal byte-identical
-    /// decode gains, composites, floor and band verdicts, and run-level figures under both pair
-    /// rules. Only the seed-named keys move. The windows are those of run 37608623516 (control
-    /// decode 151.7 tok/s, candidate 221.5 tok/s), where charging the seed to decode read a
-    /// 1.46x decode gain as 1.089.
+    /// ABSENT `decode_window_includes_seed` keeps the old bytes: changing only the seed window
+    /// changes only seed-named audit keys, never a score input.
     #[test]
-    fn paired_decode_gain_and_composite_are_byte_identical_whatever_the_seed_prefill_takes() {
+    fn absent_decode_window_includes_seed_keeps_legacy_scoring_bytes() {
         let w = ScoringWeights::DEFAULT;
         let n = BENCHMARK_DECODE_STEPS as f64;
         let control_window = n / 151.7;
@@ -6005,14 +7022,29 @@ mod tests {
                         crate::testgolden::leg_timing(0.000_35, control_seed, control_window);
                     let candidate =
                         crate::testgolden::leg_timing(0.000_30, candidate_seed, candidate_window);
-                    paired_leg_record(pair, "prompt", &control, &candidate)
+                    paired_leg_record(
+                        pair,
+                        "prompt",
+                        None,
+                        None,
+                        &control,
+                        &candidate,
+                        (None, None),
+                    )
                 })
                 .collect();
             let composites: Vec<u64> = records
                 .iter()
                 .map(|r| pair_composite(r, w).to_bits())
                 .collect();
-            let gate = first_failing_pair(&records, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w);
+            let gate = first_failing_pair(
+                &records,
+                PAIRED_TEST_BANDS,
+                SpeedupFloors::DEFAULT,
+                w,
+                None,
+                None,
+            );
             let scored = scored_pair_index(&records, w);
             let mut payload = ScorePayload {
                 score: Some(0.0),
@@ -6052,6 +7084,60 @@ mod tests {
                 "a sealed figure other than a seed-named key moved with the seed prefill"
             );
         }
+    }
+
+    #[test]
+    fn decode_window_includes_seed_charges_both_legs_and_a_slow_seed() {
+        let run = |candidate_seed_ms: u64| {
+            let golden = official_golden(None);
+            let calibration = wide_calibration();
+            let mut window = open_paired_window(1, PairCombine::LowerMedian);
+            window.decode_window_includes_seed = Some(true);
+            official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || {
+                        Session::connect(delayed_engine(20, 20, 20)).map(|(session, _)| session)
+                    },
+                    spawn_timed: || {
+                        Session::connect(delayed_engine(20, candidate_seed_ms, 20))
+                            .map(|(session, _)| session)
+                    },
+                },
+                window,
+            )
+        };
+
+        let honest = run(20);
+        let slow = run(80);
+        for payload in [&honest, &slow] {
+            assert!(payload.passed, "{}", payload.metrics.error);
+            assert_eq!(payload.metrics.decode_window_includes_seed, Some(true));
+            let record = &payload.metrics.paired_legs[0];
+            assert!(
+                record.control_decode_seconds_per_token
+                    > record.control_decode_window_seconds_per_token.unwrap()
+            );
+            assert!(
+                record.candidate_decode_seconds_per_token
+                    > record.candidate_decode_window_seconds_per_token.unwrap()
+            );
+        }
+        assert!(
+            slow.metrics.paired_legs[0].candidate_decode_seconds_per_token
+                > honest.metrics.paired_legs[0].candidate_decode_seconds_per_token
+        );
+        assert!(slow.score.unwrap() < honest.score.unwrap());
     }
 
     #[test]
@@ -6148,7 +7234,7 @@ mod tests {
     fn open_paired_window(
         pairs: usize,
         combine: PairCombine,
-    ) -> PairedWindow<impl FnMut(&str) -> bench_runner::Result<()>> {
+    ) -> PairedWindow<'static, impl FnMut(&str) -> bench_runner::Result<()>> {
         PairedWindow {
             control_band_mode: Default::default(),
             bands: AcceptanceBands {
@@ -6166,8 +7252,335 @@ mod tests {
         }
     }
 
+    fn prompt_distinct_golden(id: i64) -> GoldenFixture {
+        let mut golden = official_golden(None);
+        let benchmark = golden.benchmark.as_mut().unwrap();
+        benchmark.prefill_prompt_tokens.fill(100 + id);
+        benchmark.decode_seed_tokens = benchmark.prefill_prompt_tokens.clone();
+        golden.sha256 = format!("{id:064x}");
+        golden
+    }
+
+    fn three_prompt_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            prompts: (0..3)
+                .map(|index| wide_prompt_calibration(&format!("prompt-{index}")))
+                .collect(),
+            ..wide_calibration()
+        }
+    }
+
+    fn run_recording_three_pairs(
+        guarded: bool,
+        honest_delay: Option<std::time::Duration>,
+    ) -> (ScorePayload, Vec<SessionLog>) {
+        let candidate: Vec<_> = (0..3).map(prompt_distinct_golden).collect();
+        let control: Vec<_> = (10..13).map(prompt_distinct_golden).collect();
+        let warmup = prompt_distinct_golden(90);
+        let paired: Vec<_> = candidate
+            .iter()
+            .enumerate()
+            .map(|(index, golden)| PairedGoldens {
+                candidate: golden,
+                control: &control[index],
+                prompt: match index {
+                    0 => "prompt-0",
+                    1 => "prompt-1",
+                    _ => "prompt-2",
+                },
+            })
+            .collect();
+        let sessions: SessionLogs = Rc::new(RefCell::new(Vec::new()));
+        let baseline_sessions = Rc::clone(&sessions);
+        let candidate_sessions = Rc::clone(&sessions);
+        let spawn = |sessions: &SessionLogs| {
+            let received = Rc::new(RefCell::new(Vec::new()));
+            sessions.borrow_mut().push(Rc::clone(&received));
+            Session::connect(RecordingTransport {
+                inner: conformant_engine(),
+                received,
+                honest_delay,
+                last_seed_was_new: false,
+            })
+            .map(|(session, _)| session)
+        };
+        let calibration = three_prompt_calibration();
+        let window = PairedWindow {
+            pairs: 3,
+            warmup_golden: guarded.then_some(&warmup),
+            decode_golden_offset: guarded.then_some(1),
+            ..open_paired_window(3, PairCombine::LowerMedian)
+        };
+        let payload = official_core_paired(
+            &paired,
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || spawn(&baseline_sessions),
+                spawn_timed: || spawn(&candidate_sessions),
+            },
+            window,
+        );
+        let sessions = sessions.borrow().clone();
+        (payload, sessions)
+    }
+
+    #[test]
+    fn composition_uses_prefill_g_and_decode_g_plus_one_for_both_legs() {
+        let candidate: Vec<_> = (0..3).map(prompt_distinct_golden).collect();
+        let control: Vec<_> = (10..13).map(prompt_distinct_golden).collect();
+        for sources in [&candidate, &control] {
+            for g in 0..3 {
+                let composed = compose_benchmark_golden(
+                    sources[g].benchmark.as_ref().unwrap(),
+                    sources[(g + 1) % 3].benchmark.as_ref().unwrap(),
+                );
+                assert_eq!(
+                    composed.prefill_prompt_tokens,
+                    sources[g].benchmark.as_ref().unwrap().prefill_prompt_tokens
+                );
+                assert_eq!(
+                    composed.decode_seed_tokens,
+                    sources[(g + 1) % 3]
+                        .benchmark
+                        .as_ref()
+                        .unwrap()
+                        .decode_seed_tokens
+                );
+                assert_eq!(composed.baseline_prefill_seconds_per_token, None);
+                assert_eq!(composed.baseline_decode_seconds_per_token, None);
+            }
+        }
+        assert!(validate_decode_golden_offset(1, 3).is_ok());
+        assert!(validate_decode_golden_offset(0, 3).is_err());
+        assert!(validate_decode_golden_offset(3, 3).is_err());
+    }
+
+    #[test]
+    fn prompt_reuse_refuses_warmup_collision_and_composed_self_collision() {
+        let live = prompt_distinct_golden(1);
+        let live_benchmark = live.benchmark.as_ref().unwrap();
+        let composed = compose_benchmark_golden(live_benchmark, live_benchmark);
+        let error = validate_prompt_distinctness(
+            &[live_benchmark],
+            &[live_benchmark],
+            std::slice::from_ref(&composed),
+            std::slice::from_ref(&composed),
+            Some(live_benchmark),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.starts_with(PROMPT_REUSE_REFUSED), "{error}");
+        assert!(error.contains("warm-up prefill"), "{error}");
+
+        let mut decode = prompt_distinct_golden(2);
+        decode.benchmark.as_mut().unwrap().decode_seed_tokens =
+            live_benchmark.prefill_prompt_tokens.clone();
+        let self_collision =
+            compose_benchmark_golden(live_benchmark, decode.benchmark.as_ref().unwrap());
+        let error = validate_prompt_distinctness(
+            &[live_benchmark],
+            &[live_benchmark],
+            std::slice::from_ref(&self_collision),
+            std::slice::from_ref(&self_collision),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.starts_with(PROMPT_REUSE_REFUSED), "{error}");
+        assert!(error.contains("prefill equals"), "{error}");
+    }
+
+    #[test]
+    fn timed_prompts_are_first_use_with_guards_and_repeat_without_them() {
+        for guarded in [true, false] {
+            let (payload, sessions) = run_recording_three_pairs(guarded, None);
+            assert!(payload.passed, "{}", payload.metrics.error);
+            assert_eq!(
+                payload.metrics.paired_legs.len(),
+                3,
+                "{}",
+                payload.metrics.error
+            );
+            assert_eq!(sessions.len(), 6);
+            for received in sessions {
+                let received = received.borrow();
+                for kind in ["prefill", "free_decode_begin"] {
+                    let timed = received
+                        .iter()
+                        .rev()
+                        .find(|item| item.kind == kind)
+                        .unwrap();
+                    assert_eq!(
+                        timed.seen_before, !guarded,
+                        "{kind} guarded={guarded}: {received:?}"
+                    );
+                }
+            }
+            if guarded {
+                for (index, record) in payload.metrics.paired_legs.iter().enumerate() {
+                    assert_eq!(
+                        record.prefill_golden_sha256.as_deref(),
+                        Some(format!("{index:064x}").as_str())
+                    );
+                    assert_eq!(
+                        record.decode_golden_sha256.as_deref(),
+                        Some(format!("{:064x}", (index + 1) % 3).as_str())
+                    );
+                }
+            } else {
+                assert!(payload.metrics.paired_legs.iter().all(|record| {
+                    record.prefill_golden_sha256.is_none() && record.decode_golden_sha256.is_none()
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_warmup_timings_are_private_for_both_legs() {
+        let (payload, _) = run_recording_three_pairs(true, None);
+        assert!(payload.passed, "{}", payload.metrics.error);
+        let private = serde_json::to_value(&payload).unwrap();
+        let record = &private["metrics"]["paired_legs"][0];
+        for leg in ["control", "candidate"] {
+            for suffix in [
+                "warmup_wall_seconds",
+                "warmup_prefill_seconds_per_token",
+                "warmup_decode_seconds_per_token",
+                "warmup_seed_prefill_window_seconds_per_token",
+            ] {
+                let key = format!("{leg}_{suffix}");
+                assert!(
+                    record[&key].as_f64().is_some_and(|value| value >= 0.0),
+                    "{key}"
+                );
+            }
+        }
+
+        let public: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        let record = &public["metrics"]["paired_legs"][0];
+        for leg in ["control", "candidate"] {
+            for suffix in [
+                "warmup_wall_seconds",
+                "warmup_prefill_seconds_per_token",
+                "warmup_decode_seconds_per_token",
+                "warmup_seed_prefill_window_seconds_per_token",
+            ] {
+                let key = format!("{leg}_{suffix}");
+                assert!(record.get(&key).is_none(), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn warmup_wall_seconds_uses_measured_elapsed() {
+        let golden = official_golden(None);
+        let params =
+            official_timed_params(golden.benchmark.as_ref().unwrap(), None, &test_window());
+        let barrier_delay = std::time::Duration::from_millis(20);
+        let mut spawn = || {
+            Session::connect(conformant_engine().sleep_on("phase_diagnostics", barrier_delay))
+                .map(|(session, _)| session)
+        };
+        let mut cool_gate = |_phase: &str| -> bench_runner::Result<()> { Ok(()) };
+        let (measured, warmup, session) = run_timed_window(
+            &params,
+            Some(&params),
+            &mut spawn,
+            &mut cool_gate,
+            VerifyMode::Verify,
+        )
+        .unwrap_or_else(|_| panic!("timed window must pass"));
+        drop(session);
+        let warmup = warmup.unwrap();
+        let window_sum = warmup.timing.prefill_elapsed_seconds
+            + warmup.timing.decode_elapsed_seconds
+            + warmup
+                .timing
+                .phase_window
+                .map_or(0.0, |window| window.seed_prefill_elapsed_seconds);
+        assert!(
+            warmup.wall_seconds >= window_sum + barrier_delay.as_secs_f64(),
+            "wall={} windows={window_sum}",
+            warmup.wall_seconds
+        );
+
+        let record = paired_leg_record(
+            1,
+            "prompt",
+            None,
+            None,
+            &measured,
+            &measured,
+            (Some(&warmup), None),
+        );
+
+        assert_eq!(
+            record.control_warmup_wall_seconds,
+            Some(warmup.wall_seconds)
+        );
+    }
+
+    #[test]
+    fn unguarded_fixture_seal_is_unchanged_by_private_warmup_fields() {
+        let (payload, _) = run_recording_three_pairs(false, None);
+        assert!(payload.passed, "{}", payload.metrics.error);
+        let expected = payload.to_sealed_json().unwrap();
+        let mut with_private = payload.to_public_unsealed_value().unwrap();
+        let record = with_private["metrics"]["paired_legs"][0]
+            .as_object_mut()
+            .unwrap();
+        for leg in ["control", "candidate"] {
+            for suffix in [
+                "warmup_wall_seconds",
+                "warmup_prefill_seconds_per_token",
+                "warmup_decode_seconds_per_token",
+                "warmup_seed_prefill_window_seconds_per_token",
+            ] {
+                record.insert(format!("{leg}_{suffix}"), serde_json::json!(0.125));
+            }
+        }
+        crate::score::seal_public_value(&mut with_private);
+        assert_eq!(
+            serde_json::to_string_pretty(&with_private).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn replay_engine_cannot_shorten_guarded_timed_windows() {
+        let floor = std::time::Duration::from_millis(3);
+        let (guarded, _) = run_recording_three_pairs(true, Some(floor));
+        let (legacy, _) = run_recording_three_pairs(false, Some(floor));
+        assert!(guarded.passed, "{}", guarded.metrics.error);
+        assert!(legacy.passed, "{}", legacy.metrics.error);
+        assert!(!guarded.metrics.paired_legs.is_empty());
+        assert!(!legacy.metrics.paired_legs.is_empty());
+        for record in &guarded.metrics.paired_legs {
+            assert!(
+                record.candidate_prefill_seconds_per_token * BENCHMARK_PREFILL_PROMPT_TOKENS as f64
+                    >= floor.as_secs_f64()
+            );
+            assert!(
+                record.candidate_decode_seconds_per_token * BENCHMARK_DECODE_STEPS as f64
+                    >= floor.as_secs_f64()
+            );
+        }
+        assert!(legacy.metrics.paired_legs.iter().all(|record| {
+            record.candidate_prefill_seconds_per_token * (BENCHMARK_PREFILL_PROMPT_TOKENS as f64)
+                < floor.as_secs_f64()
+                && record.candidate_decode_seconds_per_token * (BENCHMARK_DECODE_STEPS as f64)
+                    < floor.as_secs_f64()
+        }));
+    }
+
     fn run_three_pairs(
-        window: PairedWindow<impl FnMut(&str) -> bench_runner::Result<()>>,
+        window: PairedWindow<'static, impl FnMut(&str) -> bench_runner::Result<()>>,
     ) -> ScorePayload {
         let golden = official_golden(None);
         let calibration = wide_calibration();
@@ -6843,7 +8256,8 @@ mod tests {
     fn a_passing_paired_run_seals_both_legs_and_scores_the_live_ratio() {
         let golden = official_golden(None);
         let control = run_serial_control_leg(
-            &golden,
+            golden.benchmark.as_ref(),
+            None,
             &test_window(),
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             |_phase: &str| Ok(()),
@@ -6953,7 +8367,8 @@ mod tests {
     fn the_control_leg_requests_no_spec() {
         let golden = official_golden(None);
         let control = run_serial_control_leg(
-            &golden,
+            golden.benchmark.as_ref(),
+            None,
             &test_window(),
             || Session::connect(conformant_engine().spec_modes(None)).map(|(s, _)| s),
             |_phase: &str| Ok(()),
@@ -7040,6 +8455,89 @@ mod tests {
                 ..paired_window_for_test(|_phase: &str| Ok(()))
             },
         )
+    }
+
+    fn run_with_replay_teardown_failure(
+        decode_speedup_ceiling: Option<f64>,
+    ) -> (ScorePayload, usize) {
+        struct Guard(bool);
+        impl FinishLeg for Guard {
+            fn finish(self) -> Result<(), String> {
+                if self.0 {
+                    Err("replay control teardown failed".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let golden = official_golden(None);
+        let decode = oracle_decode_tokens();
+        let calibration = wide_calibration();
+        let baseline_opens = Cell::new(0usize);
+        let mut window = open_paired_window(1, PairCombine::LowerMedian);
+        window.decode_speedup_ceiling = decode_speedup_ceiling;
+        window.token_tolerance_per_thousand = Some(100);
+        let payload = official_core_paired(
+            &[PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| {
+                    let next = baseline_opens.get() + 1;
+                    baseline_opens.set(next);
+                    Ok(Guard(next == 2))
+                },
+                open_candidate_leg: |_| Ok(Guard(false)),
+                spawn_baseline: || {
+                    Session::connect(
+                        reference_engine(&decode, 1)
+                            .sleep_on("free_decode_run", std::time::Duration::from_millis(40)),
+                    )
+                    .map(|(session, _)| session)
+                },
+                spawn_timed: || {
+                    Session::connect(candidate_with_changes(&decode, &[10], false))
+                        .map(|(session, _)| session)
+                },
+            },
+            window,
+        );
+        (payload, baseline_opens.get())
+    }
+
+    #[test]
+    fn replay_teardown_does_not_replace_earlier_speedup_ceiling_refusal() {
+        let (payload, baseline_opens) = run_with_replay_teardown_failure(Some(5.0));
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload.metrics.error.starts_with("SPEEDUP-ABOVE-CEILING"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.paired_legs[0].token_mismatch_count, Some(1));
+        assert_eq!(baseline_opens, 2, "the second control leg is the replay");
+    }
+
+    #[test]
+    fn replay_teardown_refuses_otherwise_passing_payload() {
+        let (payload, baseline_opens) = run_with_replay_teardown_failure(None);
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload.metrics.error.starts_with("LEG-TEARDOWN-FAILED"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.paired_legs[0].token_mismatch_count, Some(1));
+        assert_eq!(baseline_opens, 2, "the second control leg is the replay");
     }
 
     /// ABSENT TOLERANCE: one different decode token stops the candidate leg, exactly as before,
@@ -7134,6 +8632,73 @@ mod tests {
         assert_eq!(payload.metrics.token_mismatch_count, Some(13));
         assert_eq!(payload.metrics.first_failing_step, Some(11));
         assert_eq!(payload.metrics.baseline_band_passed, Some(true));
+    }
+
+    #[test]
+    fn replay_refusal_wins_over_cleanup_failure() {
+        #[derive(Clone)]
+        struct Guard(std::rc::Rc<Cell<usize>>, bool);
+        impl FinishLeg for Guard {
+            fn finish(self) -> Result<(), String> {
+                let next = self.0.get() + 1;
+                self.0.set(next);
+                if self.1 {
+                    Err("teardown should not replace the token refusal".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let golden = official_golden(None);
+        let decode = oracle_decode_tokens();
+        let calibration = wide_calibration();
+        let finishes = std::rc::Rc::new(Cell::new(0));
+        let for_control = std::rc::Rc::clone(&finishes);
+        let for_candidate = std::rc::Rc::clone(&finishes);
+        let baseline_opens = Cell::new(0usize);
+        let payload = official_core_paired(
+            &[PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| {
+                    let next = baseline_opens.get() + 1;
+                    baseline_opens.set(next);
+                    Ok(Guard(std::rc::Rc::clone(&for_control), next == 2))
+                },
+                open_candidate_leg: |_| Ok(Guard(std::rc::Rc::clone(&for_candidate), false)),
+                spawn_baseline: || {
+                    Session::connect(reference_engine(&decode, 1)).map(|(session, _)| session)
+                },
+                spawn_timed: || {
+                    Session::connect(candidate_with_changes(&decode, &[10], true))
+                        .map(|(session, _)| session)
+                },
+            },
+            PairedWindow {
+                token_tolerance_per_thousand: Some(100),
+                near_tie_relative_gap: Some(0.05),
+                ..paired_window_for_test(|_| Ok(()))
+            },
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with(TIMED_DIVERGENCE_NOT_A_NEAR_TIE),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(!payload.metrics.error.contains("LEG-TEARDOWN-FAILED"));
+        assert_eq!(baseline_opens.get(), 2);
+        assert!(finishes.get() >= 2);
     }
 
     /// THE CONTROL LEG STAYS EXACT: even under the widest tolerance, one different token on the
@@ -7459,7 +9024,8 @@ mod tests {
         )
         .unwrap();
         let err = run_serial_control_leg(
-            &golden,
+            golden.benchmark.as_ref(),
+            None,
             &test_window(),
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             |_phase: &str| Ok(()),
@@ -7536,7 +9102,15 @@ mod tests {
                 floors: zero_floors,
                 weights: w,
             };
-            let record = paired_leg_record(i + 1, &golden.sha256, control, candidate);
+            let record = paired_leg_record(
+                i + 1,
+                &golden.sha256,
+                None,
+                None,
+                control,
+                candidate,
+                (None, None),
+            );
             let official = finish_official(
                 &golden,
                 scoring,
@@ -7779,9 +9353,19 @@ mod tests {
 
                 // Paired mean: every pair is gated; three identical pairs.
                 let records: Vec<PairedLegRecord> = (1..=3)
-                    .map(|pair| paired_leg_record(pair, &golden.sha256, &control, &candidate))
+                    .map(|pair| {
+                        paired_leg_record(
+                            pair,
+                            &golden.sha256,
+                            None,
+                            None,
+                            &control,
+                            &candidate,
+                            (None, None),
+                        )
+                    })
                     .collect();
-                let mean_gate = first_failing_pair(&records, bands, NEMOTRON_FLOORS, w);
+                let mean_gate = first_failing_pair(&records, bands, NEMOTRON_FLOORS, w, None, None);
                 let mean_error = mean_gate.as_ref().map_or("", |(_, r)| r.as_str());
                 check("paired mean", mean_gate.is_none(), mean_error);
 

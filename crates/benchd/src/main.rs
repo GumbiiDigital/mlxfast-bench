@@ -671,6 +671,10 @@ OPTIONS:
     --control-golden-bytes <N>   Integrity pin for --control-golden: refuse it unless its byte
                                  count matches (both pin flags must be given together; checked
                                  before parse). Repeatable, as --control-golden-sha256.
+    --warmup-golden <PATH>       PAIRED PATH. Extra golden used only for warm-up. Required when
+                                 the contract declares warmup_golden; refused otherwise.
+    --warmup-golden-sha256 <HEX> Optional integrity pin for --warmup-golden.
+    --warmup-golden-bytes <N>    Byte half of --warmup-golden-sha256; give both or neither.
     --mode <local-iterate|local-submit|official>
                                  Decode window: 128 (local-iterate, default), 1023 (local-submit), 128 (official)
     --score-path <OUT>           Output score path (default: score.local-iterate.json for
@@ -2834,6 +2838,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
                 &baseline_exec,
                 golden_path,
                 false,
+                None,
                 window_socket.as_deref(),
             )
         })
@@ -2844,6 +2849,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
                 &candidate_exec,
                 golden_path,
                 false,
+                None,
                 window_socket.as_deref(),
             )
         })
@@ -3841,6 +3847,10 @@ struct IterateArgs {
     /// `control_goldens` by position and checked on the raw bytes before the parse exactly as
     /// `golden_pins` are.
     control_golden_pins: Vec<GoldenIntegrityPin>,
+    /// Extra golden used only by the paired warm-up passes.
+    warmup_golden: Option<PathBuf>,
+    /// Optional CLI integrity pin for `warmup_golden`.
+    warmup_golden_pin: Option<GoldenIntegrityPin>,
     /// `--engine-resource NAME=PATH` (repeatable) — the out-of-checkpoint inputs the runner needs
     /// to LOAD the model (runner contract §8.1/§13b). Each becomes `--resource NAME=PATH`
     /// on EVERY engine spawn this run makes. THE VALUE COMES FROM THIS COMMAND LINE, as the engine
@@ -3883,6 +3893,9 @@ static ITERATE_FLAGS: &[FlagSpec] = &[
     FlagSpec::repeatable(&["--control-golden"]),
     FlagSpec::repeatable(&["--control-golden-sha256"]),
     FlagSpec::repeatable(&["--control-golden-bytes"]),
+    FlagSpec::value(&["--warmup-golden"]),
+    FlagSpec::value(&["--warmup-golden-sha256"]),
+    FlagSpec::value(&["--warmup-golden-bytes"]),
     // Repeatable resource passthrough. The value is taken from THIS command line and is never
     // read out of a manifest, fixture or other submission-editable file.
     FlagSpec::repeatable(&[engine_resource::ENGINE_RESOURCE_FLAG]),
@@ -4356,6 +4369,21 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let golden = &goldens[0];
 
+    let validated_private_dir =
+        if args.mode == Mode::Official && declared_contract.require_private_dir == Some(true) {
+            let mut candidate_paths = args.goldens.clone();
+            candidate_paths.extend(args.warmup_golden.iter().cloned());
+            Some(require_paired_private_dir(
+                std::env::var_os("MLXFAST_PRIVATE_DIR").as_deref(),
+                &candidate_paths,
+                &args.control_goldens,
+                std::env::var_os("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE").is_some(),
+                std::env::var("MLXFAST_NO_SANDBOX").is_ok_and(|value| value == "1"),
+            )?)
+        } else {
+            None
+        };
+
     // B-2: an OFFICIAL run FAILS CLOSED on any missing sandbox prerequisite (worker disabled,
     // MLXFAST_NO_SANDBOX=1, no engine exe, no derivable profile, no sandbox-exec) — resolved
     // UP FRONT, before any score is written (Swift `runtimeWorkerOptions` throws before the
@@ -4377,6 +4405,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 &args.engine,
                 &args.goldens[0],
                 true,
+                validated_private_dir.as_deref(),
                 process_resident_socket().as_deref(),
             )?)
         } else {
@@ -4495,6 +4524,13 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     let paired_inputs_present = paired_inputs_present(args);
     let paired_track =
         live_control_leg_track && (args.mode == Mode::Official || paired_inputs_present);
+    let (warmup_path, ignored_paired_guards) = warmup_path_for_run(
+        paired_track,
+        declared_contract.warmup_golden.as_ref(),
+        args.warmup_golden.as_deref(),
+        declared_contract.decode_golden_offset,
+    )?;
+    report_ignored_paired_guards(ignored_paired_guards);
     // `--control-golden` is LEG 1's golden, so it has meaning only on a run that measures leg 1.
     // A run that measures none is refused BY NAME rather than dropping the flag: an operator who
     // wired the serial tape and got a candidate-only run must be told so, not left reading a
@@ -4788,6 +4824,22 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 &identity,
             )?);
         }
+        let warmup_golden = match (declared_contract.warmup_golden.as_ref(), warmup_path) {
+            (Some(declared), Some(path)) => {
+                let golden = load_golden_checked(
+                    path,
+                    args.warmup_golden_pin.as_ref(),
+                    args.mode.golden_required_steps(&window),
+                    None,
+                    &track_id,
+                    &identity,
+                )?;
+                validate_warmup_pin(declared, args.warmup_golden_pin.as_ref(), &golden)?;
+                Some(golden)
+            }
+            (None, None) => None,
+            _ => unreachable!("warmup_path_for_contract checked the declaration pair"),
+        };
         // ABSENT ⇒ leg 1 verifies against the candidate golden, which is today's behaviour and is
         // correct exactly when that golden's oracle is the serial tape.
         let paired_goldens: Vec<official::PairedGoldens<'_>> = goldens
@@ -4883,6 +4935,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 engine,
                 golden,
                 honor_executable_override,
+                validated_private_dir.as_deref(),
                 socket.as_deref(),
             )
             .map(Some)
@@ -5013,6 +5066,12 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 // The fixture is the only source. Absent keeps the lower-median rule.
                 combine: declared_contract.official_pair_combine,
                 floors,
+                decode_speedup_ceiling: declared_contract.decode_speedup_ceiling,
+                prefill_speedup_ceiling: declared_contract.prefill_speedup_ceiling,
+                seed_window_max_ratio: declared_contract.seed_window_max_ratio,
+                decode_window_includes_seed: declared_contract.decode_window_includes_seed,
+                warmup_golden: warmup_golden.as_ref(),
+                decode_golden_offset: declared_contract.decode_golden_offset,
                 weights,
                 // The fixture is the only source. Absent keeps the exact rule.
                 token_tolerance_per_thousand: declared_contract.timed_token_tolerance_per_thousand,
@@ -5700,6 +5759,7 @@ fn resolve_official_sandbox_from_env(
     engine: &str,
     golden: &Path,
     honor_executable_override: bool,
+    validated_private_dir: Option<&str>,
     resident_socket: Option<&str>,
 ) -> Result<OfficialSandboxPlan, String> {
     let use_rw = std::env::var("MLXFAST_USE_RUNTIME_WORKER").ok();
@@ -5712,7 +5772,9 @@ fn resolve_official_sandbox_from_env(
         .then(|| std::env::var("MLXFAST_RUNTIME_WORKER_EXECUTABLE").ok())
         .flatten();
     let prof_ov = std::env::var("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE").ok();
-    let priv_dir = std::env::var("MLXFAST_PRIVATE_DIR").ok();
+    let priv_dir = validated_private_dir
+        .map(str::to_string)
+        .or_else(|| std::env::var("MLXFAST_PRIVATE_DIR").ok());
     // THE RESIDENT SOCKET IS THE SPAWN'S, NOT THE PROCESS'S. Seatbelt counts an AF_UNIX
     // connect as network, so the profile's one `network-outbound` allowance must name exactly
     // the socket THIS spawn's worker will connect to. On the paired path that socket lives in
@@ -5720,7 +5782,13 @@ fn resolve_official_sandbox_from_env(
     // gave a per-leg spawn no allowance at all, and the box-4 calibration died on
     // `cannot reach the resident … Operation not permitted`. The caller passes the leg's
     // socket; the legacy single-resident path passes the process env's.
-    let golden_str = golden.to_string_lossy().to_string();
+    let golden_str = match validated_private_dir {
+        Some(_) => golden.to_str().ok_or_else(|| {
+            "PRIVATE-DIR-REQUIRED: golden path is not valid UTF-8 and cannot be represented in the sandbox profile"
+                .to_string()
+        })?.to_string(),
+        None => golden.to_string_lossy().to_string(),
+    };
     let inputs = OfficialSandboxInputs {
         use_runtime_worker: use_rw.as_deref(),
         no_sandbox: no_sb.as_deref(),
@@ -5735,6 +5803,146 @@ fn resolve_official_sandbox_from_env(
     // forwards_worker_stderr = false: official never echoes worker stderr (the plan also
     // forces it off, so this is belt-and-braces).
     resolve_official_sandbox(&inputs, false).map_err(|e| e.to_string())
+}
+
+fn canonical_path_is_inside(private_dir: &Path, golden: &Path) -> bool {
+    golden.starts_with(private_dir)
+}
+
+fn warmup_path_for_contract<'a>(
+    declared: Option<&bench_core::contract::WarmupGoldenPin>,
+    path: Option<&'a Path>,
+) -> Result<Option<&'a Path>, String> {
+    match (declared, path) {
+        (Some(_), None) => Err(
+            "WARMUP-GOLDEN-REQUIRED: the contract declares warmup_golden; pass --warmup-golden"
+                .to_string(),
+        ),
+        (None, Some(path)) => Err(format!(
+            "WARMUP-GOLDEN-UNDECLARED: --warmup-golden {} was given but the contract declares no warmup_golden",
+            path.display()
+        )),
+        (_, path) => Ok(path),
+    }
+}
+
+const UNPAIRED_PAIRED_GUARDS_IGNORED: &str =
+    "benchd iterate: local unpaired run ignores warmup_golden and decode_golden_offset";
+
+fn report_ignored_paired_guards(ignored: bool) {
+    if ignored {
+        eprintln!("{UNPAIRED_PAIRED_GUARDS_IGNORED}");
+    }
+}
+
+fn warmup_path_for_run<'a>(
+    paired_track: bool,
+    declared: Option<&bench_core::contract::WarmupGoldenPin>,
+    path: Option<&'a Path>,
+    decode_golden_offset: Option<usize>,
+) -> Result<(Option<&'a Path>, bool), String> {
+    if !paired_track {
+        return Ok((
+            None,
+            declared.is_some() || path.is_some() || decode_golden_offset.is_some(),
+        ));
+    }
+    Ok((warmup_path_for_contract(declared, path)?, false))
+}
+
+fn validate_warmup_pin(
+    declared: &bench_core::contract::WarmupGoldenPin,
+    cli: Option<&GoldenIntegrityPin>,
+    loaded: &GoldenFixture,
+) -> Result<(), String> {
+    if cli.is_some_and(|pin| {
+        !pin.sha256.eq_ignore_ascii_case(&declared.sha256)
+            || declared.bytes.is_some_and(|bytes| bytes != pin.bytes)
+    }) {
+        return Err(
+            "WARMUP-GOLDEN-PIN-MISMATCH: CLI warm-up pin does not match the contract warmup_golden pin"
+                .to_string(),
+        );
+    }
+    if !loaded.sha256.eq_ignore_ascii_case(&declared.sha256)
+        || declared.bytes.is_some_and(|bytes| bytes != loaded.byte_len)
+    {
+        return Err(format!(
+            "WARMUP-GOLDEN-PIN-MISMATCH: warm-up golden has sha256 {} and {} bytes, which does not match the contract pin",
+            loaded.sha256, loaded.byte_len
+        ));
+    }
+    Ok(())
+}
+
+fn require_paired_private_dir(
+    private_dir: Option<&std::ffi::OsStr>,
+    candidate_goldens: &[PathBuf],
+    control_goldens: &[PathBuf],
+    sandbox_profile_override_set: bool,
+    no_sandbox: bool,
+) -> Result<String, String> {
+    let private_dir = private_dir
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.to_str().map(PathBuf::from).ok_or_else(|| {
+                "PRIVATE-DIR-REQUIRED: MLXFAST_PRIVATE_DIR is not valid UTF-8 and cannot be represented in the sandbox profile"
+                    .to_string()
+            })
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            "PRIVATE-DIR-REQUIRED: MLXFAST_PRIVATE_DIR must name an existing directory".to_string()
+        })?;
+    let private_dir = std::fs::canonicalize(&private_dir).map_err(|error| {
+        format!(
+            "PRIVATE-DIR-REQUIRED: MLXFAST_PRIVATE_DIR {} is not an existing directory: {error}",
+            private_dir.display()
+        )
+    })?;
+    if !private_dir.is_dir() {
+        return Err(format!(
+            "PRIVATE-DIR-REQUIRED: MLXFAST_PRIVATE_DIR {} is not a directory",
+            private_dir.display()
+        ));
+    }
+    let private_dir_string = private_dir.to_str().ok_or_else(|| {
+        "PRIVATE-DIR-REQUIRED: canonical MLXFAST_PRIVATE_DIR is not valid UTF-8 and cannot be represented in the sandbox profile"
+            .to_string()
+    })?.to_string();
+    if sandbox_profile_override_set || no_sandbox {
+        return Err("SANDBOX-OVERRIDE-REFUSED: require_private_dir refuses \
+             MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE and MLXFAST_NO_SANDBOX=1"
+            .to_string());
+    }
+    for golden in candidate_goldens.iter().chain(control_goldens) {
+        if golden.to_str().is_none() {
+            return Err(
+                "PRIVATE-DIR-REQUIRED: golden path is not valid UTF-8 and cannot be represented in the sandbox profile"
+                    .to_string(),
+            );
+        }
+        let canonical = std::fs::canonicalize(golden).map_err(|error| {
+            format!(
+                "GOLDEN-OUTSIDE-PRIVATE-DIR: golden {} could not be canonicalized: {error}",
+                golden.display()
+            )
+        })?;
+        if canonical.to_str().is_none() {
+            return Err(
+                "PRIVATE-DIR-REQUIRED: canonical golden path is not valid UTF-8 and cannot be represented in the sandbox profile"
+                    .to_string(),
+            );
+        }
+        if !canonical_path_is_inside(&private_dir, &canonical) {
+            return Err(format!(
+                "GOLDEN-OUTSIDE-PRIVATE-DIR: golden {} resolves outside {}",
+                golden.display(),
+                private_dir.display()
+            ));
+        }
+    }
+    Ok(private_dir_string)
 }
 
 /// Whether `/usr/bin/sandbox-exec` exists and is executable (Swift
@@ -6941,6 +7149,18 @@ fn build_iterate_args(flags: &ParsedFlags) -> Result<IterateArgs, String> {
             "--control-golden",
         ],
     )?;
+    let warmup_golden = flags.path("--warmup-golden");
+    let warmup_golden_pin = parse_named_golden_pin(
+        flags.string("--warmup-golden-sha256"),
+        flags.string("--warmup-golden-bytes"),
+        "--warmup-golden-sha256",
+        "--warmup-golden-bytes",
+    )?;
+    if warmup_golden.is_none() && warmup_golden_pin.is_some() {
+        return Err(
+            "--warmup-golden-sha256/--warmup-golden-bytes require --warmup-golden".to_string(),
+        );
+    }
     // Default score name mirrors benchmark.sh: local-ITERATE writes `score.local-iterate.json`
     // (benchmark.sh:92-95); local-SUBMIT writes the DEFAULT `score.json`, as does official.
     let score_path = flags.path("--score-path").unwrap_or_else(|| {
@@ -6972,6 +7192,8 @@ fn build_iterate_args(flags: &ParsedFlags) -> Result<IterateArgs, String> {
         box_name: flags.string("--box"),
         control_goldens,
         control_golden_pins,
+        warmup_golden,
+        warmup_golden_pin,
         engine_resources,
     })
 }
@@ -7025,6 +7247,212 @@ fn capture_pass_record_path(base: &Path, label: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warmup_golden_declaration_requires_exact_presence_and_pin() {
+        let declared = bench_core::contract::WarmupGoldenPin {
+            sha256: "a".repeat(64),
+            bytes: Some(42),
+        };
+        let path = Path::new("warm.json");
+        assert!(warmup_path_for_contract(Some(&declared), None)
+            .unwrap_err()
+            .starts_with("WARMUP-GOLDEN-REQUIRED"));
+        assert!(warmup_path_for_contract(None, Some(path))
+            .unwrap_err()
+            .starts_with("WARMUP-GOLDEN-UNDECLARED"));
+        assert_eq!(
+            warmup_path_for_contract(Some(&declared), Some(path)).unwrap(),
+            Some(path)
+        );
+
+        let mut loaded = crate::testgolden::TestGolden::new().fixture();
+        loaded.sha256 = declared.sha256.clone();
+        loaded.byte_len = 42;
+        assert!(validate_warmup_pin(&declared, None, &loaded).is_ok());
+        let wrong = GoldenIntegrityPin {
+            sha256: "b".repeat(64),
+            bytes: 42,
+        };
+        assert!(validate_warmup_pin(&declared, Some(&wrong), &loaded)
+            .unwrap_err()
+            .starts_with("WARMUP-GOLDEN-PIN-MISMATCH"));
+        loaded.byte_len = 43;
+        assert!(validate_warmup_pin(&declared, None, &loaded)
+            .unwrap_err()
+            .starts_with("WARMUP-GOLDEN-PIN-MISMATCH"));
+    }
+
+    #[test]
+    fn unpaired_local_ignores_paired_guards_but_paired_runs_keep_them() {
+        if std::env::var_os("BENCHD_UNPAIRED_GUARD_NOTE_CHILD").is_some() {
+            report_ignored_paired_guards(true);
+            return;
+        }
+        let declared = bench_core::contract::WarmupGoldenPin {
+            sha256: "a".repeat(64),
+            bytes: Some(42),
+        };
+        let path = Path::new("warm.json");
+
+        for cli_path in [None, Some(path)] {
+            let (warmup, note) =
+                warmup_path_for_run(false, Some(&declared), cli_path, Some(1)).unwrap();
+            assert_eq!(warmup, None);
+            assert!(note);
+        }
+        assert_eq!(
+            warmup_path_for_run(false, None, Some(path), None).unwrap(),
+            (None, true)
+        );
+        assert!(UNPAIRED_PAIRED_GUARDS_IGNORED.contains("warmup_golden"));
+        assert!(UNPAIRED_PAIRED_GUARDS_IGNORED.contains("decode_golden_offset"));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unpaired_local_ignores_paired_guards_but_paired_runs_keep_them",
+                "--nocapture",
+            ])
+            .env("BENCHD_UNPAIRED_GUARD_NOTE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&child.stderr).trim(),
+            UNPAIRED_PAIRED_GUARDS_IGNORED
+        );
+
+        let error = warmup_path_for_run(true, Some(&declared), None, Some(1)).unwrap_err();
+        assert!(error.starts_with("WARMUP-GOLDEN-REQUIRED"));
+        assert_eq!(
+            warmup_path_for_run(true, Some(&declared), Some(path), Some(1)).unwrap(),
+            (Some(path), false)
+        );
+    }
+
+    #[test]
+    fn private_dir_guard_covers_inside_outside_prefix_symlink_unset_and_overrides() {
+        let temp = std::env::temp_dir().join(format!(
+            "benchd-private-dir-test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let private = temp.join("priv");
+        let sibling = temp.join("priv2");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let inside = private.join("inside.json");
+        let outside = temp.join("outside.json");
+        let sibling_file = sibling.join("sibling.json");
+        std::fs::write(&inside, b"{}").unwrap();
+        std::fs::write(&outside, b"{}").unwrap();
+        std::fs::write(&sibling_file, b"{}").unwrap();
+
+        let validated = require_paired_private_dir(
+            Some(private.as_os_str()),
+            std::slice::from_ref(&inside),
+            std::slice::from_ref(&inside),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            validated,
+            std::fs::canonicalize(&private).unwrap().to_str().unwrap()
+        );
+        for path in [&outside, &sibling_file] {
+            let error = require_paired_private_dir(
+                Some(private.as_os_str()),
+                std::slice::from_ref(path),
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("GOLDEN-OUTSIDE-PRIVATE-DIR"), "{error}");
+        }
+        let mut live_and_warmup = vec![inside.clone()];
+        live_and_warmup.push(outside.clone());
+        let error = require_paired_private_dir(
+            Some(private.as_os_str()),
+            &live_and_warmup,
+            &[],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("GOLDEN-OUTSIDE-PRIVATE-DIR"), "{error}");
+        assert!(!canonical_path_is_inside(
+            Path::new("/x/priv"),
+            Path::new("/x/priv2/golden.json")
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            std::os::unix::fs::symlink(&outside, private.join("escape.json")).unwrap();
+            let error = require_paired_private_dir(
+                Some(private.as_os_str()),
+                &[private.join("escape.json")],
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("GOLDEN-OUTSIDE-PRIVATE-DIR"), "{error}");
+
+            let invalid_dir = temp.join(std::ffi::OsString::from_vec(b"private-\xff".to_vec()));
+            let error = require_paired_private_dir(
+                Some(invalid_dir.as_os_str()),
+                std::slice::from_ref(&inside),
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("PRIVATE-DIR-REQUIRED"), "{error}");
+
+            let invalid_golden =
+                private.join(std::ffi::OsString::from_vec(b"golden-\xff.json".to_vec()));
+            let error = require_paired_private_dir(
+                Some(private.as_os_str()),
+                &[invalid_golden],
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("PRIVATE-DIR-REQUIRED"), "{error}");
+        }
+
+        for private_dir in [None, Some(std::ffi::OsStr::new(""))] {
+            let error = require_paired_private_dir(
+                private_dir,
+                std::slice::from_ref(&inside),
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("PRIVATE-DIR-REQUIRED"), "{error}");
+        }
+        for (profile, no_sandbox) in [(true, false), (false, true)] {
+            let error = require_paired_private_dir(
+                Some(private.as_os_str()),
+                std::slice::from_ref(&inside),
+                &[],
+                profile,
+                no_sandbox,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("SANDBOX-OVERRIDE-REFUSED"), "{error}");
+        }
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
 
     /// THE WINDOW THESE TESTS MEASURE UNDER — the 125B MLX track's own, as TEST DATA. STEP 3
     /// (David 2026-09-15) deleted `WindowShape::table`, so a test that needs a window states one;
@@ -10201,6 +10629,12 @@ mod tests {
             "official",
             "--contract",
             "fixture.json",
+            "--warmup-golden",
+            "warm.json",
+            "--warmup-golden-sha256",
+            &"e".repeat(64),
+            "--warmup-golden-bytes",
+            "44",
             "--mtp-depth",
             "3",
             "--no-cool-gate",
@@ -10208,6 +10642,10 @@ mod tests {
         let parsed = parse_iterate_args(&official).unwrap().unwrap();
         assert_eq!(parsed.mode, Mode::Official);
         assert_eq!(parsed.contract, Some(PathBuf::from("fixture.json")));
+        assert_eq!(parsed.warmup_golden, Some(PathBuf::from("warm.json")));
+        let warmup_pin = parsed.warmup_golden_pin.as_ref().unwrap();
+        assert_eq!(warmup_pin.sha256, "e".repeat(64));
+        assert_eq!(warmup_pin.bytes, 44);
         let spec = parsed.spec.as_ref().unwrap();
         assert_eq!(spec.mode, "mtp");
         assert_eq!(spec.mtp.as_ref().unwrap().depth, Some(3));
@@ -10254,6 +10692,8 @@ mod tests {
         assert!(parsed.engine_resources.is_empty());
         assert!(parsed.golden_pins.is_empty());
         assert!(parsed.control_golden_pins.is_empty());
+        assert!(parsed.warmup_golden.is_none());
+        assert!(parsed.warmup_golden_pin.is_none());
 
         assert_covers_table(ITERATE_FLAGS, &[&capture, &official, &explicit, &spec_only]);
         assert_usage_documents_table(ITERATE_USAGE, ITERATE_FLAGS);

@@ -48,6 +48,8 @@ REQUIRED:
                                  candidate).
     --golden <PATH>              Repeatable. A LIVE golden of the track: one prompt a ranked run
                                  measures. Give each golden a ranked run on this box measures.
+    --warmup-golden <PATH>       Required when the contract declares warmup_golden; used only for
+                                 warm-up and never scored.
     --contract <FILE>            The track fixture. It declares the model shape the golden loads
                                  under, the measurement window the legs run and the health band
                                  the file records, so the verb cannot run without it.
@@ -88,6 +90,10 @@ REFUSALS (by name):
     GOLDEN-COUNT-MISMATCH          --prompt was given, but not once per --golden
     BASELINE-CALIBRATION-INVALID   two goldens name the same prompt
     SERIAL-CONTROL-LEG-FAILED      a control leg did not complete
+    WARMUP-GOLDEN-REQUIRED         fixture declares a warm-up golden but no path was given
+    WARMUP-GOLDEN-UNDECLARED       a path was given but the fixture declares no warm-up golden
+    WARMUP-GOLDEN-PIN-MISMATCH     warm-up bytes do not match the fixture pin
+    PROMPT-REUSE-REFUSED           warm-up or composed timed tokens collide
     CALIBRATION-CV-EXCEEDED        the legs vary by more than the track's maximum
 ";
 
@@ -111,6 +117,7 @@ struct Args {
     benchd_source_commit: String,
     engine_resources: Vec<crate::engine_resource::EngineResource>,
     cool_gate: bool,
+    warmup_golden: Option<PathBuf>,
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
@@ -142,6 +149,7 @@ fn parse(args: &[String]) -> Result<Option<Args>, String> {
     let mut benchd_commit_flag: Option<String> = None;
     let mut engine_resources: Vec<crate::engine_resource::EngineResource> = Vec::new();
     let mut cool_gate = true;
+    let mut warmup_golden: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -165,6 +173,10 @@ fn parse(args: &[String]) -> Result<Option<Args>, String> {
             }
             "--golden" => {
                 goldens.push(PathBuf::from(value(args, i, "--golden")?));
+                i += 2;
+            }
+            "--warmup-golden" => {
+                warmup_golden = Some(PathBuf::from(value(args, i, "--warmup-golden")?));
                 i += 2;
             }
             "--out" => {
@@ -326,7 +338,59 @@ fn parse(args: &[String]) -> Result<Option<Args>, String> {
         benchd_source_commit,
         engine_resources,
         cool_gate,
+        warmup_golden,
     }))
+}
+
+fn calibration_shapes<'a>(
+    goldens: &[bench_core::golden::GoldenFixture],
+    warmup: Option<&'a bench_core::golden::GoldenFixture>,
+    offset: Option<usize>,
+) -> Result<
+    (
+        Vec<bench_core::golden::BenchmarkGolden>,
+        Option<&'a bench_core::golden::BenchmarkGolden>,
+    ),
+    String,
+> {
+    let shift = offset.unwrap_or(0);
+    if let Some(shift) = offset {
+        crate::official::validate_decode_golden_offset(shift, goldens.len())?;
+    }
+    let sources: Vec<_> = goldens
+        .iter()
+        .map(|golden| {
+            golden
+                .benchmark
+                .as_ref()
+                .ok_or_else(|| "benchmark golden file must contain a benchmark oracle".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let composed: Vec<_> = (0..sources.len())
+        .map(|g| {
+            crate::official::compose_benchmark_golden(
+                sources[g],
+                sources[(g + shift) % sources.len()],
+            )
+        })
+        .collect();
+    let warmup_benchmark = warmup
+        .map(|golden| {
+            golden
+                .benchmark
+                .as_ref()
+                .ok_or_else(|| "warm-up golden file must contain a benchmark oracle".to_string())
+        })
+        .transpose()?;
+    crate::official::validate_prompt_distinctness(
+        &sources,
+        &sources,
+        &composed,
+        &composed,
+        warmup_benchmark,
+        offset.is_some(),
+    )?;
+    Ok((composed, warmup_benchmark))
 }
 
 fn execute(args: &[String]) -> Result<Option<()>, String> {
@@ -357,6 +421,60 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         baseline::refuse_golden_with_stored_pair(&golden)?;
         goldens.push(golden);
     }
+    let warmup_golden = match (&loaded.contract.warmup_golden, &args.warmup_golden) {
+        (Some(_), None) => {
+            return Err(
+                "WARMUP-GOLDEN-REQUIRED: the contract declares warmup_golden; pass \
+                 --warmup-golden"
+                    .to_string(),
+            )
+        }
+        (None, Some(path)) => {
+            return Err(format!(
+                "WARMUP-GOLDEN-UNDECLARED: --warmup-golden {} was given but the contract \
+                 declares no warmup_golden",
+                path.display()
+            ))
+        }
+        (None, None) => None,
+        (Some(pin), Some(path)) => {
+            let golden = crate::load_golden_checked(
+                path,
+                None,
+                Mode::Official.golden_required_steps(&window),
+                None,
+                &args.track_id,
+                &identity,
+            )?;
+            if !golden.sha256.eq_ignore_ascii_case(&pin.sha256)
+                || pin.bytes.is_some_and(|bytes| bytes != golden.byte_len)
+            {
+                return Err(format!(
+                    "WARMUP-GOLDEN-PIN-MISMATCH: --warmup-golden {} does not match the contract pin",
+                    path.display()
+                ));
+            }
+            Some(golden)
+        }
+    };
+    let validated_private_dir = if loaded.contract.require_private_dir == Some(true) {
+        let mut paths: Vec<PathBuf> = args.goldens.iter().map(|(path, _)| path.clone()).collect();
+        paths.extend(args.warmup_golden.iter().cloned());
+        Some(crate::require_paired_private_dir(
+            std::env::var_os("MLXFAST_PRIVATE_DIR").as_deref(),
+            &paths,
+            &[],
+            std::env::var_os("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE").is_some(),
+            std::env::var("MLXFAST_NO_SANDBOX").is_ok_and(|value| value == "1"),
+        )?)
+    } else {
+        None
+    };
+    let (composed, warmup_benchmark) = calibration_shapes(
+        &goldens,
+        warmup_golden.as_ref(),
+        loaded.contract.decode_golden_offset,
+    )?;
 
     // The engine lives INSIDE the reference tree, at the relative path the operator gave.
     let engine =
@@ -401,7 +519,8 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     // point names one pass of the whole calibration.
     let mut measured_legs: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(goldens.len());
     let mut pass_number = 0;
-    for ((golden_path, prompt), golden) in args.goldens.iter().zip(&goldens) {
+    for (golden_index, (golden_path, prompt)) in args.goldens.iter().enumerate() {
+        let benchmark = &composed[golden_index];
         let mut legs: Vec<bench_runner::TimingResult> = Vec::with_capacity(args.passes as usize);
         for pass in 1..=args.passes {
             pass_number += 1;
@@ -422,6 +541,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
                     &engine_str,
                     golden_path,
                     false,
+                    validated_private_dir.as_deref(),
                     crate::spawn_resident_socket(&leg_env, None).as_deref(),
                 )?)
             } else {
@@ -436,17 +556,53 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
                     &leg_env,
                 )
             };
-            let measured =
-                crate::official::run_serial_control_leg(golden, &window, spawn, &mut phase_gates);
+            let measured = crate::official::run_serial_control_leg(
+                Some(benchmark),
+                warmup_benchmark,
+                &window,
+                spawn,
+                &mut phase_gates,
+            );
             // The pass's resident goes down before the next pass's comes up, on success and
             // failure alike — one resident at a time, exactly as the ranked run holds one leg at a
             // time.
-            drop(serve);
-            let leg = measured
-                .map_err(|e| format!("prompt {prompt:?} pass {pass}/{}: {e}", args.passes))?;
+            let mut leg = match measured {
+                Ok(leg) => leg,
+                Err(error) => {
+                    drop(serve);
+                    return Err(format!(
+                        "prompt {prompt:?} pass {pass}/{}: {error}",
+                        args.passes
+                    ));
+                }
+            };
+            leg.decode_seconds_per_token =
+                match crate::official::decode_seconds_per_token_for_scoring(
+                    &leg,
+                    loaded.contract.decode_window_includes_seed == Some(true),
+                    pass as usize,
+                    args.passes as usize,
+                    "control",
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        drop(serve);
+                        return Err(format!(
+                            "prompt {prompt:?} pass {pass}/{}: {error}",
+                            args.passes
+                        ));
+                    }
+                };
+            serve.stop().map_err(|error| {
+                format!(
+                    "prompt {prompt:?} pass {pass}/{}: LEG-TEARDOWN-FAILED: {}",
+                    args.passes,
+                    bench_runner::scrub_reason_for_seal(&error)
+                )
+            })?;
             eprintln!(
                 "benchd calibrate-baseline: prompt {prompt:?} pass {pass}/{} measured prefill {} \
-                 s/tok, decode window {} s/tok",
+                 s/tok, decode scoring window {} s/tok",
                 args.passes, leg.prefill_seconds_per_token, leg.decode_seconds_per_token
             );
             legs.push(leg);
@@ -491,7 +647,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     for entry in &calibration.prompts {
         eprintln!(
             "benchd calibrate-baseline: prompt {:?}: {} passes, prefill mean {} s/tok (CV \
-             {:.4}%), decode window mean {} s/tok (CV {:.4}%)",
+             {:.4}%), decode scoring-window mean {} s/tok (CV {:.4}%)",
             entry.prompt,
             entry.passes,
             entry.prefill_seconds_per_token_mean,
@@ -506,6 +662,212 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_calibrate_entry_charges_seed_when_the_contract_opts_in() {
+        #[cfg(target_os = "macos")]
+        {
+            let probe = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
+                .output()
+                .unwrap();
+            if !probe.status.success() {
+                eprintln!(
+                    "skipping production calibrate entry test: sandbox-exec is blocked in this test environment"
+                );
+                return;
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "benchd-calibrate-entry.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = root.join("reference");
+        std::fs::create_dir_all(workspace.join("weights")).unwrap();
+        std::fs::create_dir_all(workspace.join("tools")).unwrap();
+
+        let engine_source = root.join("engine.rs");
+        let engine = workspace.join("engine");
+        std::fs::write(
+            &engine_source,
+            r#"use std::io::{self, BufRead, Write};
+fn number(line: &str, key: &str) -> i64 {
+    line.split_once(key).unwrap().1.chars().skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+}
+fn main() {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{{\"id\":0,\"nonce\":\"test\",\"ok\":true,\"protocol_version\":1,\"capabilities\":[\"free_run_decode\"]}}").unwrap();
+    out.flush().unwrap();
+    let mut work = 0i64;
+    for line in io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let id = number(&line, "\"id\"");
+        let response = if line.contains("\"kind\":\"prefill\"") {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            format!("{{\"id\":{id},\"nonce\":\"test\",\"ok\":true,\"token\":5}}")
+        } else if line.contains("\"kind\":\"free_decode_begin\"") {
+            std::thread::sleep(std::time::Duration::from_millis(10)); work = 1;
+            format!("{{\"id\":{id},\"nonce\":\"test\",\"ok\":true,\"seed_token\":6}}")
+        } else if line.contains("\"kind\":\"free_decode_run\"") {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let n = number(&line, "\"count\"") as usize; work += n as i64;
+            let tokens = vec!["7"; n].join(","); let accepts = vec!["1"; n].join(",");
+            format!("{{\"id\":{id},\"nonce\":\"test\",\"ok\":true,\"tokens\":[{tokens}],\"acceptance_lengths\":[{accepts}],\"drafted_total\":{n},\"accepted_total\":0,\"committed_total\":{n}}}")
+        } else if line.contains("\"kind\":\"phase_diagnostics\"") {
+            let done = work; work = 0;
+            format!("{{\"id\":{id},\"nonce\":\"test\",\"ok\":true,\"completed_work\":{done},\"cache_memory\":0,\"peak_ram_gb\":1.0}}")
+        } else {
+            format!("{{\"id\":{id},\"nonce\":\"test\",\"ok\":true}}")
+        };
+        writeln!(out, "{response}").unwrap(); out.flush().unwrap();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let compile = std::process::Command::new("rustc")
+            .args(["--edition=2021", "-O"])
+            .arg(&engine_source)
+            .arg("-o")
+            .arg(&engine)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let serve = workspace.join(crate::legserve::MLX_LEG_SERVE_SCRIPT);
+        std::fs::write(
+            &serve,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in --socket-out) printf '%s\\n' '/tmp/benchd-calibrate-test-no-resident.sock' > \"$2\"; shift 2;; *) shift;; esac\ndone\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&serve, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let golden = root.join("botany.json");
+        std::fs::write(&golden, crate::testgolden::TestGolden::new().bytes()).unwrap();
+        let window = crate::iterate::test_window();
+        let run = |includes_seed: bool, suffix: &str| {
+            let contract = root.join(format!("contract-{suffix}.json"));
+            let out = root.join(format!("calibration-{suffix}.json"));
+            let fixture = serde_json::json!({
+                "track_id": "qwen3.8-125b-a6b-mlx-v1",
+                "vocab_size": 248320,
+                "num_hidden_layers": 48,
+                "seed_tokens": 1024,
+                "golden_model_type": "qwen4_exp_text",
+                "correctness_steps": window.correctness_steps,
+                "benchmark_decode_steps": window.benchmark_decode_steps,
+                "local_submit_benchmark_decode_steps": window.local_submit_benchmark_decode_steps,
+                "official_prefill_warmup_runs": window.official_prefill_warmup_runs,
+                "official_prefill_timed_runs": 1,
+                "decode_window_includes_seed": includes_seed,
+                "prefill_band_up_tolerance": 1.0,
+                "prefill_band_down_tolerance": 0.5,
+                "decode_band_up_tolerance": 1.0,
+                "decode_band_down_tolerance": 0.5,
+                "decode_band_down_enabled": true,
+                "prefill_band_down_enabled": true,
+                "calibration_max_cv_percent": 100.0
+            });
+            std::fs::write(&contract, serde_json::to_vec(&fixture).unwrap()).unwrap();
+            let args = vec![
+                "--baseline-workspace".to_string(),
+                workspace.display().to_string(),
+                "--engine".to_string(),
+                "engine".to_string(),
+                "--weights".to_string(),
+                workspace.join("weights").display().to_string(),
+                "--golden".to_string(),
+                golden.display().to_string(),
+                "--contract".to_string(),
+                contract.display().to_string(),
+                "--out".to_string(),
+                out.display().to_string(),
+                "--passes".to_string(),
+                "2".to_string(),
+                "--box".to_string(),
+                "test-box".to_string(),
+                "--track".to_string(),
+                "qwen3.8-125b-a6b-mlx-v1".to_string(),
+                "--reference-commit".to_string(),
+                "a".repeat(40),
+                "--benchd-source-commit".to_string(),
+                "b".repeat(40),
+                "--no-cool-gate".to_string(),
+            ];
+            execute(&args).unwrap();
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+            document["prompts"][0]["decode_seconds_per_token_mean"]
+                .as_f64()
+                .unwrap()
+        };
+
+        let legacy = run(false, "legacy");
+        let charged = run(true, "charged");
+        assert!(charged > legacy * 1.5, "legacy={legacy}, charged={charged}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn guarded_calibration_uses_composed_shape_and_warmup_golden() {
+        let mut goldens: Vec<_> = (0..3)
+            .map(|_| crate::testgolden::TestGolden::new().fixture())
+            .collect();
+        for (index, golden) in goldens.iter_mut().enumerate() {
+            let benchmark = golden.benchmark.as_mut().unwrap();
+            benchmark.prefill_prompt_tokens.fill(100 + index as i64);
+            benchmark.decode_seed_tokens.fill(200 + index as i64);
+        }
+        let mut warmup = crate::testgolden::TestGolden::new().fixture();
+        let warmup_expected = {
+            let benchmark = warmup.benchmark.as_mut().unwrap();
+            benchmark.prefill_prompt_tokens.fill(900);
+            benchmark.decode_seed_tokens.fill(901);
+            benchmark.clone()
+        };
+        let (shapes, passed_warmup) = calibration_shapes(&goldens, Some(&warmup), Some(1)).unwrap();
+        for index in 0..3 {
+            assert_eq!(
+                shapes[index].prefill_prompt_tokens,
+                goldens[index]
+                    .benchmark
+                    .as_ref()
+                    .unwrap()
+                    .prefill_prompt_tokens
+            );
+            assert_eq!(
+                shapes[index].decode_seed_tokens,
+                goldens[(index + 1) % 3]
+                    .benchmark
+                    .as_ref()
+                    .unwrap()
+                    .decode_seed_tokens
+            );
+        }
+        assert_eq!(passed_warmup, Some(&warmup_expected));
+    }
+
+    #[test]
+    fn absent_guard_keys_keep_the_calibration_leg_shape_byte_identical() {
+        let golden = crate::testgolden::TestGolden::new().fixture();
+        let original = golden.benchmark.as_ref().unwrap().clone();
+        let (shapes, warmup) = calibration_shapes(&[golden], None, None).unwrap();
+        assert_eq!(shapes, [original]);
+        assert!(warmup.is_none());
+    }
 
     #[test]
     fn help_and_unknown_flags_are_answered_at_parse() {
@@ -568,6 +930,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(named(&parsed), ["p1", "p2"]);
+        let parsed = parse(&argv(&["--warmup-golden", "/g/warmup.golden.json"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed.warmup_golden,
+            Some(PathBuf::from("/g/warmup.golden.json"))
+        );
 
         let err = parse(&argv(&["--prompt", "p1"])).unwrap_err();
         assert!(err.contains(baseline::GOLDEN_COUNT_MISMATCH), "{err}");
@@ -589,6 +958,10 @@ mod tests {
             baseline::BASELINE_BOX_UNRESOLVED,
             baseline::GOLDEN_COUNT_MISMATCH,
             crate::official::SERIAL_CONTROL_LEG_FAILED,
+            crate::official::PROMPT_REUSE_REFUSED,
+            "WARMUP-GOLDEN-REQUIRED",
+            "WARMUP-GOLDEN-UNDECLARED",
+            "WARMUP-GOLDEN-PIN-MISMATCH",
             bench_core::constants::CALIBRATION_CV_EXCEEDED,
         ] {
             assert!(USAGE.contains(name), "the usage must name {name}");

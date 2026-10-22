@@ -53,6 +53,11 @@ use bench_core::constants::Platform;
 use bench_protocol::SpecConfig;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(test))]
+const STOP_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const STOP_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The CUDA track's per-leg boot/teardown script, relative to a leg's workspace root.
 pub const CUDA_LEG_SERVE_SCRIPT: &str = "tools/serve-up.sh";
 /// The MLX track's per-leg boot/teardown script, relative to a leg's workspace root.
@@ -107,6 +112,7 @@ pub struct LegServe {
     socket: String,
     label: &'static str,
     platform: Platform,
+    stopped: bool,
 }
 
 impl LegServe {
@@ -118,30 +124,90 @@ impl LegServe {
             .map(|name| ((*name).to_string(), self.socket.clone()))
             .collect()
     }
+
+    fn stop_once(&mut self) -> Result<(), String> {
+        let script = self.workspace.join(leg_serve_script(self.platform));
+        let out = std::process::Command::new(&script)
+            .current_dir(&self.workspace)
+            .args(["--stop", "--socket", &self.socket])
+            .output()
+            .map_err(|e| {
+                format!(
+                    "the {} leg's resident teardown could not run ({}): {e}",
+                    self.label,
+                    script.display()
+                )
+            })?;
+        if !out.status.success() {
+            let stderr =
+                bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
+            let sealed = engine_text_seal(&stderr);
+            eprintln!("benchd: resident teardown diagnostic: {sealed}");
+            return Err(format!(
+                "the {} leg's resident did not stop cleanly ({}): {}",
+                self.label, out.status, sealed
+            ));
+        }
+        self.stopped = true;
+        wait_for_socket_to_stop_accepting(&self.socket, STOP_SOCKET_WAIT).map_err(|error| {
+            format!(
+                "the {} leg's resident stop command succeeded, but {error}",
+                self.label
+            )
+        })
+    }
+
+    /// Stop this leg now and report a teardown failure to the scored path.
+    pub fn stop(mut self) -> Result<(), String> {
+        self.stop_once()
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_socket_to_stop_accepting(
+    socket: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    wait_for_socket_probe(timeout, || {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    })
+}
+
+#[cfg(not(unix))]
+fn wait_for_socket_to_stop_accepting(
+    _socket: &str,
+    _timeout: std::time::Duration,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn wait_for_socket_probe(
+    timeout: std::time::Duration,
+    mut accepts_connection: impl FnMut() -> bool,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !accepts_connection() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the resident socket still accepts connections after {:.3} seconds",
+                timeout.as_secs_f64()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 impl Drop for LegServe {
     fn drop(&mut self) {
-        let script = self.workspace.join(leg_serve_script(self.platform));
-        let outcome = std::process::Command::new(&script)
-            .current_dir(&self.workspace)
-            .args(["--stop", "--socket", &self.socket])
-            .output();
-        match outcome {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => eprintln!(
-                "benchd: the {} leg's resident did not stop cleanly ({}): {}",
-                self.label,
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            // Teardown runs on the failure path too, so it REPORTS rather than panics: a leg that
-            // already failed must not be replaced in the log by its own cleanup.
-            Err(e) => eprintln!(
-                "benchd: the {} leg's resident teardown could not run ({}): {e}",
-                self.label,
-                script.display()
-            ),
+        if self.stopped {
+            return;
+        }
+        if let Err(error) = self.stop_once() {
+            // Failure paths report cleanup without replacing their original error.
+            eprintln!("benchd: {error}");
         }
     }
 }
@@ -253,6 +319,7 @@ pub fn boot_leg(
         socket,
         label,
         platform,
+        stopped: false,
     })
 }
 
@@ -333,6 +400,48 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn explicit_stop_does_not_run_teardown_twice() {
+        let dir = stub_workspace(Platform::Mlx, "/tmp/checked-stop.sock");
+        let leg = boot_leg(&dir, None, "candidate", Platform::Mlx).unwrap();
+        leg.stop().unwrap();
+        let calls = calls(&dir);
+        assert_eq!(calls.len(), 2, "one boot and one stop");
+        assert_eq!(calls[1], "--stop --socket /tmp/checked-stop.sock");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn successful_stop_refuses_while_the_resident_socket_still_accepts() {
+        let error =
+            wait_for_socket_probe(std::time::Duration::from_millis(20), || true).unwrap_err();
+        assert!(error.contains("still accepts connections"), "{error}");
+    }
+
+    #[test]
+    fn stop_script_stderr_is_digest_sealed() {
+        let dir = stub_workspace(Platform::Mlx, "/tmp/stop-stderr.sock");
+        let leg = boot_leg(&dir, None, "candidate", Platform::Mlx).unwrap();
+        let script = dir.join(leg_serve_script(Platform::Mlx));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'PLANTED-STOP-SECRET 4242' >&2\nexit 2\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let error = leg.stop().unwrap_err();
+        assert!(error.contains("engine-text-sha256="), "{error}");
+        assert!(
+            !error.contains("PLANTED") && !error.contains("4242"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// THE CONVENTION, END TO END, ON BOTH PLATFORMS. benchd boots a leg's resident from that
@@ -559,6 +668,7 @@ mod tests {
             socket: "/tmp/ds4-resident.run.sock".to_string(),
             label: "candidate",
             platform: Platform::Cuda,
+            stopped: false,
         };
         assert_eq!(
             leg.spawn_env(),
@@ -580,6 +690,7 @@ mod tests {
             socket: "/tmp/bench-worker.run.sock".to_string(),
             label: "serial-control",
             platform: Platform::Mlx,
+            stopped: false,
         };
         assert_eq!(
             leg.spawn_env(),

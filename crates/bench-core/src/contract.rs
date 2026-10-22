@@ -72,6 +72,14 @@ pub struct PromptPoolEntry {
     pub noop_decode_speedup: Option<f64>,
 }
 
+/// Integrity pin for the extra golden used only to warm a paired engine process.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WarmupGoldenPin {
+    pub sha256: String,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+}
+
 /// How the paired official run combines its `official_pairs` pairs into the score it seals
 /// (`official_pair_combine` in the track fixture). Each pair has its own composite: the track's
 /// weighted score of its candidate leg over its OWN control leg.
@@ -173,6 +181,26 @@ pub struct Contract {
     /// floor of its own, not a decode side effect.
     #[serde(default)]
     pub prefill_speedup_floor: Option<f64>,
+    /// Optional plausibility ceilings for the paired run. Absent preserves the legacy path.
+    #[serde(default)]
+    pub decode_speedup_ceiling: Option<f64>,
+    #[serde(default)]
+    pub prefill_speedup_ceiling: Option<f64>,
+    /// Maximum seed-prefill-window / timed-prefill ratio for either leg of a pair.
+    #[serde(default)]
+    pub seed_window_max_ratio: Option<f64>,
+    /// Charge the seed-prefill window to decode on both paired legs and in calibration.
+    #[serde(default)]
+    pub decode_window_includes_seed: Option<bool>,
+    /// Require all paired-path goldens to live under `MLXFAST_PRIVATE_DIR`.
+    #[serde(default)]
+    pub require_private_dir: Option<bool>,
+    /// One extra, never-scored golden used for both warm-up forms in paired runs.
+    #[serde(default)]
+    pub warmup_golden: Option<WarmupGoldenPin>,
+    /// Decode golden displacement in the live pool. Absent keeps the legacy same-golden shape.
+    #[serde(default)]
+    pub decode_golden_offset: Option<usize>,
     /// THE BATCH SIZE this track's scored point is measured at, and the value that SELECTS the
     /// measured path (David 2026-09-15: "Benchd should support batching. Batching as part of the
     /// configuration.").
@@ -367,6 +395,13 @@ impl Contract {
         timed_token_near_tie_relative_gap: None,
         decode_speedup_floor: None,
         prefill_speedup_floor: None,
+        decode_speedup_ceiling: None,
+        prefill_speedup_ceiling: None,
+        seed_window_max_ratio: None,
+        decode_window_includes_seed: None,
+        require_private_dir: None,
+        warmup_golden: None,
+        decode_golden_offset: None,
         scored_batch_size: None,
         prefill_gain_exponent: None,
         decode_gain_exponent: None,
@@ -1216,6 +1251,21 @@ fn one_floor(declared: Option<f64>, field: &str, track_id: &str) -> Result<f64, 
     }
 }
 
+fn certify_greater_than_one(
+    declared: Option<f64>,
+    field: &str,
+    track_id: &str,
+) -> Result<(), String> {
+    match declared {
+        Some(v) if v.is_finite() && v > 1.0 => Ok(()),
+        Some(v) => Err(format!(
+            "the --contract track fixture for {track_id:?} declares {field}: {v}; {field} must be \
+             finite and greater than 1.0"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The paired path's pair count, or the refusal naming what the fixture must declare.
 pub fn official_pairs(contract: &Contract, track_id: &str) -> Result<usize, String> {
     match contract.official_pairs {
@@ -1329,6 +1379,43 @@ impl Contract {
                 "prefill_speedup_floor",
                 track_id,
             )?;
+        }
+        certify_greater_than_one(
+            self.decode_speedup_ceiling,
+            "decode_speedup_ceiling",
+            track_id,
+        )?;
+        if let Some(offset) = self.decode_golden_offset {
+            let n = self.timed_prompt_pool.len();
+            if offset == 0 || offset >= n {
+                return Err(format!(
+                    "decode_golden_offset must be at least 1 and less than the live golden count {n}; got {offset}"
+                ));
+            }
+        }
+        certify_greater_than_one(
+            self.prefill_speedup_ceiling,
+            "prefill_speedup_ceiling",
+            track_id,
+        )?;
+        certify_greater_than_one(
+            self.seed_window_max_ratio,
+            "seed_window_max_ratio",
+            track_id,
+        )?;
+        if (self.warmup_golden.is_some() || self.decode_golden_offset.is_some())
+            && self
+                .official_prefill_timed_runs
+                .map_or(crate::constants::BENCHMARK_PREFILL_TIMED_RUNS, |runs| {
+                    runs as usize
+                })
+                != 1
+        {
+            return Err(format!(
+                "PROMPT-REUSE-REFUSED: the --contract track fixture for {track_id:?} declares a \
+                 warmup_golden or decode_golden_offset, so resolved official_prefill_timed_runs \
+                 must be exactly 1; repeated timed prefill would reuse the first-exposure prompt"
+            ));
         }
         if self.official_pairs.is_some() {
             official_pairs(self, track_id)?;
@@ -1679,6 +1766,104 @@ mod speedup_floor_tests {
         assert!(speedup_floors(&nan, "t")
             .unwrap_err()
             .contains("finite and greater than 0"));
+    }
+}
+
+#[cfg(test)]
+mod anticheat_guard_contract_tests {
+    use super::*;
+
+    #[test]
+    fn anticheat_guard_keys_are_optional_and_validated() {
+        let absent = Contract::parse(br#"{}"#).unwrap();
+        assert_eq!(absent.decode_speedup_ceiling, None);
+        assert_eq!(absent.prefill_speedup_ceiling, None);
+        assert_eq!(absent.seed_window_max_ratio, None);
+        assert_eq!(absent.decode_window_includes_seed, None);
+        assert_eq!(absent.require_private_dir, None);
+        assert!(absent.warmup_golden.is_none());
+        assert_eq!(absent.decode_golden_offset, None);
+
+        let valid = Contract::parse(
+            br#"{"decode_speedup_ceiling":5.0,"prefill_speedup_ceiling":4.0,
+                 "seed_window_max_ratio":1.25,"decode_window_includes_seed":true,
+                 "require_private_dir":true}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.decode_speedup_ceiling, Some(5.0));
+        assert_eq!(valid.prefill_speedup_ceiling, Some(4.0));
+        assert_eq!(valid.seed_window_max_ratio, Some(1.25));
+        assert_eq!(valid.decode_window_includes_seed, Some(true));
+        assert_eq!(valid.require_private_dir, Some(true));
+
+        for field in [
+            "decode_speedup_ceiling",
+            "prefill_speedup_ceiling",
+            "seed_window_max_ratio",
+        ] {
+            for value in [0.0, 1.0, -1.0] {
+                let body = format!(r#"{{"{field}":{value}}}"#);
+                let error = Contract::parse(body.as_bytes()).unwrap_err();
+                assert!(error.contains(field), "{error}");
+                assert!(error.contains("greater than 1.0"), "{error}");
+            }
+            for value in [f64::NAN, f64::INFINITY] {
+                let contract = match field {
+                    "decode_speedup_ceiling" => Contract {
+                        decode_speedup_ceiling: Some(value),
+                        ..Contract::NONE_DECLARED
+                    },
+                    "prefill_speedup_ceiling" => Contract {
+                        prefill_speedup_ceiling: Some(value),
+                        ..Contract::NONE_DECLARED
+                    },
+                    _ => Contract {
+                        seed_window_max_ratio: Some(value),
+                        ..Contract::NONE_DECLARED
+                    },
+                };
+                let error = contract.certify().unwrap_err();
+                assert!(error.contains(field), "{error}");
+                assert!(error.contains("finite"), "{error}");
+            }
+        }
+
+        let guarded = Contract::parse(
+            br#"{
+                "timed_prompt_pool":[
+                    {"sha256":"a","noop_decode_speedup":1.0},
+                    {"sha256":"b","noop_decode_speedup":1.0},
+                    {"sha256":"c","noop_decode_speedup":1.0}
+                ],
+                "warmup_golden":{"sha256":"d","bytes":42},
+                "decode_golden_offset":1
+            }"#,
+        )
+        .unwrap();
+        let warmup = guarded.warmup_golden.unwrap();
+        assert_eq!(warmup.sha256, "d");
+        assert_eq!(warmup.bytes, Some(42));
+        assert_eq!(guarded.decode_golden_offset, Some(1));
+
+        for first_exposure in [
+            r#""warmup_golden":{"sha256":"d"}"#,
+            r#""decode_golden_offset":1"#,
+        ] {
+            let body = format!(
+                r#"{{"timed_prompt_pool":[{{"sha256":"a"}},{{"sha256":"b"}}],{first_exposure},"official_prefill_timed_runs":2}}"#
+            );
+            let error = Contract::parse(body.as_bytes()).unwrap_err();
+            assert!(error.starts_with("PROMPT-REUSE-REFUSED"), "{error}");
+            assert!(error.contains("exactly 1"), "{error}");
+        }
+
+        for offset in [0, 3] {
+            let body = format!(
+                r#"{{"timed_prompt_pool":[{{"sha256":"a"}},{{"sha256":"b"}},{{"sha256":"c"}}],"decode_golden_offset":{offset}}}"#
+            );
+            let error = Contract::parse(body.as_bytes()).unwrap_err();
+            assert!(error.contains("decode_golden_offset"), "{error}");
+        }
     }
 }
 
