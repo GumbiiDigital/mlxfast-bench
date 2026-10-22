@@ -93,6 +93,12 @@ pub struct ScoreMetrics {
     pub prefill_speedup: f64,
     pub decode_speedup_floor: f64,
     pub prefill_speedup_floor: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_speedup_ceiling: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_speedup_ceiling: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_window_includes_seed: Option<bool>,
     pub passed_decode_speedup_floor: bool,
     pub passed_prefill_speedup_floor: bool,
     pub benchmark_wall_seconds: f64,
@@ -330,12 +336,10 @@ pub struct ScoreMetrics {
     /// [`ScoreMetrics::decode_seconds_per_token`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_leg_decode_seconds_per_token: Option<f64>,
-    /// The DECODE WINDOW seconds per token of each role: the same value as
-    /// `*_leg_decode_seconds_per_token` (decode is the decode window,
-    /// `bench_core::score::decode_window_seconds_per_token`). THE BOARD READS THESE for its decode
-    /// tok/s readout. Absent when that role produced no timing. The candidate key is sealed on
-    /// every path that timed a leg, the local modes included; the baseline key only where a
-    /// control leg ran.
+    /// The raw DECODE WINDOW seconds per token of each role. It matches
+    /// `*_leg_decode_seconds_per_token` unless the paired fixture opts into charging the seed
+    /// window to the scored decode figure. THE BOARD READS THESE for its raw decode-window tok/s
+    /// readout. Absent when that role produced no timing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_leg_decode_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -417,14 +421,23 @@ pub struct PairedLegRecord {
     /// prompt. `default` lets this benchd read a score sealed before the key existed.
     #[serde(default)]
     pub prompt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_golden_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_golden_sha256: Option<String>,
     pub control_prefill_seconds_per_token: f64,
     pub control_decode_seconds_per_token: f64,
     pub candidate_prefill_seconds_per_token: f64,
     pub candidate_decode_seconds_per_token: f64,
-    /// The same legs' window SPLIT, per token. `*_decode_window_seconds_per_token` is the decode
-    /// window over N, the same value as `*_decode_seconds_per_token` above, which is what scores.
-    /// `*_seed_prefill_window_seconds_per_token` is the seed prefill over the seed length,
-    /// REPORT-ONLY, never part of any decode figure, and absent on a teacher-forced (v1) window.
+    /// Seed-window / timed-prefill ratios. They stay in the private audit because the public
+    /// numeric allowlist intentionally omits engine-influenced values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_seed_window_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_seed_window_ratio: Option<f64>,
+    /// The same legs' raw window SPLIT, per token. The scored `*_decode_seconds_per_token` above
+    /// can include both halves when the fixture opts in; these keys always keep the separate
+    /// decode and seed-prefill measurements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,6 +446,24 @@ pub struct PairedLegRecord {
     pub candidate_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_decode_window_seconds_per_token: Option<f64>,
+    /// The unmeasured warm-up timings for both legs. These engine-influenced values stay in the
+    /// private audit and never feed a score, floor, band, ceiling or guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_warmup_wall_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_warmup_prefill_seconds_per_token: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_warmup_decode_seconds_per_token: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_warmup_seed_prefill_window_seconds_per_token: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_warmup_wall_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_warmup_prefill_seconds_per_token: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_warmup_decode_seconds_per_token: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_warmup_seed_prefill_window_seconds_per_token: Option<f64>,
     /// The candidate leg's timed tokens (the seed token, then the decode tokens) that differ from
     /// the reference engine's choice for the same prefix. `0` when the tokens equal the golden's
     /// oracle. `null` only when the replay that counts them did not complete.
@@ -544,6 +575,9 @@ impl ScoreMetrics {
             prefill_speedup: self.prefill_speedup,
             decode_speedup_floor: self.decode_speedup_floor,
             prefill_speedup_floor: self.prefill_speedup_floor,
+            decode_speedup_ceiling: self.decode_speedup_ceiling,
+            prefill_speedup_ceiling: self.prefill_speedup_ceiling,
+            decode_window_includes_seed: self.decode_window_includes_seed,
             passed_decode_speedup_floor: self.passed_decode_speedup_floor,
             passed_prefill_speedup_floor: self.passed_prefill_speedup_floor,
             benchmark_wall_seconds: rounded_wall,
@@ -722,6 +756,14 @@ pub(crate) const EXACT_SEALED_KEYS: &[(&str, &str)] = &[
     (
         "metrics.prefill_speedup_floor",
         "The fixture pins the prefill floor.",
+    ),
+    (
+        "metrics.decode_speedup_ceiling",
+        "The fixture pins the decode ceiling.",
+    ),
+    (
+        "metrics.prefill_speedup_ceiling",
+        "The fixture pins the prefill ceiling.",
     ),
     (
         "metrics.gpqa_ttft_case_count",
@@ -1498,14 +1540,26 @@ mod tests {
             paired_legs: vec![PairedLegRecord {
                 pair: 1,
                 prompt_sha256: "cd".repeat(32),
+                prefill_golden_sha256: None,
+                decode_golden_sha256: None,
                 control_prefill_seconds_per_token: 0.1,
                 control_decode_seconds_per_token: 0.2,
                 candidate_prefill_seconds_per_token: 0.3,
                 candidate_decode_seconds_per_token: 0.4,
+                control_seed_window_ratio: None,
+                candidate_seed_window_ratio: None,
                 control_seed_prefill_window_seconds_per_token: None,
                 control_decode_window_seconds_per_token: None,
                 candidate_seed_prefill_window_seconds_per_token: None,
                 candidate_decode_window_seconds_per_token: None,
+                control_warmup_wall_seconds: None,
+                control_warmup_prefill_seconds_per_token: None,
+                control_warmup_decode_seconds_per_token: None,
+                control_warmup_seed_prefill_window_seconds_per_token: None,
+                candidate_warmup_wall_seconds: None,
+                candidate_warmup_prefill_seconds_per_token: None,
+                candidate_warmup_decode_seconds_per_token: None,
+                candidate_warmup_seed_prefill_window_seconds_per_token: None,
                 token_mismatch_count: Some(1_234),
                 token_mismatch_first_step: Some(77),
                 token_mismatch_near_tie_count: Some(1_234),
@@ -1650,6 +1704,21 @@ mod tests {
         assert_eq!(private["metrics"]["checked_steps"], 77);
         assert_eq!(private["metrics"]["spec_rounds"], 7_777);
         assert_eq!(private["metrics"]["spec_acceptance_rate"], 0.66);
+        let leg = &private["metrics"]["paired_legs"][0];
+        assert_eq!(leg["control_warmup_wall_seconds"], 1.25);
+        assert_eq!(leg["control_warmup_prefill_seconds_per_token"], 0.01);
+        assert_eq!(leg["control_warmup_decode_seconds_per_token"], 0.02);
+        assert_eq!(
+            leg["control_warmup_seed_prefill_window_seconds_per_token"],
+            0.03
+        );
+        assert_eq!(leg["candidate_warmup_wall_seconds"], 2.25);
+        assert_eq!(leg["candidate_warmup_prefill_seconds_per_token"], 0.04);
+        assert_eq!(leg["candidate_warmup_decode_seconds_per_token"], 0.05);
+        assert_eq!(
+            leg["candidate_warmup_seed_prefill_window_seconds_per_token"],
+            0.06
+        );
         assert_eq!(
             private["metrics"]["acceptance_lengths"],
             serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8])
@@ -1684,6 +1753,23 @@ mod tests {
         let Ok(mode) = std::env::var("BENCHD_PRIVATE_AUDIT_CHILD") else {
             return;
         };
+        let paired_leg = serde_json::from_value(serde_json::json!({
+            "pair": 1,
+            "prompt_sha256": "ab",
+            "control_prefill_seconds_per_token": 0.1,
+            "control_decode_seconds_per_token": 0.2,
+            "candidate_prefill_seconds_per_token": 0.3,
+            "candidate_decode_seconds_per_token": 0.4,
+            "control_warmup_wall_seconds": 1.25,
+            "control_warmup_prefill_seconds_per_token": 0.01,
+            "control_warmup_decode_seconds_per_token": 0.02,
+            "control_warmup_seed_prefill_window_seconds_per_token": 0.03,
+            "candidate_warmup_wall_seconds": 2.25,
+            "candidate_warmup_prefill_seconds_per_token": 0.04,
+            "candidate_warmup_decode_seconds_per_token": 0.05,
+            "candidate_warmup_seed_prefill_window_seconds_per_token": 0.06
+        }))
+        .unwrap();
         let payload = ScorePayload {
             score: Some(1.0),
             passed: false,
@@ -1692,12 +1778,25 @@ mod tests {
                 spec_rounds: Some(7_777),
                 spec_acceptance_rate: Some(0.66),
                 acceptance_lengths: (1..=8).collect(),
+                paired_legs: vec![paired_leg],
                 ..zero_metrics()
             },
         };
         let sealed = payload.to_sealed_json().unwrap();
         for planted in ["77", "7777", "0.66", "[1,2,3,4,5,6,7,8]"] {
             assert!(!sealed.contains(planted), "{sealed}");
+        }
+        for key in [
+            "control_warmup_wall_seconds",
+            "control_warmup_prefill_seconds_per_token",
+            "control_warmup_decode_seconds_per_token",
+            "control_warmup_seed_prefill_window_seconds_per_token",
+            "candidate_warmup_wall_seconds",
+            "candidate_warmup_prefill_seconds_per_token",
+            "candidate_warmup_decode_seconds_per_token",
+            "candidate_warmup_seed_prefill_window_seconds_per_token",
+        ] {
+            assert!(!sealed.contains(key), "{sealed}");
         }
         if mode == "unset" {
             let path = std::env::var_os("BENCHD_PRIVATE_AUDIT_EXPECTED_PATH").unwrap();
@@ -2199,14 +2298,26 @@ mod sealed_key_pin_tests {
         PairedLegRecord {
             pair: 1,
             prompt_sha256: "v140".to_string(),
+            prefill_golden_sha256: Some("v141".to_string()),
+            decode_golden_sha256: Some("v142".to_string()),
             control_prefill_seconds_per_token: 2.5,
             control_decode_seconds_per_token: 3.5,
             candidate_prefill_seconds_per_token: 4.5,
             candidate_decode_seconds_per_token: 5.5,
+            control_seed_window_ratio: Some(6.5),
+            candidate_seed_window_ratio: Some(7.5),
             control_seed_prefill_window_seconds_per_token: None,
             control_decode_window_seconds_per_token: None,
             candidate_seed_prefill_window_seconds_per_token: None,
             candidate_decode_window_seconds_per_token: None,
+            control_warmup_wall_seconds: Some(8.5),
+            control_warmup_prefill_seconds_per_token: Some(9.5),
+            control_warmup_decode_seconds_per_token: Some(10.5),
+            control_warmup_seed_prefill_window_seconds_per_token: Some(11.5),
+            candidate_warmup_wall_seconds: Some(12.5),
+            candidate_warmup_prefill_seconds_per_token: Some(13.5),
+            candidate_warmup_decode_seconds_per_token: Some(14.5),
+            candidate_warmup_seed_prefill_window_seconds_per_token: Some(15.5),
             token_mismatch_count: Some(141),
             token_mismatch_first_step: Some(143),
             token_mismatch_near_tie_count: Some(159),
@@ -2267,6 +2378,9 @@ mod sealed_key_pin_tests {
                 prefill_speedup: 8.5,
                 decode_speedup_floor: 9.5,
                 prefill_speedup_floor: 10.5,
+                decode_speedup_ceiling: Some(11.5),
+                prefill_speedup_ceiling: Some(12.5),
+                decode_window_includes_seed: Some(true),
                 passed_decode_speedup_floor: true,
                 passed_prefill_speedup_floor: true,
                 benchmark_wall_seconds: 13.5,
@@ -2469,6 +2583,44 @@ mod sealed_key_pin_tests {
         assert_no_non_allowed_plants(&sealed, "");
         assert_eq!(sealed["score"], 7_777.75);
         assert!(sealed["metrics"].get("acceptance_lengths").is_none());
+    }
+
+    #[test]
+    fn anticheat_constants_are_public_ratios_private_and_absence_adds_no_keys() {
+        let payload = fully_populated_payload();
+        let raw = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            raw["metrics"]["paired_legs"][0]["control_seed_window_ratio"],
+            6.5
+        );
+        assert_eq!(
+            raw["metrics"]["paired_legs"][0]["candidate_seed_window_ratio"],
+            7.5
+        );
+
+        let mut public = payload.to_public_unsealed_value().unwrap();
+        seal_public_value(&mut public);
+        assert_eq!(public["metrics"]["decode_speedup_ceiling"], 11.5);
+        assert_eq!(public["metrics"]["prefill_speedup_ceiling"], 12.5);
+        assert_eq!(public["metrics"]["decode_window_includes_seed"], true);
+        assert!(public["metrics"]["paired_legs"][0]
+            .get("control_seed_window_ratio")
+            .is_none());
+        assert!(public["metrics"]["paired_legs"][0]
+            .get("candidate_seed_window_ratio")
+            .is_none());
+
+        let absent = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: ScoreMetrics::default(),
+        };
+        let absent = serde_json::to_value(absent).unwrap();
+        assert!(absent["metrics"].get("decode_speedup_ceiling").is_none());
+        assert!(absent["metrics"].get("prefill_speedup_ceiling").is_none());
+        assert!(absent["metrics"]
+            .get("decode_window_includes_seed")
+            .is_none());
     }
 
     /// Pre-default-deny snapshot retained as migration history.

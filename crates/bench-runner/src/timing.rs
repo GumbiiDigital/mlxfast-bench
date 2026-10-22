@@ -44,6 +44,9 @@ pub struct TimingParams {
     /// Prompt fed to the single timed `prefill` (should be
     /// `BENCHMARK_PREFILL_PROMPT_TOKENS` long for an official run).
     pub prefill_prompt_tokens: Vec<i64>,
+    /// Optional prompt used only by the untimed prefill warm-up runs. `None` keeps the legacy
+    /// behaviour: warm-up and timed runs use `prefill_prompt_tokens`.
+    pub prefill_warmup_prompt_tokens: Option<Vec<i64>>,
     /// Golden oracle: the token the timed `prefill` must greedily produce
     /// (`BenchmarkGolden.expected_prefill_token`).
     ///
@@ -125,6 +128,7 @@ impl TimingParams {
     ) -> Self {
         Self {
             prefill_prompt_tokens,
+            prefill_warmup_prompt_tokens: None,
             expected_prefill_token: Some(expected_prefill_token),
             decode_seed_tokens,
             expected_decode_seed_token,
@@ -154,6 +158,7 @@ impl TimingParams {
     ) -> Self {
         Self {
             prefill_prompt_tokens: Vec::new(),
+            prefill_warmup_prompt_tokens: None,
             expected_prefill_token: None,
             decode_seed_tokens,
             expected_decode_seed_token,
@@ -176,6 +181,12 @@ impl TimingParams {
     /// Unmeasured prefill passes before the timed one(s), in the same session and phase.
     pub fn with_prefill_warmup_runs(mut self, runs: usize) -> Self {
         self.prefill_warmup_runs = runs;
+        self
+    }
+
+    /// Use a different prompt for the untimed prefill warm-up runs.
+    pub fn with_prefill_warmup_prompt_tokens(mut self, tokens: Option<Vec<i64>>) -> Self {
+        self.prefill_warmup_prompt_tokens = tokens;
         self
     }
 
@@ -988,7 +999,16 @@ fn measure_prefill<T: LineTransport>(
         // The worker holds submitted model code, so its reported prefill duration
         // is not trusted: the parent measures the full request/response wall time.
         let start = Instant::now();
-        let resp = session.prefill(&params.prefill_prompt_tokens)?;
+        let is_warmup = run_index < params.prefill_warmup_runs;
+        let prompt = if is_warmup {
+            params
+                .prefill_warmup_prompt_tokens
+                .as_deref()
+                .unwrap_or(&params.prefill_prompt_tokens)
+        } else {
+            &params.prefill_prompt_tokens
+        };
+        let resp = session.prefill(prompt)?;
         let elapsed = start.elapsed().as_secs_f64();
         let token = resp.token.ok_or_else(|| {
             RunnerError::Protocol("runtime worker prefill response missing token".to_string())
@@ -997,7 +1017,8 @@ fn measure_prefill<T: LineTransport>(
         // `comparePrefillToken` → `requireBenchmarkMatch`). An engine returning fast
         // garbage is rejected here instead of being credited with a prefill speedup.
         // TimeOnly tolerates the mismatch (correctness is judged separately upstream).
-        if verify != VerifyMode::TimeOnly && token != expected_prefill_token {
+        let alternate_warmup = is_warmup && params.prefill_warmup_prompt_tokens.is_some();
+        if !alternate_warmup && verify != VerifyMode::TimeOnly && token != expected_prefill_token {
             return Err(RunnerError::TokenMismatch {
                 label: "benchmark prefill token".to_string(),
                 step: run_index,
@@ -1769,6 +1790,35 @@ mod tests {
             }
             other => panic!("expected TokenMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn only_an_alternate_warmup_prompt_skips_the_prefill_token_check() {
+        let run = |alternate: bool| {
+            let engine = MockEngine::new().oracle_tokens(
+                PREFILL_TOKEN + 1,
+                SEED_TOKEN,
+                oracle_decode_tokens(8),
+            );
+            let (mut session, _) = Session::connect(engine).unwrap();
+            let mut p = params(8).with_prefill_warmup_runs(1);
+            if alternate {
+                p = p.with_prefill_warmup_prompt_tokens(Some(vec![9; 8]));
+            }
+            let mut peak = 0.0;
+            measure_prefill(&mut session, &p, VerifyMode::Verify, &mut peak).unwrap_err()
+        };
+
+        let old_prompt = run(false);
+        assert!(matches!(
+            old_prompt,
+            RunnerError::TokenMismatch { step: 0, .. }
+        ));
+        let alternate_prompt = run(true);
+        assert!(matches!(
+            alternate_prompt,
+            RunnerError::TokenMismatch { step: 1, .. }
+        ));
     }
 
     #[test]

@@ -102,11 +102,10 @@ pub fn validate_resident_socket(socket_path: &str) -> Result<(), OfficialSandbox
     Ok(())
 }
 
-/// Build the Seatbelt profile source that guards the official runtime worker. Byte-shape
-/// mirror of Swift `writeRuntimeWorkerSandboxProfile` (main.swift:1237-1256): a fixed rule
-/// preamble, then the golden deny-read rule, then (when `private_dir` is non-empty) the
-/// private-dir subpath deny-read rule, joined by `\n` with NO trailing newline (Swift
-/// multiline string literal ends on the interpolation).
+/// Build the Seatbelt profile source that guards the official runtime worker. This follows
+/// Swift `writeRuntimeWorkerSandboxProfile` (main.swift:1237-1256), then adds rules that
+/// block process-persistent IPC and preference writes. The golden deny-read rule and optional
+/// private-dir subpath deny-read rule follow. Lines are joined by `\n` with NO trailing newline.
 ///
 /// `resident_socket`, when present and non-empty, adds the single resident-socket
 /// `network-outbound` allowance documented at the top of this module, immediately after
@@ -156,6 +155,12 @@ pub fn build_seatbelt_profile(
             "(allow process-exec (literal \"{}\"))",
             seatbelt_escaped(engine_path)
         ),
+        "(deny ipc-posix-shm*)".to_string(),
+        "(deny ipc-sysv*)".to_string(),
+        "(deny ipc-posix-sem*)".to_string(),
+        "(deny user-preference-write)".to_string(),
+        "(deny mach-lookup)".to_string(),
+        "(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\"))".to_string(),
         "(deny file-write*)".to_string(),
         "(allow file-write* (literal \"/dev/null\"))".to_string(),
     ]);
@@ -435,10 +440,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_byte_shape_matches_swift() {
-        // Byte-shape parity with the Swift multiline literal: exact rule order, the
-        // engine literal, /dev/null write allowance, and the golden deny-read as the last
-        // line with NO trailing newline.
+    fn profile_byte_shape_adds_persistence_denies_to_swift_original() {
+        // Exact Swift rule order plus the M14 persistence block after the engine allowance.
+        // The golden deny-read remains the last line with NO trailing newline.
         let profile = build_seatbelt_profile("/opt/engine", "/private/golden.json", None, None);
         let expected = "(version 1)\n\
              (allow default)\n\
@@ -446,6 +450,12 @@ mod tests {
              (deny process-fork)\n\
              (deny process-exec*)\n\
              (allow process-exec (literal \"/opt/engine\"))\n\
+             (deny ipc-posix-shm*)\n\
+             (deny ipc-sysv*)\n\
+             (deny ipc-posix-sem*)\n\
+             (deny user-preference-write)\n\
+             (deny mach-lookup)\n\
+             (allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\"))\n\
              (deny file-write*)\n\
              (allow file-write* (literal \"/dev/null\"))\n\
              (deny file-read* (literal \"/private/golden.json\"))";
@@ -608,6 +618,12 @@ mod tests {
              (deny process-fork)\n\
              (deny process-exec*)\n\
              (allow process-exec (literal \"/opt/engine\"))\n\
+             (deny ipc-posix-shm*)\n\
+             (deny ipc-sysv*)\n\
+             (deny ipc-posix-sem*)\n\
+             (deny user-preference-write)\n\
+             (deny mach-lookup)\n\
+             (allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\"))\n\
              (deny file-write*)\n\
              (allow file-write* (literal \"/dev/null\"))\n\
              (deny file-read* (literal \"/private/golden.json\"))";
@@ -623,6 +639,30 @@ mod tests {
             build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), None),
             build_seatbelt_profile("/opt/e", "/g.json", Some("/private/dir"), Some(""))
         );
+    }
+
+    #[test]
+    fn profile_always_denies_process_persistent_state() {
+        let rules = [
+            "(deny ipc-posix-shm*)",
+            "(deny ipc-sysv*)",
+            "(deny ipc-posix-sem*)",
+            "(deny user-preference-write)",
+            "(deny mach-lookup)",
+            "(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\"))",
+        ];
+        for (private_dir, resident_socket) in [
+            (None, None),
+            (Some("/private/dir"), None),
+            (None, Some("/tmp/bw.sock")),
+            (Some("/private/dir"), Some("/tmp/bw.sock")),
+        ] {
+            let profile =
+                build_seatbelt_profile("/opt/engine", "/g.json", private_dir, resident_socket);
+            for rule in rules {
+                assert!(profile.lines().any(|line| line == rule), "missing {rule}");
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! Fixed constants, exactly like the cool gate's fixed temperature target:
 //! - 1-minute load average below [`LOAD_MAX`] (2.0),
 //! - GPU utilization below [`GPU_UTIL_MAX`] (0.10, a fraction),
-//! - one sample every [`POLL_SECONDS`] (15 s),
+//! - one sample every [`POLL_SECONDS`] (2 s),
 //! - give up after [`MAX_WAIT_SECONDS`] (900 s) with the [`QUIESCENCE_TIMEOUT`] refusal.
 //!
 //! Readers, resolved natively per host OS so no env var is required:
@@ -49,8 +49,8 @@ use crate::coolgate::{
 pub const LOAD_MAX: f64 = 2.0;
 /// The GPU utilization fraction the box must be BELOW before a timed window opens.
 pub const GPU_UTIL_MAX: f64 = 0.10;
-/// One sample every 15 s, the original step's `sleep 15`.
-const POLL_SECONDS: u64 = 15;
+/// One sample every 2 s.
+const POLL_SECONDS: u64 = 2;
 /// The original step's 900 s ceiling.
 const MAX_WAIT_SECONDS: u64 = 900;
 
@@ -116,8 +116,7 @@ where
 
 /// The pure poll loop: `read` yields one observation, `sleep` waits the given seconds. Returns
 /// `Err` with the [`QUIESCENCE_TIMEOUT`] refusal once the box has stayed busy for
-/// [`MAX_WAIT_SECONDS`]. Mirrors the original workflow step 1:1 — check, sleep 15, count, give up
-/// at 900 — with a dropped sample treated as busy.
+/// [`MAX_WAIT_SECONDS`]. Check, sleep 2, count, and give up at 900. A dropped sample is busy.
 ///
 /// `progress` is an observation-only callback `(waited, sample)` called on every sample, including
 /// the passing one, exactly as the cool gate's observer is.
@@ -647,7 +646,7 @@ mod tests {
 
     #[test]
     fn waits_then_passes_as_load_and_utilization_fall() {
-        // busy load -> busy gpu -> both at the edge (not below) -> idle: 3 polls of 15 s.
+        // busy load -> busy gpu -> both at the edge (not below) -> idle: 3 polls of 2 s.
         let slept = Rc::new(RefCell::new(0u64));
         let s = slept.clone();
         let r = quiesce_gate_loop(
@@ -662,12 +661,12 @@ mod tests {
         assert_eq!(
             r,
             Ok(QuiesceOutcome::Passed {
-                waited: 45,
+                waited: 6,
                 load: 0.8,
                 gpu_util: 0.02
             })
         );
-        assert_eq!(*slept.borrow(), 45);
+        assert_eq!(*slept.borrow(), 6);
     }
 
     #[test]
@@ -690,7 +689,7 @@ mod tests {
         assert_eq!(
             r,
             Ok(QuiesceOutcome::Passed {
-                waited: 30,
+                waited: 4,
                 load: 0.1,
                 gpu_util: 0.01
             })
@@ -733,7 +732,7 @@ mod tests {
             |waited, s| seen.push((waited, s)),
         );
         assert_eq!(result, quiesce_gate_loop(seq(samples.clone()), |_| {}));
-        assert_eq!(seen, vec![(0, samples[0]), (15, samples[1])]);
+        assert_eq!(seen, vec![(0, samples[0]), (2, samples[1])]);
     }
 
     #[test]
