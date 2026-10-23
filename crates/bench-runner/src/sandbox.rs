@@ -158,6 +158,10 @@ pub fn build_seatbelt_profile(
             "(allow process-exec (literal \"{}\"))",
             seatbelt_escaped(engine_path)
         ),
+        // The worker shares an OS account with trusted jobs, so deny signals to siblings
+        // while preserving signals that the worker sends to itself.
+        "(deny signal)".to_string(),
+        "(allow signal (target self))".to_string(),
         "(deny ipc-posix-shm*)".to_string(),
         "(deny ipc-sysv*)".to_string(),
         "(deny ipc-posix-sem*)".to_string(),
@@ -480,6 +484,8 @@ mod tests {
              (deny process-fork)\n\
              (deny process-exec*)\n\
              (allow process-exec (literal \"/opt/engine\"))\n\
+             (deny signal)\n\
+             (allow signal (target self))\n\
              (deny ipc-posix-shm*)\n\
              (deny ipc-sysv*)\n\
              (deny ipc-posix-sem*)\n\
@@ -494,6 +500,19 @@ mod tests {
             !profile.ends_with('\n'),
             "no trailing newline (Swift literal)"
         );
+    }
+
+    #[test]
+    fn profile_denies_signals_then_allows_self_signals() {
+        let profile = build_seatbelt_profile("/opt/engine", "/g.json", None, None, &[]);
+        let lines: Vec<&str> = profile.lines().collect();
+        let exec_allow = lines
+            .iter()
+            .position(|line| *line == "(allow process-exec (literal \"/opt/engine\"))")
+            .expect("engine exec allowance present");
+
+        assert_eq!(lines[exec_allow + 1], "(deny signal)");
+        assert_eq!(lines[exec_allow + 2], "(allow signal (target self))");
     }
 
     #[test]
@@ -672,6 +691,8 @@ mod tests {
              (deny process-fork)\n\
              (deny process-exec*)\n\
              (allow process-exec (literal \"/opt/engine\"))\n\
+             (deny signal)\n\
+             (allow signal (target self))\n\
              (deny ipc-posix-shm*)\n\
              (deny ipc-sysv*)\n\
              (deny ipc-posix-sem*)\n\

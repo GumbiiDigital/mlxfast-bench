@@ -7,11 +7,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// H3 (cycle-3) — the outcome of a deadline-bounded read ([`LineTransport::read_line_deadline`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +457,25 @@ fn read_line_capped<R: BufRead>(
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> io::Result<LineRead> {
+    read_line_capped_with_overflow(reader, buf, cap, true)
+}
+
+/// The stdout variant returns as soon as the cap is crossed because its caller ends the stream;
+/// draining a hostile newline-less line first would let the worker keep that thread busy forever.
+fn read_line_capped_fail_fast<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<LineRead> {
+    read_line_capped_with_overflow(reader, buf, cap, false)
+}
+
+fn read_line_capped_with_overflow<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+    discard_overflow: bool,
+) -> io::Result<LineRead> {
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
@@ -473,8 +495,10 @@ fn read_line_capped<R: BufRead>(
             }
             // Newline exists but only past the cap → overflow.
             Some(_) => {
-                reader.consume(room);
-                discard_to_newline(reader)?;
+                if discard_overflow {
+                    reader.consume(room);
+                    discard_to_newline(reader)?;
+                }
                 return Ok(LineRead::Exceeded);
             }
             // No newline in this chunk.
@@ -486,8 +510,10 @@ fn read_line_capped<R: BufRead>(
             }
             // No newline and this chunk alone reaches the cap → overflow.
             None => {
-                reader.consume(room);
-                discard_to_newline(reader)?;
+                if discard_overflow {
+                    reader.consume(room);
+                    discard_to_newline(reader)?;
+                }
                 return Ok(LineRead::Exceeded);
             }
         }
@@ -601,6 +627,99 @@ fn forward_and_retain(redacted: &str, tail: &Arc<Mutex<StderrTail>>, forward: bo
     }
 }
 
+/// The ranked protocol's largest response is the trusted top-1 cohort replay: 8 streams x 128
+/// positions is under 128 KiB even with widest integer values. Keep more than 16x headroom for
+/// envelope growth while still putting a hard bound on one worker-controlled allocation.
+const WORKER_STDOUT_LINE_BYTE_LIMIT: usize = 2 * 1024 * 1024;
+/// Backpressure keeps a fast worker from turning many valid lines into an unbounded benchd queue.
+const WORKER_STDOUT_CHANNEL_CAPACITY: usize = 8;
+
+fn open_inheritable_fds() -> io::Result<Vec<i32>> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CStr;
+
+        struct OpenDir(*mut libc::DIR);
+
+        impl Drop for OpenDir {
+            fn drop(&mut self) {
+                // A failed opendir leaves NULL; Apple's closedir dereferences it, so skip it.
+                if !self.0.is_null() {
+                    // SAFETY: this guard owns the successful opendir result.
+                    unsafe { libc::closedir(self.0) };
+                }
+            }
+        }
+
+        // SAFETY: the path is a static NUL-terminated C string.
+        let directory = OpenDir(unsafe { libc::opendir(c"/dev/fd".as_ptr()) });
+        if directory.0.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: directory holds a valid DIR pointer.
+        let listing_fd = unsafe { libc::dirfd(directory.0) };
+        if listing_fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut fds = Vec::new();
+        loop {
+            // SAFETY: directory remains open for this loop. A null pointer marks end of listing.
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: readdir returns a dirent with a NUL-terminated d_name.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let Ok(name) = name.to_str() else {
+                continue;
+            };
+            let Ok(fd) = name.parse::<i32>() else {
+                continue;
+            };
+            if fd < 3 || fd == listing_fd {
+                continue;
+            }
+            // SAFETY: F_GETFD only reads flags for this descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EBADF) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if flags & libc::FD_CLOEXEC == 0 {
+                fds.push(fd);
+            }
+        }
+        Ok(fds)
+    }
+
+    #[cfg(not(unix))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "official sandbox fd closing requires Unix",
+    ))
+}
+
+fn close_inherited_fds_before_exec(command: &mut Command, fds: Vec<i32>) {
+    #[cfg(unix)]
+    // SAFETY: the parent built this fixed list before spawn. The closure only iterates it and calls
+    // close, which is async-signal-safe. CLOEXEC descriptors are absent, including Rust's spawn
+    // error pipe.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &fds {
+                libc::close(*fd);
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(not(unix))]
+    let _ = (command, fds);
+}
+
 /// Spawns an engine binary and speaks NDJSON over its stdio, matching the Swift
 /// `RuntimeWorkerClient` invocation: `<exe> runtime-worker --weights <path> [extra...]`.
 ///
@@ -632,25 +751,25 @@ pub struct ChildStdioTransport {
 /// newline stripped) over `tx`. Exits on EOF or the first read error (dropping `tx` → the channel
 /// disconnects, which the transport reads as end-of-stream, fail-closed). Also exits when the
 /// receiver is gone (the transport was dropped).
-fn stdout_reader_to_eof(stdout: ChildStdout, tx: mpsc::Sender<String>) {
+fn stdout_reader_to_eof<R: io::Read>(stdout: R, tx: SyncSender<String>) {
     let mut reader = BufReader::new(stdout);
-    // One read buffer for the whole stream. `read_line` APPENDS, so clearing it per iteration
-    // reuses the capacity the longest line so far earned instead of regrowing a fresh `String`
-    // (several reallocations on a long line) for every line of the session.
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_line(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                while buf.ends_with('\n') || buf.ends_with('\r') {
+        match read_line_capped_fail_fast(&mut reader, &mut buf, WORKER_STDOUT_LINE_BYTE_LIMIT) {
+            Ok(LineRead::Eof) => break,
+            Ok(LineRead::Line) => {
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
                     buf.pop();
                 }
-                // One exact-size allocation for the sent line; `buf` keeps its capacity.
-                if tx.send(buf.clone()).is_err() {
+                let Ok(line) = String::from_utf8(buf.clone()) else {
+                    break; // invalid UTF-8 is a read failure, as with BufRead::read_line
+                };
+                if tx.send(line).is_err() {
                     break; // receiver (transport) dropped
                 }
             }
+            Ok(LineRead::Exceeded) => break, // overlong protocol line: fail closed
             Err(_) => break, // read error → treat as end-of-stream (fail-closed upstream)
         }
     }
@@ -711,12 +830,14 @@ impl ChildStdioTransport {
             weights_path,
             extra_args,
         );
-        Self::spawn_command_with_overrides(
+        let inherited_fds = open_inheritable_fds()?;
+        Self::spawn_command_with_overrides_and_inherited_fds(
             &program,
             &args,
             current_process_env(),
             extra_env,
             plan.forward_worker_stderr,
+            Some(inherited_fds),
         )
     }
 
@@ -838,6 +959,29 @@ impl ChildStdioTransport {
         K: Into<String>,
         V: Into<String>,
     {
+        Self::spawn_command_with_overrides_and_inherited_fds(
+            program,
+            args,
+            parent_env,
+            extra_env,
+            forward_worker_stderr,
+            None,
+        )
+    }
+
+    fn spawn_command_with_overrides_and_inherited_fds<I, K, V>(
+        program: &str,
+        args: &[String],
+        parent_env: I,
+        extra_env: &[(String, String)],
+        forward_worker_stderr: bool,
+        inherited_fds: Option<Vec<i32>>,
+    ) -> std::io::Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
         let mut sanitized = sanitized_engine_env(parent_env);
         for (key, value) in extra_env {
             sanitized.insert(key.clone(), value.clone());
@@ -846,7 +990,8 @@ impl ChildStdioTransport {
             ENGINE_ENV_FORCED_KEY.to_string(),
             ENGINE_ENV_FORCED_VALUE.to_string(),
         );
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             // Build the child env FROM EMPTY, then apply only the allowlisted
             // names — the parent env is never inherited.
@@ -854,8 +999,11 @@ impl ChildStdioTransport {
             .envs(&sanitized)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(fds) = inherited_fds {
+            close_inherited_fds_before_exec(&mut command, fds);
+        }
+        let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -875,7 +1023,7 @@ impl ChildStdioTransport {
             )
         })?;
         // H3 (cycle-3) — spawn the stdout reader thread delivering lines over a channel.
-        let (tx, stdout_rx) = mpsc::channel::<String>();
+        let (tx, stdout_rx) = mpsc::sync_channel::<String>(WORKER_STDOUT_CHANNEL_CAPACITY);
         let stdout_reader = std::thread::Builder::new()
             .name("mlxfast.worker-stdout-reader".to_string())
             .spawn(move || stdout_reader_to_eof(stdout, tx))
@@ -1384,6 +1532,108 @@ mod tests {
             read_line_capped(&mut reader, &mut buf, WORKER_STDERR_LINE_BYTE_LIMIT).unwrap(),
             LineRead::Eof
         ));
+    }
+
+    #[test]
+    fn stdout_reader_passes_normal_lines() {
+        use std::io::Cursor;
+
+        let (tx, rx) = mpsc::sync_channel(WORKER_STDOUT_CHANNEL_CAPACITY);
+        stdout_reader_to_eof(Cursor::new(b"first\nsecond\r\n"), tx);
+
+        assert_eq!(rx.recv().unwrap(), "first");
+        assert_eq!(rx.recv().unwrap(), "second");
+        assert!(rx.recv().is_err(), "EOF must disconnect the channel");
+    }
+
+    #[test]
+    fn overlong_stdout_line_ends_stream_without_buffering_the_remainder() {
+        use std::io::Cursor;
+
+        let mut data = vec![b'x'; WORKER_STDOUT_LINE_BYTE_LIMIT + 1];
+        data.extend_from_slice(b"\nthis-must-not-pass\n");
+        let (tx, rx) = mpsc::sync_channel(WORKER_STDOUT_CHANNEL_CAPACITY);
+
+        stdout_reader_to_eof(Cursor::new(data), tx);
+
+        assert!(
+            rx.recv().is_err(),
+            "an overlong line must end the stream, not truncate or resume"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_child_closes_fd_above_lowered_soft_limit() {
+        use std::fs::File;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const CHILD_MODE: &str = "BENCH_RUNNER_HIGH_FD_TEST_CHILD";
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let output = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("official_child_closes_fd_above_lowered_soft_limit")
+                .arg("--nocapture")
+                .env(CHILD_MODE, "1")
+                .output()
+                .expect("spawn isolated fd test");
+            assert!(
+                output.status.success(),
+                "isolated fd test failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let source = File::open("/dev/null").expect("open probe fd");
+        let raw = 200;
+        // SAFETY: dup2 creates or replaces descriptor 200.
+        assert_eq!(unsafe { libc::dup2(source.as_raw_fd(), raw) }, raw);
+        // SAFETY: descriptor 200 is now owned by this test process.
+        let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
+        let flags = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, 0, "probe fd must be inheritable");
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: these calls read and then lower this isolated process's descriptor soft limit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(
+            limit.rlim_cur > 200,
+            "test needs fd 200 below the initial limit"
+        );
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let mut child = Command::new("/bin/sh");
+        child.args([
+            "-c",
+            &format!(
+                "if [ -e /dev/fd/{} ]; then exit 9; fi",
+                inherited.as_raw_fd()
+            ),
+        ]);
+        let fds = open_inheritable_fds().expect("list inheritable fds");
+        assert!(fds.contains(&raw), "fd {raw} was not listed");
+        close_inherited_fds_before_exec(&mut child, fds);
+
+        let status = child.status().expect("spawn fd probe");
+        assert!(status.success(), "official child inherited fd {raw}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_child_exec_failure_reaches_parent() {
+        let mut command = Command::new("/path/that/does/not/exist/bench-runner-worker");
+        let fds = open_inheritable_fds().expect("list inheritable fds");
+        close_inherited_fds_before_exec(&mut command, fds);
+
+        let error = command.spawn().expect_err("exec must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
     }
 
     // ------------------------------------------------------------------
