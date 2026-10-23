@@ -5934,6 +5934,27 @@ fn worker_evaluator_paths(
         paths.push(path);
     }
 
+    if let Some(home) = nonempty_env_path(env, "HOME") {
+        // Runner registration grants control of trusted jobs, so hide every sibling runner owned
+        // by this account. A stale or unreadable HOME entry must not stop profile construction.
+        if let Ok(entries) = std::fs::read_dir(home) {
+            for entry in entries.filter_map(Result::ok) {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("actions-runner")
+                    && std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+                {
+                    paths.extend(
+                        RUNNER_REGISTRATION_FILES
+                            .iter()
+                            .map(|name| entry.path().join(name)),
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(workspace) = nonempty_env_path(env, "RUNNER_WORKSPACE") {
         if let Some(root) = workspace.parent().and_then(Path::parent) {
             paths.extend(RUNNER_REGISTRATION_FILES.iter().map(|name| root.join(name)));
@@ -8675,6 +8696,103 @@ mod tests {
             .to_string();
         assert!(paths.contains(&expected), "{paths:?}");
         assert!(!paths.iter().any(|path| path == "/.credentials"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_runner_under_home_has_its_registration_files_denied() {
+        let home = std::env::temp_dir().join(format!(
+            "benchd-runner-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runners = ["actions-runner", "actions-runner-a", "actions-runner-b"];
+        for runner in runners {
+            let root = home.join(runner);
+            std::fs::create_dir_all(&root).unwrap();
+            for name in RUNNER_REGISTRATION_FILES {
+                std::fs::write(root.join(name), b"registration").unwrap();
+            }
+        }
+        let unrelated = home.join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        for name in RUNNER_REGISTRATION_FILES {
+            std::fs::write(unrelated.join(name), b"not a runner").unwrap();
+        }
+
+        let env = [("HOME", home.as_os_str())]
+            .into_iter()
+            .map(|(key, value)| (std::ffi::OsString::from(key), value.to_os_string()))
+            .collect();
+        let paths = worker_evaluator_paths(
+            &env,
+            Path::new("/candidate"),
+            Path::new("/candidate/engine"),
+            WorkerLegRole::Candidate,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        for runner in runners {
+            for name in RUNNER_REGISTRATION_FILES {
+                let expected = resolved_worker_path(&home.join(runner).join(name))
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                assert!(paths.contains(&expected), "missing {expected}");
+            }
+        }
+        assert!(RUNNER_REGISTRATION_FILES.iter().all(|name| {
+            let path = resolved_worker_path(&unrelated.join(name))
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            !paths.contains(&path)
+        }));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runner_under_home_has_its_registration_files_denied() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "benchd-symlinked-runner-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let home = root.join("home");
+        let target = root.join("runner-target");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        for name in RUNNER_REGISTRATION_FILES {
+            std::fs::write(target.join(name), b"registration").unwrap();
+        }
+        symlink(&target, home.join("actions-runner-x")).unwrap();
+
+        let env = [("HOME", home.as_os_str())]
+            .into_iter()
+            .map(|(key, value)| (std::ffi::OsString::from(key), value.to_os_string()))
+            .collect();
+        let paths = worker_evaluator_paths(
+            &env,
+            Path::new("/candidate"),
+            Path::new("/candidate/engine"),
+            WorkerLegRole::Candidate,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        for name in RUNNER_REGISTRATION_FILES {
+            let expected = resolved_worker_path(&target.join(name))
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert!(paths.contains(&expected), "missing {expected}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

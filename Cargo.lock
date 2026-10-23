@@ -33,6 +33,7 @@ version = "0.0.0"
 dependencies = [
  "bench-core",
  "bench-protocol",
+ "libc",
  "serde_json",
 ]
 
