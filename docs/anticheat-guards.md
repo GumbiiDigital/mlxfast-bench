@@ -43,6 +43,7 @@ The runtime-worker Seatbelt profile also denies POSIX shared memory, System V IP
 semaphores, preference writes, and Mach lookups. It allows only the five Mach services required by
 MLX: `com.apple.MTLCompilerService`, the two OpenDirectory services, `com.apple.logd`, and
 `com.apple.diagnosticd`. These rules stop one worker from leaving state for a later worker.
+It also denies signals to other processes and scheduling changes.
 
 Public engine identity digest keys keep their existing names, but their values are now
 the fixed `engine-value-withheld` marker. This applies to `head_provenance_sha256` and

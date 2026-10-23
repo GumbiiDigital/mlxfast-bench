@@ -158,10 +158,11 @@ pub fn build_seatbelt_profile(
             "(allow process-exec (literal \"{}\"))",
             seatbelt_escaped(engine_path)
         ),
-        // The worker shares an OS account with trusted jobs, so deny signals to siblings
-        // while preserving signals that the worker sends to itself.
+        // The worker shares an OS account with trusted jobs, so deny signals to siblings,
+        // preserve self-signals, and deny scheduling changes.
         "(deny signal)".to_string(),
         "(allow signal (target self))".to_string(),
+        "(deny system-sched)".to_string(),
         "(deny ipc-posix-shm*)".to_string(),
         "(deny ipc-sysv*)".to_string(),
         "(deny ipc-posix-sem*)".to_string(),
@@ -486,6 +487,7 @@ mod tests {
              (allow process-exec (literal \"/opt/engine\"))\n\
              (deny signal)\n\
              (allow signal (target self))\n\
+             (deny system-sched)\n\
              (deny ipc-posix-shm*)\n\
              (deny ipc-sysv*)\n\
              (deny ipc-posix-sem*)\n\
@@ -503,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_denies_signals_then_allows_self_signals() {
+    fn profile_denies_signals_allows_self_and_denies_scheduling() {
         let profile = build_seatbelt_profile("/opt/engine", "/g.json", None, None, &[]);
         let lines: Vec<&str> = profile.lines().collect();
         let exec_allow = lines
@@ -513,6 +515,8 @@ mod tests {
 
         assert_eq!(lines[exec_allow + 1], "(deny signal)");
         assert_eq!(lines[exec_allow + 2], "(allow signal (target self))");
+        assert_eq!(lines[exec_allow + 3], "(deny system-sched)");
+        assert!(profile.lines().any(|line| line == "(deny system-sched)"));
     }
 
     #[test]
@@ -693,6 +697,7 @@ mod tests {
              (allow process-exec (literal \"/opt/engine\"))\n\
              (deny signal)\n\
              (allow signal (target self))\n\
+             (deny system-sched)\n\
              (deny ipc-posix-shm*)\n\
              (deny ipc-sysv*)\n\
              (deny ipc-posix-sem*)\n\
