@@ -4881,8 +4881,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("engine reported failure on \"correctness_step\": engine-text-sha256=")
-                && payload.metrics.error.contains("engine-text-bytes=15")
+                .contains("engine reported failure on \"correctness_step\": engine-text-withheld")
                 && !payload.metrics.error.contains("engine exploded"),
             "site :431 signature — reached a different exit: {:?}",
             payload.metrics.error
@@ -5298,8 +5297,7 @@ mod tests {
             payload
                 .metrics
                 .error
-                .contains("engine reported failure on \"free_decode_run\": engine-text-sha256=")
-                && payload.metrics.error.contains("engine-text-bytes=24")
+                .contains("engine reported failure on \"free_decode_run\": engine-text-withheld")
                 && !payload.metrics.error.contains("PLANTED")
                 && !payload.metrics.error.contains("4242"),
             "site :619 signature — reached a different exit: {:?}",

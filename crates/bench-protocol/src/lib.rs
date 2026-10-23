@@ -761,7 +761,7 @@ pub struct WorkerResponse {
     /// v1.2 (additive, COHORT): a histogram of the engine's depth-clamp reasons over the window
     /// (e.g. `automatic_rectangular_limit`, `tail_depth`, `batch_gate`, `step_kv_headroom`,
     /// `rectangular_cache_unsupported`). AUDIT-only and never scored. Safe snake-case keys seal
-    /// verbatim; other keys seal as engine-text hashes.
+    /// verbatim; other keys use a fixed engine-text-withheld marker.
     ///
     /// This is what makes "did it actually speculate?" a checkable question rather than a trusted
     /// claim: a cohort that reports zero draft rounds under a clamp reason is a legitimate engine

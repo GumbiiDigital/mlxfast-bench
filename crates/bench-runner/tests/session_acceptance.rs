@@ -364,8 +364,14 @@ fn counter_resets_across_phases() {
 fn hello_rejects_missing_protocol_version() {
     let engine = MockEngine::new().with_hello_protocol_version(None);
     match Session::connect(engine) {
-        Err(RunnerError::Protocol(msg)) => assert!(msg.contains("protocol_version")),
-        Err(other) => panic!("expected Protocol(protocol_version), got {other:?}"),
+        Err(RunnerError::ProtocolEngineText {
+            detail,
+            engine_text,
+        }) => {
+            assert_eq!(detail, "hello protocol version mismatch");
+            assert!(engine_text.contains("protocol_version None"));
+        }
+        Err(other) => panic!("expected sealed protocol version error, got {other:?}"),
         Ok(_) => panic!("expected rejection, got Ok"),
     }
 }
@@ -374,8 +380,14 @@ fn hello_rejects_missing_protocol_version() {
 fn hello_rejects_wrong_protocol_version() {
     let engine = MockEngine::new().with_hello_protocol_version(Some(2));
     match Session::connect(engine) {
-        Err(RunnerError::Protocol(msg)) => assert!(msg.contains("protocol_version")),
-        Err(other) => panic!("expected Protocol(protocol_version), got {other:?}"),
+        Err(RunnerError::ProtocolEngineText {
+            detail,
+            engine_text,
+        }) => {
+            assert_eq!(detail, "hello protocol version mismatch");
+            assert!(engine_text.contains("protocol_version Some(2)"));
+        }
+        Err(other) => panic!("expected sealed protocol version error, got {other:?}"),
         Ok(_) => panic!("expected rejection, got Ok"),
     }
 }
@@ -434,8 +446,14 @@ fn correctness_step_rejects_wrong_top_logits_length() {
     session.begin_phase();
     session.correctness_begin(&[1, 2, 3]).unwrap();
     match session.correctness_step(11) {
-        Err(RunnerError::Protocol(msg)) => assert!(msg.contains("top_logits")),
-        other => panic!("expected Protocol(top_logits), got {other:?}"),
+        Err(RunnerError::ProtocolEngineText {
+            detail,
+            engine_text,
+        }) => {
+            assert_eq!(detail, "top-logit count mismatch");
+            assert!(engine_text.contains("expected 8 top_logits, got 7"));
+        }
+        other => panic!("expected sealed top-logit count error, got {other:?}"),
     }
     assert!(session.is_discarded());
 }

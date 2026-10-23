@@ -113,10 +113,10 @@ fn seal_official_per_prompt(
 /// `head_provenance_sha256` is MIRRORED onto each `per_prompt` entry, which is where the board reads
 /// it; the entries are already sealed by then, so this fills them in place.
 ///
-/// Engine identity values are logged only as stable text seals; full scrubbed values go to the
+/// Engine identity values are logged only as fixed withheld markers; full scrubbed values go to the
 /// private audit when configured.
-/// Engine-supplied digest values are hashed again before publication; their raw values stay only
-/// in the private audit.
+/// Engine-supplied digest values use a fixed public marker; their raw values stay only in the
+/// private audit.
 /// Resident numbers are log-only; the in-window resident comparison still refuses a change.
 pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
     let seal_text = |field: &str, value: &str| {
@@ -4390,7 +4390,7 @@ mod tests {
             payload.metrics.error
         );
         assert!(
-            payload.metrics.error.contains("engine-text-sha256="),
+            payload.metrics.error.contains("engine-text-withheld"),
             "{}",
             payload.metrics.error
         );
@@ -5313,7 +5313,7 @@ mod tests {
         });
 
         let json = payload.to_sealed_json().unwrap();
-        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(json.contains("engine-text-withheld"), "{json}");
         assert!(!json.contains("PLANTED"), "{json}");
     }
 
@@ -5412,7 +5412,7 @@ mod tests {
         );
         assert_eq!(
             payload.metrics.spec_verification_mode.as_deref(),
-            Some("rectangular")
+            Some("engine-text-withheld")
         );
         assert_eq!(
             payload.metrics.spec_rectangular_verification_rounds,
@@ -5421,7 +5421,10 @@ mod tests {
         assert_eq!(payload.metrics.spec_serial_verification_rounds, Some(0));
         let v: serde_json::Value =
             serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
-        assert_eq!(v["metrics"]["spec_verification_mode"], "rectangular");
+        assert_eq!(
+            v["metrics"]["spec_verification_mode"],
+            "engine-text-withheld"
+        );
         assert!(v["metrics"]
             .get("spec_rectangular_verification_rounds")
             .is_none());
@@ -5461,7 +5464,7 @@ mod tests {
             |_phase: &str| Ok(()),
         );
         let json = payload.to_sealed_json().unwrap();
-        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(json.contains("engine-text-withheld"), "{json}");
         assert!(!json.contains("PLANTED"), "{json}");
     }
 
@@ -5503,13 +5506,9 @@ mod tests {
             Some(33),
         );
         assert!(!payload.passed);
-        assert!(
-            payload
-                .metrics
-                .error
-                .contains("verify_replay_disagreements 33"),
-            "expected the named disagreement refusal, got: {}",
-            payload.metrics.error
+        assert_eq!(
+            payload.metrics.error,
+            "official warmup leg failed: free-run decode consistency failure"
         );
         assert_eq!(payload.metrics.spec_verify_replay_disagreements, None);
 
@@ -5525,7 +5524,7 @@ mod tests {
         assert_eq!(ok.metrics.spec_verify_replay_disagreements, Some(32));
     }
 
-    /// The ENGINE IDENTITY seal hashes free text and mirrors a valid head digest onto the
+    /// The ENGINE IDENTITY seal withholds free text and mirrors a valid head digest onto the
     /// per-prompt entry the board reads.
     #[test]
     fn engine_identity_seal_records_the_hello_and_mirrors_the_head_digest() {
@@ -5550,17 +5549,17 @@ mod tests {
             resident: None,
         };
         seal_engine_identity(&mut metrics, &hello);
-        let public_head = bench_core::hash::sha256_hex("ab".repeat(32).as_bytes());
+        let public_head = crate::measure_job::ENGINE_VALUE_WITHHELD.to_string();
         assert!(metrics
             .engine_backend
             .as_deref()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert!(metrics
             .engine_device
             .as_deref()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert_eq!(metrics.engine_protocol_version, Some(1));
         assert_eq!(metrics.head_provenance_sha256, Some(public_head.clone()));
         assert_eq!(
@@ -5662,17 +5661,17 @@ mod tests {
         }
         .to_sealed_json()
         .unwrap();
-        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(json.contains("engine-text-withheld"), "{json}");
         assert!(!json.contains("PLANTED"), "{json}");
         assert!(!json.contains("4242"), "{json}");
         assert!(!json.contains("4243"), "{json}");
     }
 
-    /// Runner free text is sealed, valid digests stay readable, and resident numbers stay log-only.
+    /// Runner free text and engine-supplied digests are withheld; resident numbers stay log-only.
     #[test]
     fn runner_identity_digest_and_resident_numbers_have_safe_serialized_forms() {
         let mut metrics = ScoreMetrics::default();
-        let public_manifest = bench_core::hash::sha256_hex("ab".repeat(32).as_bytes());
+        let public_manifest = crate::measure_job::ENGINE_VALUE_WITHHELD.to_string();
         seal_engine_identity(
             &mut metrics,
             &bench_runner::Hello {
@@ -5700,12 +5699,12 @@ mod tests {
             .runner_id
             .as_deref()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert!(metrics
             .runner_model_type
             .as_deref()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert_eq!(
             metrics.runner_manifest_sha256,
             Some(public_manifest.clone())
@@ -5714,7 +5713,7 @@ mod tests {
             .runner_build
             .as_deref()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert_eq!(metrics.resident_pid, None);
         assert_eq!(metrics.resident_load_epoch, None);
 
@@ -5732,17 +5731,17 @@ mod tests {
         assert!(obj["runner_id"]
             .as_str()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert!(obj["runner_model_type"]
             .as_str()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert_eq!(obj["runner_manifest_sha256"], public_manifest);
         assert_ne!(obj["runner_manifest_sha256"], "ab".repeat(32));
         assert!(obj["runner_build"]
             .as_str()
             .unwrap()
-            .starts_with("engine-text-sha256="));
+            .starts_with("engine-text-withheld"));
         assert!(!obj.contains_key("resident_pid"));
         assert!(!obj.contains_key("resident_load_epoch"));
         let back: ScorePayload = serde_json::from_str(&json).unwrap();

@@ -165,10 +165,10 @@ impl<T: LineTransport> Session<T> {
         // The hello handshake is untimed (no RunTimeout deadline armed yet).
         let resp = read_response_line(&mut transport, None, "hello")?;
         if resp.id != 0 {
-            return Err(RunnerError::Protocol(format!(
-                "hello had id {}, expected 0",
-                resp.id
-            )));
+            return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                detail: "hello response id mismatch".to_string(),
+                engine_text: format!("hello had id {}, expected 0", resp.id),
+            }));
         }
         if !resp.ok {
             return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
@@ -191,10 +191,13 @@ impl<T: LineTransport> Session<T> {
         // The hello is the only place the version is meaningful; refuse to drive an
         // engine we cannot guarantee wire-compatibility with.
         if resp.protocol_version != Some(PROTOCOL_VERSION) {
-            return Err(RunnerError::Protocol(format!(
-                "hello protocol_version {:?} does not match supported {}",
-                resp.protocol_version, PROTOCOL_VERSION
-            )));
+            return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                detail: "hello protocol version mismatch".to_string(),
+                engine_text: format!(
+                    "hello protocol_version {:?} does not match supported {}",
+                    resp.protocol_version, PROTOCOL_VERSION
+                ),
+            }));
         }
         let capabilities = resp.capabilities.unwrap_or_default();
         let spec_modes = resp.spec_modes.unwrap_or_default();
@@ -309,10 +312,10 @@ impl<T: LineTransport> Session<T> {
         }
         // 2. id echo
         if resp.id != id {
-            return Err(RunnerError::Protocol(format!(
-                "response id {} did not match request id {id}",
-                resp.id
-            )));
+            return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                detail: "response id mismatch".to_string(),
+                engine_text: format!("response id {} did not match request id {id}", resp.id),
+            }));
         }
         // 3. ok
         if !resp.ok {
@@ -542,10 +545,10 @@ impl<T: LineTransport> Session<T> {
             return Ok(());
         }
         self.discarded = true;
-        Err(RunnerError::BatchEchoDivergence {
+        Err(log_engine_text_error(RunnerError::BatchEchoDivergence {
             requested,
             effective: resp.effective_batch_size,
-        })
+        }))
     }
 
     /// `free_decode_begin` in its v1.2 COHORT form: B seed forwards, one per cohort slot in SLOT
@@ -597,10 +600,10 @@ impl<T: LineTransport> Session<T> {
         if let Some(echoed) = resp.effective_batch_size {
             if echoed != batch_size {
                 self.discarded = true;
-                return Err(RunnerError::BatchEchoDivergence {
+                return Err(log_engine_text_error(RunnerError::BatchEchoDivergence {
                     requested: batch_size,
                     effective: Some(echoed),
-                });
+                }));
             }
         }
         Ok(resp)
@@ -700,9 +703,10 @@ impl<T: LineTransport> Session<T> {
         let n = resp.top_logits.as_ref().map(|v| v.len()).unwrap_or(0);
         if n != TOP_LOGITS_K {
             self.discarded = true;
-            return Err(RunnerError::Protocol(format!(
-                "expected {TOP_LOGITS_K} top_logits, got {n}"
-            )));
+            return Err(log_engine_text_error(RunnerError::ProtocolEngineText {
+                detail: "top-logit count mismatch".to_string(),
+                engine_text: format!("expected {TOP_LOGITS_K} top_logits, got {n}"),
+            }));
         }
         Ok(())
     }
@@ -739,7 +743,9 @@ impl<T: LineTransport> Session<T> {
         if let Some(reported) = resp.cache_memory {
             if reported != 0 {
                 self.discarded = true;
-                return Err(RunnerError::AllocatorCacheNotDrained { reported });
+                return Err(log_engine_text_error(
+                    RunnerError::AllocatorCacheNotDrained { reported },
+                ));
             }
         }
         match resp.completed_work {
@@ -754,10 +760,10 @@ impl<T: LineTransport> Session<T> {
             }
             other => {
                 self.discarded = true;
-                Err(RunnerError::CompletedWorkMismatch {
+                Err(log_engine_text_error(RunnerError::CompletedWorkMismatch {
                     issued: self.issued_steps,
                     reported: other,
-                })
+                }))
             }
         }
     }
@@ -775,16 +781,18 @@ impl<T: LineTransport> Session<T> {
         if let Some(reported) = diag.cache_memory {
             if reported != 0 {
                 self.discarded = true;
-                return Err(RunnerError::AllocatorCacheNotDrained { reported });
+                return Err(log_engine_text_error(
+                    RunnerError::AllocatorCacheNotDrained { reported },
+                ));
             }
         }
         let completed_work = match diag.completed_work {
             Some(cw) => cw,
             None => {
                 self.discarded = true;
-                return Err(RunnerError::FreeRunConsistency {
+                return Err(log_engine_text_error(RunnerError::FreeRunConsistency {
                     detail: "phase_diagnostics carried no completed_work counter".to_string(),
-                });
+                }));
             }
         };
         // Reset the timed-step counter across the phase boundary (parity with `close_phase`).
@@ -812,9 +820,9 @@ impl<T: LineTransport> Session<T> {
             Ok(audit) => Ok((audit, diag)),
             Err(e) => {
                 self.discarded = true;
-                Err(RunnerError::FreeRunConsistency {
+                Err(log_engine_text_error(RunnerError::FreeRunConsistency {
                     detail: e.to_string(),
-                })
+                }))
             }
         }
     }
@@ -839,9 +847,9 @@ impl<T: LineTransport> Session<T> {
             Ok(audit) => Ok((audit, diag)),
             Err(e) => {
                 self.discarded = true;
-                Err(RunnerError::FreeRunConsistency {
+                Err(log_engine_text_error(RunnerError::FreeRunConsistency {
                     detail: e.to_string(),
-                })
+                }))
             }
         }
     }
@@ -875,10 +883,8 @@ fn read_response_line<T: LineTransport>(
             ReadOutcome::Eof => {
                 // #134 — the bare form of this message is what blocked Proof A: every leg died
                 // here and the run record carried nothing that could localise it. Ask the
-                // transport for its post-mortem (child wait status + retained redacted worker
-                // stderr tail) and APPEND it, so the engine's own last words travel with the
-                // error into whatever record seals it. The leading clause is unchanged, so
-                // anything keying on this signature still matches.
+                // transport for its post-mortem. Exact wait status and stderr go only to the
+                // private audit; the public error gets one fixed class.
                 let base = "engine closed the stream before returning a response".to_string();
                 return Err(match transport.failure_diagnostic() {
                     Some(diagnostic) => log_engine_text_error(RunnerError::ProtocolEngineText {
@@ -895,10 +901,8 @@ fn read_response_line<T: LineTransport>(
                 // #134 — an engine that dies MID-LINE delivers a truncated final line (the reader
                 // yields whatever preceded EOF), which looks like a response and then fails to
                 // decode. That is the same "engine died on the way down" event as the EOF arm and
-                // needs the same post-mortem: without it the operator sees only a bare serde
-                // message. Reported as `Protocol` so the diagnostic can ride along — the
-                // measure-job classifier maps both this and `Json` to `RejectClass::Infra`, so the
-                // reject class is unchanged.
+                // needs the same private post-mortem. The public message keeps only the trusted
+                // serde category and a fixed process class.
                 match serde_json::from_str::<WorkerResponse>(&line) {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
@@ -907,6 +911,17 @@ fn read_response_line<T: LineTransport>(
                             json_error_summary(&e)
                         );
                         let mut engine_text = format!("decode error: {e}; response line: {line}");
+                        if crate::error::record_private_engine_value(
+                            "protocol-json-raw",
+                            &engine_text,
+                        )
+                        .is_err()
+                        {
+                            eprintln!(
+                                "benchd: private engine diagnostic audit write failed: \
+                                 class=protocol-json-raw"
+                            );
+                        }
                         if let Some(diagnostic) = transport.failure_diagnostic() {
                             detail.push_str(&format!(" ({})", diagnostic.detail));
                             engine_text.push_str(&format!("; {}", diagnostic.engine_text));
@@ -1009,7 +1024,7 @@ mod tests {
             .expect_err("a divergent width must be refused fail-closed");
         let sealed = err.to_string();
         assert!(
-            sealed.contains("cohort") && sealed.contains("engine-text-sha256="),
+            sealed.contains("cohort") && sealed.contains("engine-text-withheld"),
             "{sealed}"
         );
         assert!(!sealed.contains("canonical"), "{sealed}");

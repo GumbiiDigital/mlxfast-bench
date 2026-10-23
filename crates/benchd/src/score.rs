@@ -239,8 +239,8 @@ pub struct ScoreMetrics {
     /// ADDITIVE — the engine's self-reported VERIFY PATH for the timed window: `"rectangular"`
     /// (one target forward over the 1+k candidate window, recurrent state captured per position
     /// and rolled back to the accepted one) or `"serial"` (one forward per candidate token, the
-    /// fallback oracle). Present only when the engine reported it. AUDIT-only, never scored — it
-    /// exists so a sealed decode number states which path produced it.
+    /// fallback oracle). Present only when the engine reported it. PRIVATE-AUDIT only, never
+    /// scored; public output carries one fixed marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_verification_mode: Option<String>,
     /// ADDITIVE — verify rounds that ran the rectangular path (self-reported). AUDIT-only.
@@ -253,36 +253,37 @@ pub struct ScoreMetrics {
     /// Checks use this value. The JSON seal replaces it with its length and a hash.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acceptance_lengths: Vec<u32>,
-    /// ADDITIVE — a stable text seal of the timed worker's `hello.backend`. The full scrubbed value
-    /// is log-only. Absent when no timed worker ran or the engine sent none. AUDIT-only.
+    /// ADDITIVE — a fixed withheld marker for the timed worker's `hello.backend`. The full scrubbed
+    /// value is private-audit-only. Absent when no timed worker ran or the engine sent none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_backend: Option<String>,
-    /// ADDITIVE — a stable text seal of the timed worker's `hello.device`. AUDIT-only.
+    /// ADDITIVE — a fixed withheld marker for the timed worker's `hello.device`. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_device: Option<String>,
     /// ADDITIVE — the timed worker's `hello.protocol_version`. The session handshake already
     /// refuses a version benchd does not speak; this records WHICH one answered. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_protocol_version: Option<u32>,
-    /// ADDITIVE — the timed worker's loaded-head digest (`hello.head_provenance.sha256`, #106).
-    /// The board's custom-head reader looks for it here and on each `per_prompt` entry. Absent for
-    /// an engine that echoes no head provenance. AUDIT-only, never scored.
+    /// ADDITIVE — a fixed withheld marker when the timed worker sent
+    /// `hello.head_provenance.sha256` (#106). The board's custom-head reader looks for it here and
+    /// on each `per_prompt` entry. Absent for an engine that echoes no head provenance. AUDIT-only,
+    /// never scored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_provenance_sha256: Option<String>,
-    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.id`. Absent for a worker
+    /// ADDITIVE — a fixed withheld marker for the timed worker's `hello.runner.id`. Absent for a worker
     /// that echoes no runner identity. IDENTITY, never an input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<String>,
-    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.model_type`. IDENTITY,
+    /// ADDITIVE — a fixed withheld marker for the timed worker's `hello.runner.model_type`. IDENTITY,
     /// never an input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_model_type: Option<String>,
-    /// ADDITIVE — the digest of the timed worker's CANONICAL runner manifest
-    /// (`hello.runner.manifest_sha256`, 64 lowercase hex). IDENTITY, never an input to the score;
-    /// the conformance kit, not the scorer, is what compares it against a declared manifest.
+    /// ADDITIVE — a fixed withheld marker when the timed worker sent its CANONICAL runner manifest
+    /// digest (`hello.runner.manifest_sha256`). IDENTITY, never an input to the score; the
+    /// conformance kit, not the scorer, is what compares the raw value against a declared manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_manifest_sha256: Option<String>,
-    /// ADDITIVE — a stable text seal of the timed worker's `hello.runner.build`. IDENTITY, never an
+    /// ADDITIVE — a fixed withheld marker for the timed worker's `hello.runner.build`. IDENTITY, never an
     /// input to the score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_build: Option<String>,
@@ -529,8 +530,8 @@ pub struct ScorePerPrompt {
     /// ADDITIVE — this prompt's total ACCEPTED draft tokens (self-reported). AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_accepted_total: Option<u64>,
-    /// ADDITIVE — the timed worker's loaded-head digest, MIRRORED here because the board's
-    /// custom-head reader reads it off the per-prompt entry. Same value as
+    /// ADDITIVE — the fixed withheld head marker, MIRRORED here because the board's custom-head
+    /// reader reads it off the per-prompt entry. Same value as
     /// [`ScoreMetrics::head_provenance_sha256`]. AUDIT-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_provenance_sha256: Option<String>,
@@ -1206,6 +1207,10 @@ fn seal_value(value: &mut Value, path: &str) -> bool {
             let keys: Vec<String> = object.keys().cloned().collect();
             for key in keys {
                 let child_path = join_path(path, &key);
+                if is_private_engine_subtree(&child_path) {
+                    object.remove(&key);
+                    continue;
+                }
                 let child = object.get_mut(&key).expect("key came from this object");
                 let keep = match child {
                     Value::String(text) if is_engine_number_text_key(&key) => {
@@ -1230,6 +1235,17 @@ fn seal_value(value: &mut Value, path: &str) -> bool {
         Value::Number(_) => is_exact_sealed_key(path),
         _ => true,
     }
+}
+
+fn is_private_engine_subtree(path: &str) -> bool {
+    matches!(
+        path,
+        "pairs[].serial_per_stream_attestation"
+            | "pairs[].candidate_per_stream_attestation"
+            | "pairs[].per_stream_composite_diagnostic"
+            | "pairs[].cohort_near_tie_seal"
+            | "per_cohort[].per_stream_attestation_slot_order"
+    )
 }
 
 fn join_path(parent: &str, key: &str) -> String {
@@ -1268,38 +1284,13 @@ fn is_engine_number_text_key(key: &str) -> bool {
 }
 
 fn seal_engine_chosen_text(text: &str) -> String {
+    // `engine-text-withheld` has no digits, so the normal pass preserves it. Do not add a
+    // passthrough for an engine-derived digest or byte count here.
     let mut sealed = String::with_capacity(text.len());
     let mut copied = 0;
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"engine-text-sha256=") {
-            sealed.push_str(&text[copied..index]);
-            let digest_start = index + "engine-text-sha256=".len();
-            let digest_len = text[digest_start..]
-                .bytes()
-                .take(64)
-                .take_while(u8::is_ascii_hexdigit)
-                .count();
-            let digest_end = digest_start + digest_len;
-            sealed.push_str(&text[index..digest_end]);
-            index = digest_end;
-            copied = digest_end;
-            continue;
-        }
-        if bytes[index..].starts_with(b"engine-text-bytes=") {
-            sealed.push_str(&text[copied..index]);
-            let value_start = index + "engine-text-bytes=".len();
-            let value_len = text[value_start..]
-                .bytes()
-                .take_while(u8::is_ascii_digit)
-                .count();
-            let value_end = value_start + value_len;
-            sealed.push_str(&text[index..value_end]);
-            index = value_end;
-            copied = value_end;
-            continue;
-        }
         if !bytes[index].is_ascii_digit() {
             index += 1;
             continue;
@@ -1346,7 +1337,6 @@ mod tests {
 
     #[test]
     fn seal_boundary_omits_numbers_arrays_and_seals_text() {
-        let digest = "a1".repeat(32);
         let mut value = serde_json::json!({
             "score": 1.5,
             "passed": false,
@@ -1354,12 +1344,24 @@ mod tests {
                 "decode_seconds_per_token": 0.125,
                 "spec_acceptance_rate": 0.66,
                 "checked_steps": 77,
-                "error": format!(
-                    "consistency failure at round 77 for acceptance_lengths[77] after 7777 events; \
-                     engine-text-sha256={digest}; engine-text-bytes=24"
-                ),
+                "error": "consistency failure at round 77 for acceptance_lengths[77] after 7777 events; \
+                          engine-text-withheld",
                 "acceptance_lengths": [1, 2, 3, 4, 5, 6, 7, 8],
-            }
+            },
+            "pairs": [{
+                "candidate_per_stream_attestation": {
+                    "advertised": true,
+                    "attestation_refused": "engine supplied shape"
+                },
+                "cohort_near_tie_seal": {
+                    "near_tie_refused": "engine supplied gaps"
+                }
+            }],
+            "per_cohort": [{
+                "per_stream_attestation_slot_order": {
+                    "rule": "engine supplied order"
+                }
+            }]
         });
 
         seal_engine_chosen_numbers(&mut value).unwrap();
@@ -1370,15 +1372,19 @@ mod tests {
         assert!(value["metrics"].get("spec_acceptance_rate").is_none());
         assert!(value["metrics"].get("checked_steps").is_none());
         assert!(value["metrics"].get("acceptance_lengths").is_none());
+        assert!(value["pairs"][0]
+            .get("candidate_per_stream_attestation")
+            .is_none());
+        assert!(value["pairs"][0].get("cohort_near_tie_seal").is_none());
+        assert!(value["per_cohort"][0]
+            .get("per_stream_attestation_slot_order")
+            .is_none());
         assert_eq!(
             value["metrics"]["error"],
-            format!(
-                "consistency failure at round # for acceptance_lengths[#] after # events; \
-                 engine-text-sha256={digest}; engine-text-bytes=24"
-            )
+            "consistency failure at round # for acceptance_lengths[#] after # events; \
+             engine-text-withheld"
         );
-        assert!(serialized.contains(&format!("engine-text-sha256={digest}")));
-        assert!(serialized.contains("engine-text-bytes=24"));
+        assert!(serialized.contains("engine-text-withheld"));
         for planted in ["77", "7777", "0.66", "[1,2,3,4,5,6,7,8]"] {
             assert!(!serialized.contains(planted), "{serialized}");
         }

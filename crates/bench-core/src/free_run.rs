@@ -119,7 +119,7 @@ pub struct FreeRunResponse {
 /// so an artifact can state which path produced its decode number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
-    /// `"rectangular"` or `"serial"`; the runner replaces other wire text with a stable seal.
+    /// A fixed public marker; the exact engine-reported mode is private-audit-only.
     pub mode: String,
     /// Rounds that ran the rectangular path, when reported.
     pub rectangular_rounds: Option<u64>,
@@ -860,8 +860,8 @@ impl CohortFreeRunAudit {
         &self.active_streams_by_round
     }
 
-    /// The sealed depth-clamp reason histogram. Safe keys stay verbatim, and other keys use stable
-    /// text seals. This is the evidence for whether the window ACTUALLY SPECULATED: a cohort
+    /// The sealed depth-clamp reason histogram. Safe keys stay verbatim, and other keys use a
+    /// fixed withheld marker. This is the evidence for whether the window ACTUALLY SPECULATED: a cohort
     /// clamped to depth zero (e.g.
     /// `automatic_rectangular_limit`, `tail_depth`) is a legitimate engine outcome, and the report
     /// has to be able to say so rather than presenting a target-only window as a speculative one.

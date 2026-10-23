@@ -76,9 +76,9 @@ The sealed `score.json` records the effective mode as text. It omits `effective_
 spec counters, acceptance rates, verification-round counts, acceptance arrays, resident process
 numbers, and per-prompt draft-length means. Benchd still checks these exact values in memory.
 
-The identity keys come from the timed worker's `hello`. Free-text values use
-`engine-text-sha256` seals. `head_provenance_sha256` and `runner_manifest_sha256` stay verbatim
-only as 64 lowercase hex characters. Other digest text uses an `engine-text-sha256` seal.
+The identity keys come from the timed worker's `hello`. Public free-text values use the fixed
+`engine-text-withheld` marker. `head_provenance_sha256` and `runner_manifest_sha256` use the fixed
+`engine-value-withheld` marker, never a value derived from engine input.
 The in-window resident identity check is unchanged. None of these fields changes a score or gate.
 
 ### 3.2 Sealed numbers
@@ -139,7 +139,7 @@ throttle counts, truncation counts, per-stream ratios, clamp counts, `checked_st
 `first_failing_step`.
 
 In `error`, `reason`, `detail`, `*_reason`, and `*_refused` text, each digit run becomes `#`.
-The seal does not change digits inside `engine-text-sha256=<hex>` or `engine-text-bytes=<value>`.
+Engine-written text is replaced by the fixed `engine-text-withheld` marker before this pass.
 
 If `BENCHD_PRIVATE_AUDIT_PATH` is set, benchd writes the full JSON from before this pass to that
 path. On Unix, benchd creates or resets the file with mode `0600`. If the variable is unset,

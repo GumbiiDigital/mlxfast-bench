@@ -30,6 +30,14 @@ use crate::error::{
 use crate::session::Session;
 use crate::transport::LineTransport;
 
+fn audit_engine_error(error: RunnerError) -> RunnerError {
+    let class = error.engine_diagnostic_class();
+    if crate::error::record_private_engine_text(class, &error.diagnostic()).is_err() {
+        eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
+    }
+    error
+}
+
 /// Inputs to one timed benchmark: the prefill prompt, the decode seed, how many
 /// checked decode steps to run (128 official, 16 local-iterate), AND the golden
 /// benchmark oracle tokens each engine response is verified against.
@@ -859,10 +867,12 @@ where
     // Refuse an over-wide cohort PRE-GPU on the engine's own advertised ceiling (when present).
     if let Some(max) = session.max_batch_size() {
         if params.batch_size > max {
-            return Err(RunnerError::BatchWidthExceedsEngineMax {
-                requested: params.batch_size,
-                max_batch_size: max,
-            });
+            return Err(audit_engine_error(
+                RunnerError::BatchWidthExceedsEngineMax {
+                    requested: params.batch_size,
+                    max_batch_size: max,
+                },
+            ));
         }
     }
     cool_gate("decode")?;
@@ -1019,12 +1029,12 @@ fn measure_prefill<T: LineTransport>(
         // TimeOnly tolerates the mismatch (correctness is judged separately upstream).
         let alternate_warmup = is_warmup && params.prefill_warmup_prompt_tokens.is_some();
         if !alternate_warmup && verify != VerifyMode::TimeOnly && token != expected_prefill_token {
-            return Err(RunnerError::TokenMismatch {
+            return Err(audit_engine_error(RunnerError::TokenMismatch {
                 label: "benchmark prefill token".to_string(),
                 step: run_index,
                 expected: expected_prefill_token,
                 actual: token,
-            });
+            }));
         }
         if run_index >= params.prefill_warmup_runs {
             timed_elapsed.push(elapsed);
@@ -1096,12 +1106,12 @@ fn measure_decode<T: LineTransport>(
         RunnerError::Protocol("runtime worker decode_begin response missing seed token".to_string())
     })?;
     if verify == VerifyMode::Verify && seed_token != params.expected_decode_seed_token {
-        return Err(RunnerError::TokenMismatch {
+        return Err(audit_engine_error(RunnerError::TokenMismatch {
             label: "benchmark decode seed token".to_string(),
             step: 0,
             expected: params.expected_decode_seed_token,
             actual: seed_token,
-        });
+        }));
     }
     // THE DECODE WINDOW opens here, after the seed prefill and its oracle check.
     let start = Instant::now();
@@ -1120,12 +1130,12 @@ fn measure_decode<T: LineTransport>(
         })?;
         let expected = params.expected_decode_tokens[decoded_step];
         if verify == VerifyMode::Verify && token != expected {
-            return Err(RunnerError::TokenMismatch {
+            return Err(audit_engine_error(RunnerError::TokenMismatch {
                 label: "benchmark decode token".to_string(),
                 step: decoded_step,
                 expected,
                 actual: token,
-            });
+            }));
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -1208,12 +1218,12 @@ fn measure_free_run_decode<T: LineTransport>(
     // TimeOnly path retained it — a silent regression of the "retain real timing on a correctness
     // failure" ruling.
     if seed_token != params.expected_decode_seed_token && verify == VerifyMode::Verify {
-        return Err(RunnerError::TokenMismatch {
+        return Err(audit_engine_error(RunnerError::TokenMismatch {
             label: "benchmark free-run decode seed token".to_string(),
             step: 0,
             expected: params.expected_decode_seed_token,
             actual: seed_token,
-        });
+        }));
     }
     // The SPLIT: ONE reading of benchd's own clock serves as both the close of the seed prefill
     // and the open of the decode window, so the two are contiguous with no untimed gap between
@@ -1240,13 +1250,13 @@ fn measure_free_run_decode<T: LineTransport>(
     // per-token loop's generic `Protocol` error while a LONG one reached `verify_consistency`'s
     // `TokenCount`, so the same invariant produced two different classes depending on the sign.)
     if tokens.len() != n_usize {
-        return Err(RunnerError::FreeRunConsistency {
+        return Err(audit_engine_error(RunnerError::FreeRunConsistency {
             detail: bench_core::free_run::FreeRunConsistencyError::TokenCount {
                 expected: n_usize,
                 got: tokens.len(),
             }
             .to_string(),
-        });
+        }));
     }
     // §2.2 / §2.7: exact-match every committed token against the golden continuation. A wrong
     // free-run token is a HARD failure (the same TokenMismatch class as v1 teacher-forced
@@ -1271,12 +1281,12 @@ fn measure_free_run_decode<T: LineTransport>(
             ))
         })?;
         if actual != expected && verify == VerifyMode::Verify {
-            return Err(RunnerError::TokenMismatch {
+            return Err(audit_engine_error(RunnerError::TokenMismatch {
                 label: "benchmark free-run decode token".to_string(),
                 step,
                 expected,
                 actual,
-            });
+            }));
         }
     }
 
@@ -1474,10 +1484,13 @@ fn measure_batched_free_run_decode<T: LineTransport>(
         )
     })?;
     if seed_token_by_stream.len() != b_usize {
-        return Err(RunnerError::Protocol(format!(
-            "batched free_decode_begin returned {} seed tokens, expected B={batch_size}",
-            seed_token_by_stream.len()
-        )));
+        return Err(audit_engine_error(RunnerError::ProtocolEngineText {
+            detail: "batched free-run seed-token count mismatch".to_string(),
+            engine_text: format!(
+                "batched free_decode_begin returned {} seed tokens, expected B={batch_size}",
+                seed_token_by_stream.len()
+            ),
+        }));
     }
     // Oracle-check EVERY slot's seed forward, in slot order. ANTI-CHEAT — this loop runs BEFORE
     // the prefill window closes, so its cost is charged to the prefill window rather than sitting
@@ -1488,12 +1501,12 @@ fn measure_batched_free_run_decode<T: LineTransport>(
         .enumerate()
     {
         if actual != stream.expected_decode_seed_token {
-            return Err(RunnerError::TokenMismatch {
+            return Err(audit_engine_error(RunnerError::TokenMismatch {
                 label: format!("benchmark batched free-run decode seed token (stream {slot})"),
                 step: 0,
                 expected: stream.expected_decode_seed_token,
                 actual,
-            });
+            }));
         }
     }
     // PREFILL window closes here.
@@ -1524,24 +1537,24 @@ fn measure_batched_free_run_decode<T: LineTransport>(
     // number of streams, or a stream with fewer/more than N committed tokens, is the same class
     // of lie as a doctored histogram — an accounting mismatch benchd's counters falsify.
     if tokens_by_stream.len() != b_usize {
-        return Err(RunnerError::FreeRunConsistency {
+        return Err(audit_engine_error(RunnerError::FreeRunConsistency {
             detail: bench_core::free_run::FreeRunConsistencyError::CohortWidth {
                 batch_size,
                 got: tokens_by_stream.len(),
             }
             .to_string(),
-        });
+        }));
     }
     for (slot, stream_tokens) in tokens_by_stream.iter().enumerate() {
         if stream_tokens.len() != n_usize {
-            return Err(RunnerError::FreeRunConsistency {
+            return Err(audit_engine_error(RunnerError::FreeRunConsistency {
                 detail: bench_core::free_run::FreeRunConsistencyError::CohortStreamTokenCount {
                     slot,
                     expected: n_usize,
                     got: stream_tokens.len(),
                 }
                 .to_string(),
-            });
+            }));
         }
     }
     // (b) admission — the inline STATIC-TAPE exact-match on the committed tokens is REMOVED here.
@@ -1561,7 +1574,7 @@ fn measure_batched_free_run_decode<T: LineTransport>(
     // fault. `depth_clamp_reasons` is the one tolerated absence: it is audit-only prose about WHY
     // depth was clamped, carries no cross-checkable accounting, and an engine with nothing to
     // report may omit the histogram entirely (treated as empty, sealed as such). Safe keys stay
-    // verbatim. Other keys become stable engine-text seals.
+    // verbatim. Other keys become a fixed engine-text-withheld marker.
     let acceptance_lengths = run.acceptance_lengths.clone().ok_or_else(|| {
         RunnerError::Protocol(
             "batched free_decode_run response missing acceptance_lengths".to_string(),

@@ -4,7 +4,8 @@
 //! and NOT ONE `mlxfast-worker:` line in any run record, which made the failure undiagnosable
 //! from the artifacts alone. These tests drive the REAL spawn + `Session::connect` path against
 //! scripted fake workers covering each way an engine can end its stream, and assert that benchd's
-//! error now carries the engine's own last words (wait status + redacted stderr tail).
+//! error now carries a fixed public ending class plus a redacted private stderr tail. Exact wait
+//! status is private-audit-only.
 //!
 //! Unix-only: the fake workers are `/bin/sh` scripts.
 
@@ -74,7 +75,7 @@ fn assert_keeps_signature(tag: &str, message: &str) {
 /// A worker that writes a diagnostic to stderr and exits before saying hello — the plain
 /// "engine refused to start" shape. Its reason must reach benchd's error.
 #[test]
-fn dies_before_hello_surfaces_stderr_and_status() {
+fn dies_before_hello_surfaces_only_fixed_classes() {
     let message = handshake_failure(
         "before-hello",
         "#!/bin/sh\nprintf 'fatal: could not open weights\\n' 1>&2\nexit 3\n",
@@ -85,13 +86,13 @@ fn dies_before_hello_surfaces_stderr_and_status() {
         "worker stderr missing from the error: {message}"
     );
     assert!(
-        message.contains("worker exited with status 3"),
-        "worker exit status missing from the error: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing from the error: {message}"
     );
 }
 
 #[test]
-fn dies_before_hello_seals_stderr_but_keeps_status() {
+fn dies_before_hello_seals_stderr_and_status() {
     let error = handshake_error(
         "sealed-before-hello",
         "#!/bin/sh\nprintf 'PLANTED-PROMPT-TEXT 4242\\n' 1>&2\nexit 3\n",
@@ -101,8 +102,9 @@ fn dies_before_hello_seals_stderr_but_keeps_status() {
         !sealed.contains("PLANTED") && !sealed.contains("4242"),
         "{sealed}"
     );
-    assert!(sealed.contains("engine-text-sha256="), "{sealed}");
-    assert!(sealed.contains("worker exited with status 3"), "{sealed}");
+    assert!(sealed.contains("engine-text-withheld"), "{sealed}");
+    assert!(sealed.contains("worker exited abnormally"), "{sealed}");
+    assert!(!sealed.contains("status 3"), "{sealed}");
     assert!(error.diagnostic().contains("PLANTED-PROMPT-TEXT 4242"));
 }
 
@@ -118,13 +120,13 @@ fn hello_not_ok_seals_the_engine_error() {
         !sealed.contains("PLANTED") && !sealed.contains("4242"),
         "{sealed}"
     );
-    assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+    assert!(sealed.contains("engine-text-withheld"), "{sealed}");
     assert!(sealed.contains("hello was not ok"), "{sealed}");
     assert!(error.diagnostic().contains("PLANTED-PROMPT-TEXT 4242"));
 }
 
 #[test]
-fn engine_error_public_stderr_is_hash_only_and_private_audit_keeps_text() {
+fn engine_error_public_stderr_is_fixed_marker_and_private_audit_keeps_text() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = std::env::temp_dir().join(format!(
@@ -148,7 +150,7 @@ fn engine_error_public_stderr_is_hash_only_and_private_audit_keeps_text() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("PLANTED-PROMPT-TEXT 4242"), "{stderr}");
     assert!(stderr.contains("class=protocol-engine-text"), "{stderr}");
-    assert!(stderr.contains("engine-text-sha256="), "{stderr}");
+    assert!(stderr.contains("engine-text-withheld"), "{stderr}");
 
     let audit: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&private).unwrap()).unwrap();
@@ -176,11 +178,70 @@ fn engine_error_public_stderr_child() {
     );
 }
 
+#[test]
+fn worker_status_and_json_position_are_private_audit_only() {
+    let root = std::env::temp_dir().join(format!(
+        "bench-runner-private-status-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let private = root.join("private.json");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "worker_status_and_json_position_private_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("BENCH_RUNNER_PRIVATE_STATUS_CHILD", "1")
+        .env("BENCHD_PRIVATE_AUDIT_PATH", &private)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("worker exited abnormally"), "{stderr}");
+    assert!(stderr.contains("category=Eof"), "{stderr}");
+    assert!(!stderr.contains("status 7"), "{stderr}");
+    assert!(
+        !stderr.contains("line=1") && !stderr.contains("column="),
+        "{stderr}"
+    );
+
+    let audit: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&private).unwrap()).unwrap();
+    let records = audit["engine_diagnostics"].as_array().unwrap();
+    assert!(records.iter().any(|record| {
+        record["class"] == "worker-exit-status"
+            && record["text"].as_str().unwrap().contains("status 7")
+    }));
+    assert!(records.iter().any(|record| {
+        record["class"] == "protocol-json-raw"
+            && record["text"].as_str().unwrap().contains("line 1 column")
+            && record["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"{"id":0,"ok":tr"#)
+    }));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_status_and_json_position_private_child() {
+    if std::env::var_os("BENCH_RUNNER_PRIVATE_STATUS_CHILD").is_none() {
+        return;
+    }
+    let _ = handshake_error_forwarding(
+        "private-status-child",
+        "#!/bin/sh\nprintf '{\"id\":0,\"ok\":tr'\nexit 7\n",
+        false,
+    );
+}
+
 /// A worker that emits a non-JSON preamble line and a TRUNCATED (newline-less) hello, then dies
 /// mid-handshake. The partial line is never a response, so the read still ends in EOF — and the
 /// stderr that explains the truncation must still arrive.
 #[test]
-fn dies_mid_hello_surfaces_stderr_and_status() {
+fn dies_mid_hello_surfaces_only_fixed_classes() {
     let error = handshake_error(
         "mid-hello",
         "#!/bin/sh\n\
@@ -202,8 +263,8 @@ fn dies_mid_hello_surfaces_stderr_and_status() {
         "worker stderr missing from the error: {message}"
     );
     assert!(
-        message.contains("worker exited with status 5"),
-        "worker exit status missing from the error: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing from the error: {message}"
     );
     assert!(
         message.contains("EOF while parsing a value"),
@@ -215,7 +276,11 @@ fn dies_mid_hello_surfaces_stderr_and_status() {
     );
 
     let sealed = error.to_string();
-    assert!(sealed.contains("category=Eof line=1 column="), "{sealed}");
+    assert!(sealed.contains("category=Eof"), "{sealed}");
+    assert!(
+        !sealed.contains("line=1") && !sealed.contains("column="),
+        "{sealed}"
+    );
     assert!(!sealed.contains("EOF while parsing a value"), "{sealed}");
     assert!(!sealed.contains(r#"{"id":0,"ok":tr"#), "{sealed}");
 }
@@ -240,8 +305,8 @@ fn writes_more_than_the_tail_limit_then_dies_stays_bounded() {
         "the final (most diagnostic) stderr line was dropped: {message}"
     );
     assert!(
-        message.contains("worker exited with status 7"),
-        "worker exit status missing from the error: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing from the error: {message}"
     );
     assert!(
         !message.contains("flood line 0 "),
@@ -272,8 +337,8 @@ fn closes_stdout_keeps_running_then_speaks_is_not_killed_first() {
         "stderr written AFTER the stdout close was lost to teardown: {message}"
     );
     assert!(
-        message.contains("worker exited with status 4"),
-        "worker exit status missing from the error: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing from the error: {message}"
     );
 }
 
@@ -287,8 +352,8 @@ fn closes_stdout_and_hangs_is_killed_after_the_grace() {
     );
     assert_keeps_signature("hang", &message);
     assert!(
-        message.contains("STILL RUNNING") && message.contains("killed by benchd"),
-        "a hung worker was not reported as killed by benchd after the grace: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing after the grace: {message}"
     );
     assert!(
         !message.contains("killed by signal"),
@@ -308,8 +373,8 @@ fn silent_signal_death_reports_the_signal_and_says_stderr_was_empty() {
     let message = handshake_failure("signal", "#!/bin/sh\nkill -9 $$\n");
     assert_keeps_signature("signal", &message);
     assert!(
-        message.contains("worker was killed by signal 9"),
-        "signal death was not identified: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing: {message}"
     );
     assert!(
         message.contains("no worker stderr was emitted"),
@@ -366,8 +431,8 @@ fn an_oversized_binary_final_line_does_not_evict_the_readable_lines() {
         "the oversized final line evicted a readable line: {message}"
     );
     assert!(
-        message.contains("worker exited with status 6"),
-        "worker exit status missing: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing: {message}"
     );
 }
 
@@ -399,14 +464,14 @@ fn secret_shaped_stderr_without_trigger_keywords_cannot_reach_the_diagnostic() {
             "secret-tier content reached the sealable diagnostic: {secret:?} in {message}"
         );
     }
-    // The diagnosis still survives: the failing filename and the exit status.
+    // The diagnosis still survives: the failing filename and the fixed ending class.
     assert!(
         message.contains("sample-001.json"),
         "scrubbing destroyed the diagnostic basename: {message}"
     );
     assert!(
-        message.contains("worker exited with status 9"),
-        "worker exit status missing: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing: {message}"
     );
 }
 
@@ -426,8 +491,8 @@ fn tail_still_reaches_the_diagnostic_with_forwarding_off() {
         "an unforwarded worker's tail did not reach the diagnostic: {message}"
     );
     assert!(
-        message.contains("worker exited with status 8"),
-        "worker exit status missing: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing: {message}"
     );
 }
 
@@ -454,8 +519,8 @@ fn live_worker_with_one_bad_line_is_not_reported_as_a_signal_death() {
         "a LIVE worker was falsely sealed as a signal death: {message}"
     );
     assert!(
-        message.contains("STILL RUNNING") && message.contains("killed by benchd"),
-        "the harness kill was not attributed to benchd: {message}"
+        message.contains("worker exited abnormally"),
+        "fixed worker ending class missing: {message}"
     );
 }
 
