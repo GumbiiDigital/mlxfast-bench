@@ -36,7 +36,7 @@ The resolved `official_prefill_timed_runs` must be exactly `1` whenever `warmup_
 
 Leg teardown is always checked, even when none of these keys is present. After the stop script
 succeeds, benchd waits up to two seconds for the resident socket to stop accepting connections. A
-failed normal teardown refuses with `LEG-TEARDOWN-FAILED`; stop stderr is digest-sealed. Cleanup on
+failed normal teardown refuses with `LEG-TEARDOWN-FAILED`; stop stderr is withheld. Cleanup on
 an already-failed path remains best effort so it does not replace the first failure.
 
 The runtime-worker Seatbelt profile also denies POSIX shared memory, System V IPC, POSIX named
@@ -45,10 +45,10 @@ MLX: `com.apple.MTLCompilerService`, the two OpenDirectory services, `com.apple.
 `com.apple.diagnosticd`. These rules stop one worker from leaving state for a later worker.
 
 Public engine identity digest keys keep their existing names, but their values are now
-`sha256(engine_value)`. This applies to `head_provenance_sha256` and
+the fixed `engine-value-withheld` marker. This applies to `head_provenance_sha256` and
 `runner_manifest_sha256`, including the per-prompt head mirror. An engine-supplied 64-character
-hex value is not treated as trusted proof. The raw engine value is written only to the private
-audit when `BENCHD_PRIVATE_AUDIT_PATH` is configured.
+hex value is not treated as trusted proof and cannot affect the public marker. The raw engine value
+is written only to the private audit when `BENCHD_PRIVATE_AUDIT_PATH` is configured.
 
 The worker deny set includes the private audit file, its parent directory when that parent is not
 the worker's own workspace, and the whole `MLXFAST_RESIDENT_LOG_ROOT`. An official candidate run

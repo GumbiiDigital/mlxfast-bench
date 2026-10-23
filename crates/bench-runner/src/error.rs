@@ -152,19 +152,12 @@ impl fmt::Display for RunnerError {
                 write!(f, "engine reported failure on {kind:?}: ")?;
                 write_engine_text_seal(f, message)
             }
-            RunnerError::CompletedWorkMismatch { issued, reported } => match reported {
-                Some(reported) => write!(
-                    f,
-                    "phase-close barrier: issued {issued} timed steps but engine reported {reported} completed"
-                ),
-                None => write!(
-                    f,
-                    "phase-close barrier: issued {issued} timed steps but engine reported no completed_work counter"
-                ),
-            },
-            RunnerError::AllocatorCacheNotDrained { reported } => write!(
+            RunnerError::CompletedWorkMismatch { .. } => {
+                write!(f, "phase-close barrier: engine work count mismatch")
+            }
+            RunnerError::AllocatorCacheNotDrained { .. } => write!(
                 f,
-                "runtime worker failed to clear the MLX allocator cache at phase start (cache_memory={reported} bytes, expected 0)"
+                "runtime worker failed to clear the MLX allocator cache at phase start"
             ),
             // No token value is named: the golden's token is hidden material, and the engine's
             // token at that step would tell a reader where the golden goes next.
@@ -179,8 +172,8 @@ impl fmt::Display for RunnerError {
                 f,
                 "engine did not advertise the {capability:?} capability; refusing the capability-gated request (fail-closed)"
             ),
-            RunnerError::FreeRunConsistency { detail } => {
-                write!(f, "free-run decode consistency failure: {detail}")
+            RunnerError::FreeRunConsistency { .. } => {
+                write!(f, "free-run decode consistency failure")
             }
             RunnerError::GateRejected { phase, reason } => {
                 write!(f, "gate rejected ({phase}): {reason}")
@@ -206,29 +199,14 @@ impl fmt::Display for RunnerError {
                      effective_spec (spec-never-ignored, fail-closed — session discarded)"
                 ),
             },
-            RunnerError::BatchEchoDivergence {
-                requested,
-                effective,
-            } => match effective {
-                Some(effective) => write!(
-                    f,
-                    "batch echo divergence: requested batch_size {requested} but the engine echoed \
-                     effective_batch_size {effective} (batch-never-ignored, fail-closed — session \
-                     discarded)"
-                ),
-                None => write!(
-                    f,
-                    "batch echo divergence: requested batch_size {requested} but the engine echoed \
-                     no effective_batch_size (batch-never-ignored, fail-closed — session discarded)"
-                ),
-            },
-            RunnerError::BatchWidthExceedsEngineMax {
-                requested,
-                max_batch_size,
-            } => write!(
+            RunnerError::BatchEchoDivergence { .. } => write!(
                 f,
-                "requested cohort batch_size {requested} exceeds the engine's advertised \
-                 max_batch_size {max_batch_size}; refusing pre-GPU (fail-closed)"
+                "batch echo divergence (batch-never-ignored, fail-closed — session discarded)"
+            ),
+            RunnerError::BatchWidthExceedsEngineMax { .. } => write!(
+                f,
+                "requested cohort width exceeds the engine's advertised maximum; refusing \
+                 pre-GPU (fail-closed)"
             ),
             RunnerError::SpecModeNotRunnable { mode, advertised } => {
                 let advertised = serde_json::to_string(advertised).unwrap_or_default();
@@ -266,14 +244,13 @@ fn write_engine_text_seal(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result
     f.write_str(&engine_text_seal(text))
 }
 
-/// A stable seal for engine-written text stored in artifacts.
-pub fn engine_text_seal(text: &str) -> String {
-    let scrubbed = crate::scrub::scrub_engine_text(text);
-    format!(
-        "engine-text-sha256={} engine-text-bytes={}",
-        bench_core::hash::sha256_hex(scrubbed.as_bytes()),
-        scrubbed.len()
-    )
+/// A fixed public marker for withheld engine-written text.
+///
+/// The engine chooses this text and sees the hidden prompt, so neither the text nor any value
+/// derived from it may enter a public log or artifact. The scrubbed text is retained only by
+/// [`record_private_engine_text`] when a private audit is configured.
+pub fn engine_text_seal(_text: &str) -> String {
+    "engine-text-withheld".to_string()
 }
 
 /// Keep full scrubbed engine text only in the organizer's private audit, when configured.
@@ -333,16 +310,15 @@ pub fn record_private_engine_value(class: &str, value: &str) -> std::io::Result<
     file.write_all(&bytes)
 }
 
-/// Preserve a documented verification mode and seal all other engine text.
+/// Keep the exact engine-reported verification mode private and publish one fixed marker.
 pub fn seal_verification_mode(mode: &str) -> String {
-    if bench_protocol::VERIFICATION_MODES.contains(&mode) {
-        mode.to_string()
-    } else {
-        engine_text_seal(mode)
+    if record_private_engine_value("verification-mode", mode).is_err() {
+        eprintln!("benchd: private engine diagnostic audit write failed: class=verification-mode");
     }
+    engine_text_seal(mode)
 }
 
-/// Preserve a documented spec mode and seal all other engine text.
+/// Preserve a documented spec mode and withhold all other engine text.
 pub fn seal_spec_mode(mode: &str) -> String {
     if bench_protocol::SPEC_MODES.contains(&mode) {
         mode.to_string()
@@ -351,7 +327,7 @@ pub fn seal_spec_mode(mode: &str) -> String {
     }
 }
 
-/// Preserve documented logit provenance and seal all other engine text.
+/// Preserve documented logit provenance and withhold all other engine text.
 pub fn seal_logit_provenance(provenance: &str) -> String {
     if provenance == bench_protocol::LOGIT_PROVENANCE_POST_SOFTCAP {
         provenance.to_string()
@@ -360,10 +336,19 @@ pub fn seal_logit_provenance(provenance: &str) -> String {
     }
 }
 
-/// Seal unsafe engine-written histogram keys before they enter an audit record.
+/// Withhold unsafe engine-written histogram keys before they enter an audit record.
 pub fn seal_depth_clamp_reasons(
     reasons: &std::collections::BTreeMap<String, u32>,
 ) -> std::collections::BTreeMap<String, u64> {
+    if !reasons.is_empty() {
+        let full = serde_json::to_string(reasons).expect("BTreeMap<String, u32> serializes");
+        if record_private_engine_value("depth-clamp-reasons", &full).is_err() {
+            eprintln!(
+                "benchd: private engine diagnostic audit write failed: \
+                 class=depth-clamp-reasons"
+            );
+        }
+    }
     let mut sealed = std::collections::BTreeMap::new();
     for (key, count) in reasons {
         let key = if depth_clamp_reason_key_is_safe(key) {
@@ -392,12 +377,7 @@ fn depth_clamp_reason_key_is_safe(key: &str) -> bool {
 }
 
 pub(crate) fn json_error_summary(error: &serde_json::Error) -> String {
-    format!(
-        "category={:?} line={} column={}",
-        error.classify(),
-        error.line(),
-        error.column()
-    )
+    format!("category={:?}", error.classify())
 }
 
 impl RunnerError {
@@ -410,6 +390,12 @@ impl RunnerError {
             RunnerError::Engine { .. } => "engine-reported-failure",
             RunnerError::SpecEchoDivergence { .. } => "spec-echo-divergence",
             RunnerError::SpecModeNotRunnable { .. } => "spec-mode-not-runnable",
+            RunnerError::TokenMismatch { .. } => "token-mismatch",
+            RunnerError::CompletedWorkMismatch { .. } => "completed-work-mismatch",
+            RunnerError::AllocatorCacheNotDrained { .. } => "allocator-cache-not-drained",
+            RunnerError::FreeRunConsistency { .. } => "free-run-consistency",
+            RunnerError::BatchEchoDivergence { .. } => "batch-echo-divergence",
+            RunnerError::BatchWidthExceedsEngineMax { .. } => "batch-width-exceeds-engine-max",
             _ => "runner-error",
         }
     }
@@ -467,6 +453,40 @@ impl RunnerError {
                      timed work (fail-closed — session discarded)"
                 )
             }
+            RunnerError::TokenMismatch {
+                label,
+                step,
+                expected,
+                actual,
+            } => format!(
+                "{label} mismatch at step {step}: expected token {expected}, engine returned \
+                 token {actual}"
+            ),
+            RunnerError::CompletedWorkMismatch { issued, reported } => format!(
+                "phase-close barrier: issued {issued} timed steps but engine reported \
+                 {reported:?} completed"
+            ),
+            RunnerError::AllocatorCacheNotDrained { reported } => format!(
+                "runtime worker failed to clear the MLX allocator cache at phase start \
+                 (cache_memory={reported} bytes, expected 0)"
+            ),
+            RunnerError::FreeRunConsistency { detail } => {
+                format!("free-run decode consistency failure: {detail}")
+            }
+            RunnerError::BatchEchoDivergence {
+                requested,
+                effective,
+            } => format!(
+                "batch echo divergence: requested batch_size {requested}, engine echoed \
+                 {effective:?}"
+            ),
+            RunnerError::BatchWidthExceedsEngineMax {
+                requested,
+                max_batch_size,
+            } => format!(
+                "requested cohort batch_size {requested} exceeds engine max_batch_size \
+                 {max_batch_size}"
+            ),
             _ => self.to_string(),
         }
     }
@@ -530,7 +550,9 @@ mod tests {
 
         for error in errors {
             let sealed = error.to_string();
-            assert!(sealed.contains("engine-text-sha256="), "{sealed}");
+            assert!(sealed.contains("engine-text-withheld"), "{sealed}");
+            assert!(!sealed.contains("engine-text-sha256="), "{sealed}");
+            assert!(!sealed.contains("engine-text-bytes="), "{sealed}");
             assert!(!sealed.contains("PLANTED"), "{sealed}");
             assert!(!sealed.contains("4242"), "{sealed}");
             let diagnostic = error.diagnostic();
@@ -543,6 +565,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn engine_text_marker_does_not_depend_on_text_or_length() {
+        assert_eq!(engine_text_seal("1"), "engine-text-withheld");
+        assert_eq!(
+            engine_text_seal("attacker chose a longer value"),
+            "engine-text-withheld"
+        );
     }
 
     #[test]
@@ -583,5 +614,67 @@ mod tests {
             !text.contains("123457") && !text.contains("234568"),
             "{text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_mode_and_full_histogram_reach_only_the_private_audit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "bench-runner-private-ingest-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let private = root.join("private.json");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "error::tests::private_ingest_child",
+                "--test-threads=1",
+            ])
+            .env("BENCH_RUNNER_PRIVATE_INGEST_CHILD", "1")
+            .env("BENCHD_PRIVATE_AUDIT_PATH", &private)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let audit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&private).unwrap()).unwrap();
+        let records = audit[PRIVATE_ENGINE_DIAGNOSTICS_KEY].as_array().unwrap();
+        assert!(records.iter().any(|record| {
+            record["class"] == "verification-mode"
+                && record["text"] == "PLANTED-verification-mode-4242"
+        }));
+        assert!(records.iter().any(|record| {
+            record["class"] == "depth-clamp-reasons"
+                && record["text"] == r#"{"PLANTED reason 4242":7,"tail_depth":3}"#
+        }));
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_ingest_child() {
+        if std::env::var_os("BENCH_RUNNER_PRIVATE_INGEST_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(
+            seal_verification_mode("PLANTED-verification-mode-4242"),
+            "engine-text-withheld"
+        );
+        let reasons = [
+            ("PLANTED reason 4242".to_string(), 7),
+            ("tail_depth".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let sealed = seal_depth_clamp_reasons(&reasons);
+        assert_eq!(sealed["tail_depth"], 3);
+        assert_eq!(sealed["engine-text-withheld"], 7);
     }
 }

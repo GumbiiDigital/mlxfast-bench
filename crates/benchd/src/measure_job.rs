@@ -43,13 +43,16 @@ use crate::quiescegate::QuiesceRecord;
 // UNVERIFIED(measure-job): the one-gated-retry-per-leg structure + full-reset-between-attempts.
 const MAX_ATTEMPTS: usize = 2;
 
-/// Hash every engine-supplied digest value before it reaches a public artifact. The raw value is
-/// kept only in the organizer's private audit when one is configured.
+/// The fixed public marker for an engine-supplied digest value.
+pub(crate) const ENGINE_VALUE_WITHHELD: &str = "engine-value-withheld";
+
+/// Replace every engine-supplied digest value before it reaches a public artifact. The raw value
+/// is kept only in the organizer's private audit when one is configured.
 pub(crate) fn seal_engine_digest(class: &str, value: &str) -> String {
     if bench_runner::error::record_private_engine_value(class, value).is_err() {
         eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
     }
-    bench_core::hash::sha256_hex(value.as_bytes())
+    ENGINE_VALUE_WITHHELD.to_string()
 }
 
 /// The maximum number of pair ATTEMPTS the loop will make before giving up, as a multiple of
@@ -3922,7 +3925,7 @@ pub struct PairRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_cohort_active_streams_by_round: Option<Vec<u32>>,
     /// COHORT (D6) — the engine's depth-clamp reason histogram over the window. Safe keys stay
-    /// verbatim, and unsafe keys become stable engine-text seals:
+    /// verbatim, and unsafe keys become a fixed engine-text-withheld marker:
     /// the evidence for whether the window ACTUALLY SPECULATED (a cohort clamped to depth zero is
     /// a legitimate outcome the record must be able to state). OMITTED off the batched regime.
     /// AUDIT ONLY.
@@ -3946,16 +3949,15 @@ pub struct PairRecord {
     /// `attestation_refused` reason (clause (a)/(b) structural failures — NOT a run failure, NOT
     /// a pair rejection; nothing scores on this data). OMITTED when the leg carried no
     /// per-stream channel at all (non-batched regime, or capability not advertised and no
-    /// vectors on the wire). ADDITIVE diagnostic: every pre-existing field of this record is
-    /// byte-identical with or without it.
+    /// vectors on the wire). PRIVATE-AUDIT diagnostic: it is removed from public sealed output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial_per_stream_attestation: Option<PerStreamAttestationSeal>,
-    /// REPORT-ONLY (gap G2) — the CANDIDATE leg's sealed per-stream attestation; same posture as
+    /// REPORT-ONLY (gap G2) — the CANDIDATE leg's private per-stream attestation; same posture as
     /// [`serial_per_stream_attestation`](Self::serial_per_stream_attestation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_per_stream_attestation: Option<PerStreamAttestationSeal>,
     /// REPORT-ONLY (gap G2) — the pair's
-    /// [`bench_core::per_stream_attestation::composite_diagnostic`] over the two legs' sealed
+    /// [`bench_core::per_stream_attestation::composite_diagnostic`] over the two legs' private
     /// SUM aggregates, raised to the CERTIFIED exponent pair the contract declared
     /// ([`ScoredExponents::certify`]'s output, threaded through the cohort pair loop — never the
     /// raw code constants). Present only when BOTH legs sealed an Ok verdict AND the certified
@@ -3968,7 +3970,7 @@ pub struct PairRecord {
     pub per_stream_composite_diagnostic:
         Option<bench_core::per_stream_attestation::PerStreamCompositeDiagnostic>,
     /// REPORT-ONLY (NEAR-TIE STATS SEAL) — this pair's [`CohortNearTieSeal`]: the near-tie
-    /// characterization of the trusted oracle's replay report, sealed as the SIBLING of the ≤10%
+    /// characterization of the trusted oracle's replay report, retained only in the private audit.
     /// tolerance outcome that the same gate reached over the same report. OMITTED off the batched
     /// cohort regime (the single-stream path runs no trusted-oracle gate at all, so there is no
     /// replay report to characterize). ADDITIVE: every pre-existing field of this record is
@@ -7487,12 +7489,16 @@ mod seal_boundary_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn engine_digest_values_are_always_hashed_again() {
-        let raw = "ab".repeat(32);
-        let public = seal_engine_digest("head_provenance_sha256", &raw);
-        assert_eq!(public, bench_core::hash::sha256_hex(raw.as_bytes()));
-        assert_ne!(public, raw);
-        assert_eq!(public.len(), 64);
+    fn engine_digest_values_always_use_a_fixed_public_marker() {
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        let first_public = seal_engine_digest("head_provenance_sha256", &first);
+        let second_public = seal_engine_digest("runner_manifest_sha256", &second);
+        assert_eq!(first_public, ENGINE_VALUE_WITHHELD);
+        assert_eq!(second_public, ENGINE_VALUE_WITHHELD);
+        assert_eq!(first_public, second_public);
+        assert!(!first_public.contains(&first));
+        assert!(!second_public.contains(&second));
     }
 
     #[test]
@@ -9068,8 +9074,7 @@ mod tests {
 
         let reject = &out.results.rejected_pairs[0];
         assert_eq!(reject.class, "non-serial-tf-regime");
-        assert!(reject.reason.contains("engine-text-sha256="), "{reject:?}");
-        assert!(reject.reason.contains("engine-text-bytes=24"), "{reject:?}");
+        assert!(reject.reason.contains("engine-text-withheld"), "{reject:?}");
         assert!(!reject.reason.contains("PLANTED"), "{reject:?}");
         assert!(!reject.reason.contains("4242"), "{reject:?}");
     }
@@ -9262,15 +9267,10 @@ mod tests {
         .unwrap();
         assert!(out.candidate_accepted);
         let pair = &out.results.pairs[0];
-        let public_candidate_head = bench_core::hash::sha256_hex(CANDIDATE_HEAD_SHA.as_bytes());
-        let public_serial_head = bench_core::hash::sha256_hex(SERIAL_HEAD_SHA.as_bytes());
+        let public_candidate_head = ENGINE_VALUE_WITHHELD.to_string();
         assert_eq!(
             pair.head_provenance_sha256, public_candidate_head,
-            "head provenance = hash of the candidate-declared head value"
-        );
-        assert_ne!(
-            pair.head_provenance_sha256, public_serial_head,
-            "NOT the serial pinned head"
+            "head provenance uses the fixed public marker"
         );
         // The free-run series' two echoes: speculating candidate, depth-0 serial control.
         assert_eq!(pair.serial_effective_spec, SpecConfig::serial());
@@ -9287,6 +9287,7 @@ mod tests {
         let json = serde_json::to_string(&out.results).unwrap();
         assert!(json.contains(&public_candidate_head), "{json}");
         assert!(!json.contains(CANDIDATE_HEAD_SHA), "{json}");
+        assert!(!json.contains(SERIAL_HEAD_SHA), "{json}");
         // The MTP arm's depth cap is sealed; the dflash-specific field is OMITTED (mirror of the
         // dflash direction in `dflash_run_seals_dflash_depth_and_drops_the_mtp_field`).
         assert_eq!(
@@ -9316,10 +9317,7 @@ mod tests {
         .unwrap();
         assert!(out.candidate_accepted);
         let json = serde_json::to_string(&out.results).unwrap();
-        assert!(
-            json.contains(&bench_core::hash::sha256_hex(MARKER.as_bytes())),
-            "{json}"
-        );
+        assert!(json.contains(ENGINE_VALUE_WITHHELD), "{json}");
         assert!(!json.contains("PLANTED"), "{json}");
         assert!(!json.contains("4242"), "{json}");
     }
@@ -9461,8 +9459,7 @@ mod tests {
                 rej.reason
             );
             assert!(rej.reason.contains(SPECULATIVE_PROTOCOL_FLAG));
-            assert!(rej.reason.contains("engine-text-sha256="), "{rej:?}");
-            assert!(rej.reason.contains("engine-text-bytes=24"), "{rej:?}");
+            assert!(rej.reason.contains("engine-text-withheld"), "{rej:?}");
             assert!(!rej.reason.contains("PLANTED"), "{rej:?}");
             assert!(!rej.reason.contains("4242"), "{rej:?}");
         }
@@ -9474,7 +9471,7 @@ mod tests {
         assert!(tf_hello_carries_no_head_provenance(None).is_ok());
         let hp = head_prov(CANDIDATE_HEAD_SHA).unwrap();
         let err = tf_hello_carries_no_head_provenance(Some(&hp)).unwrap_err();
-        assert!(err.contains("engine-text-sha256="));
+        assert!(err.contains("engine-text-withheld"));
         assert!(!err.contains(CANDIDATE_HEAD_SHA));
         assert!(err.contains("gate-off worker cannot have produced one"));
         // The two v1.1-gated hello fields ride the SAME spawn gate, so the two predicates agree
@@ -12747,13 +12744,8 @@ mod tests {
         ] {
             assert!(pair.get(key).is_none(), "{key}");
         }
-        assert!(pair["serial_per_stream_attestation"]
-            .get("rounds")
-            .is_none());
-        assert_eq!(
-            pair["cohort_near_tie_seal"]["near_tie_refused"],
-            "the trusted oracle emitted no gaps at slot # position #"
-        );
+        assert!(pair.get("serial_per_stream_attestation").is_none());
+        assert!(pair.get("cohort_near_tie_seal").is_none());
         assert!(value["per_prompt"][0]
             .get("effective_mean_draft_len")
             .is_none());
@@ -12923,10 +12915,9 @@ mod tests {
             "classified as the free-run accounting barrier"
         );
         assert_eq!(rej.leg, "candidate");
-        assert!(
-            rej.reason.contains("acceptance_lengths"),
-            "reason names the doctored field: {}",
-            rej.reason
+        assert_eq!(
+            rej.reason,
+            "candidate leg: free-run decode consistency failure"
         );
     }
 
@@ -12943,10 +12934,9 @@ mod tests {
         assert!(!out.candidate_accepted);
         let rej = &out.results.rejected_pairs[0];
         assert_eq!(rej.class, "free-run-consistency");
-        assert!(
-            rej.reason.contains("completed_work"),
-            "reason names the forward counter: {}",
-            rej.reason
+        assert_eq!(
+            rej.reason,
+            "candidate leg: free-run decode consistency failure"
         );
     }
 
@@ -12962,10 +12952,9 @@ mod tests {
         assert!(!out.candidate_accepted);
         let rej = &out.results.rejected_pairs[0];
         assert_eq!(rej.class, "free-run-consistency");
-        assert!(
-            rej.reason.contains("committed tokens"),
-            "reason names the count invariant: {}",
-            rej.reason
+        assert_eq!(
+            rej.reason,
+            "candidate leg: free-run decode consistency failure"
         );
     }
 
@@ -14116,7 +14105,7 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&cohort_near_tie_seal(&report)).unwrap();
-        assert!(json.contains("engine-text-sha256="), "{json}");
+        assert!(json.contains("engine-text-withheld"), "{json}");
         assert!(!json.contains("PLANTED"), "{json}");
     }
 
@@ -14227,8 +14216,8 @@ mod tests {
             "sanity: the max is the per-stream reading, not the average ({average})"
         );
 
-        // WHERE IT LANDS in results.json: `pairs[i].cohort_near_tie_seal`, a SIBLING of the same
-        // pair's other report-only seals — values only, no verdict field anywhere in it.
+        // WHERE IT LANDS in the private audit: `pairs[i].cohort_near_tie_seal`, a SIBLING of the
+        // same pair's other report-only evidence — values only, no verdict field anywhere in it.
         let json = serde_json::to_value(&outcome.results).unwrap();
         let sealed = &json["pairs"][0]["cohort_near_tie_seal"];
         assert_eq!(sealed["rel_envelope"], json!(NEAR_TIE_MOCK_ENVELOPE));
@@ -15690,8 +15679,8 @@ mod tests {
         assert_eq!(sealed["tail_depth"], json!(2));
         let (_, unsafe_count) = sealed
             .iter()
-            .find(|(key, _)| key.starts_with("engine-text-sha256="))
-            .expect("the unsafe key has a stable seal");
+            .find(|(key, _)| key.starts_with("engine-text-withheld"))
+            .expect("the unsafe key has a withheld marker");
         assert_eq!(unsafe_count, &json!(3));
     }
 
@@ -15719,7 +15708,7 @@ mod tests {
             .unwrap();
         assert_eq!(sealed.len(), 1, "{json}");
         let (key, count) = sealed.iter().next().unwrap();
-        assert!(key.starts_with("engine-text-sha256="), "{json}");
+        assert!(key.starts_with("engine-text-withheld"), "{json}");
         assert_eq!(count, &json!(4_294_967_296u64));
     }
 
@@ -15835,27 +15824,15 @@ mod tests {
             verdict.decode_bounding[0]
         );
 
-        // And the SAME flag is visible in the sealed results.json BYTES — the artifact the box
-        // calibration pass (and any reviewer) actually reads.
+        // Engine-supplied evidence stays in the private audit and is absent from public bytes.
         let v: serde_json::Value =
             serde_json::from_str(&out.results.to_sealed_json().unwrap()).unwrap();
-        let sealed = &v["pairs"][0]["candidate_per_stream_attestation"];
-        assert_eq!(sealed["advertised"], json!(true));
-        assert_eq!(
-            sealed["verdict"]["decode_bounding"][3]["flagged_at_zero_tolerance"],
-            json!(true),
-            "the doctored slot's flag must be visible in the sealed artifact"
-        );
-        assert_eq!(
-            sealed["verdict"]["decode_bounding"][0]["flagged_at_zero_tolerance"],
-            json!(false)
-        );
-        assert_eq!(
-            sealed["verdict"]["tolerance_state"],
-            json!("unpinned-tolerances")
-        );
-        // The composite DIAGNOSTIC still seals (a flagged clause is evidence, not a refusal).
-        assert!(v["pairs"][0]["per_stream_composite_diagnostic"].is_object());
+        assert!(v["pairs"][0]
+            .get("candidate_per_stream_attestation")
+            .is_none());
+        assert!(v["pairs"][0]
+            .get("per_stream_composite_diagnostic")
+            .is_none());
         // And the SCORED composite is the SHARED-WINDOW one: recomputed here straight from the
         // sealed per-pair PARENT-clocked windows, it matches the sealed score exactly — so the
         // slot-3 lie that flagged above moved nothing, on a LIVE engine-driven run.
@@ -15980,20 +15957,12 @@ mod tests {
             );
             assert_eq!(*sha, c.members[i].prompt_sha256, "restated, not re-derived");
         }
-        // And in the sealed bytes.
+        // The exact evidence is private and absent from sealed public bytes.
         let v: serde_json::Value =
             serde_json::from_str(&out.results.to_sealed_json().unwrap()).unwrap();
-        assert_eq!(
-            v["per_cohort"][0]["per_stream_attestation_slot_order"]["rule"],
-            json!(PER_STREAM_SLOT_ORDER_RULE)
-        );
-        assert_eq!(
-            v["per_cohort"][0]["per_stream_attestation_slot_order"]["slot_prompt_sha256"]
-                .as_array()
-                .unwrap()
-                .len(),
-            COHORT_B
-        );
+        assert!(v["per_cohort"][0]
+            .get("per_stream_attestation_slot_order")
+            .is_none());
     }
 
     #[test]
@@ -16084,14 +16053,11 @@ mod tests {
         assert!(out.results.pairs[0]
             .per_stream_composite_diagnostic
             .is_none());
-        // Visible by name in the sealed artifact.
+        // The named refusal and defective vector remain private, not public.
         let v: serde_json::Value =
             serde_json::from_str(&out.results.to_sealed_json().unwrap()).unwrap();
-        assert!(
-            v["pairs"][0]["candidate_per_stream_attestation"]["attestation_refused"].is_string()
-        );
-        assert!(v["pairs"][0]["candidate_per_stream_attestation"]
-            .get("verdict")
+        assert!(v["pairs"][0]
+            .get("candidate_per_stream_attestation")
             .is_none());
     }
 

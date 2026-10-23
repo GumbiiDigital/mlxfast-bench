@@ -27,7 +27,7 @@ pub enum ReadOutcome {
     TimedOut,
 }
 
-/// Benchd-written process status and engine-written stderr from a failed child.
+/// Fixed public failure class and private-audit engine stderr from a failed child.
 pub struct FailureDiagnostic {
     pub detail: String,
     pub engine_text: String,
@@ -64,14 +64,12 @@ pub trait LineTransport {
     /// #134 — the POST-MORTEM for a stream-level failure: what the engine did on the way down.
     ///
     /// Called when a read ends the stream ([`ReadOutcome::Eof`]) without a response — the
-    /// signature that blocked Proof A. Implementations that own a child process return its wait
-    /// status plus the retained (already-redacted) worker-stderr tail, so the engine's own last
-    /// words reach benchd's error instead of being discarded with the transport. `None` (the
-    /// default) means "no child to autopsy" — the in-process
+    /// signature that blocked Proof A. Implementations that own a child process retain its exact
+    /// wait status and redacted worker-stderr tail in the private audit, while returning only a
+    /// fixed public class. `None` (the default) means "no child to autopsy" — the in-process
     /// [`MockEngine`](crate::mock::MockEngine) has nothing to add.
     ///
-    /// The returned detail is benchd-written. The engine text is for scrubbed diagnostic logs;
-    /// sealed errors include only its digest and byte count.
+    /// The returned detail is a fixed benchd-written class. Engine text is private-audit only.
     fn failure_diagnostic(&mut self) -> Option<FailureDiagnostic> {
         None
     }
@@ -1095,7 +1093,7 @@ enum WorkerEnding {
 
 impl WorkerEnding {
     fn describe(&self) -> String {
-        match self {
+        let exact = match self {
             WorkerEnding::SelfDirected(status) => describe_exit_status(status),
             WorkerEnding::KilledByBenchd => format!(
                 "worker was STILL RUNNING {:?} after it ended its output stream and was killed by \
@@ -1103,7 +1101,13 @@ impl WorkerEnding {
                 WORKER_EXIT_GRACE
             ),
             WorkerEnding::WaitFailed(e) => format!("worker wait failed: {e}"),
+        };
+        if crate::error::record_private_engine_value("worker-exit-status", &exact).is_err() {
+            eprintln!(
+                "benchd: private engine diagnostic audit write failed: class=worker-exit-status"
+            );
         }
+        "worker exited abnormally".to_string()
     }
 }
 
@@ -1163,11 +1167,8 @@ impl LineTransport for ChildStdioTransport {
         }
     }
 
-    /// #134 — a real child HAS an autopsy: its wait status and its redacted stderr tail.
-    /// This is what puts the engine's own last words into benchd's error instead of dropping
-    /// them with the transport. Note it is INDEPENDENT of stderr FORWARDING: an official
-    /// (sandboxed) spawn never echoes worker stderr to this process's stderr, but the tail is
-    /// still retained and still surfaces here, which is the only channel a sealed record has.
+    /// #134 — a real child HAS a private autopsy: its wait status and redacted stderr tail.
+    /// It is independent of stderr forwarding and never reaches the public error.
     fn failure_diagnostic(&mut self) -> Option<FailureDiagnostic> {
         Some(self.post_mortem())
     }

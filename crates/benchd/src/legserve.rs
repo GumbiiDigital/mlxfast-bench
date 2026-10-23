@@ -75,11 +75,18 @@ pub const LEG_SERVE_BOOT_FAILED: &str = "LEG-SERVE-BOOT-FAILED";
 pub const LEG_SERVE_INHERITED_SOCKET: &str = "LEG-SERVE-INHERITED-SOCKET";
 
 fn socket_file_text_seal(text: &str) -> String {
-    format!(
-        "class=resident-socket-file sha256={} length={}",
-        bench_core::hash::sha256_hex(text.as_bytes()),
-        text.len()
-    )
+    if bench_runner::error::record_private_engine_value("resident-socket-file", text).is_err() {
+        eprintln!(
+            "benchd: private engine diagnostic audit write failed: class=resident-socket-file"
+        );
+    }
+    "class=resident-socket-file value=withheld".to_string()
+}
+
+fn record_process_exit(class: &str, status: std::process::ExitStatus) {
+    if bench_runner::error::record_private_engine_value(class, &status.to_string()).is_err() {
+        eprintln!("benchd: private engine diagnostic audit write failed: class={class}");
+    }
 }
 
 /// The per-leg boot/teardown script THIS platform's trees carry. The argv contract behind the two
@@ -138,6 +145,7 @@ impl LegServe {
                 )
             })?;
         if !out.status.success() {
+            record_process_exit("resident-teardown-exit-status", out.status);
             let stderr =
                 bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
             let class = "resident-teardown-stderr";
@@ -147,8 +155,8 @@ impl LegServe {
             let sealed = bench_runner::error::engine_text_seal(&stderr);
             eprintln!("benchd: resident teardown diagnostic: class={class} {sealed}");
             return Err(format!(
-                "the {} leg's resident did not stop cleanly ({}): {}",
-                self.label, out.status, sealed
+                "the {} leg's resident teardown exited abnormally: {}",
+                self.label, sealed
             ));
         }
         self.stopped = true;
@@ -285,6 +293,7 @@ pub fn boot_leg(
             )
         })?;
     if !out.status.success() {
+        record_process_exit("resident-boot-exit-status", out.status);
         let stderr = bench_runner::scrub_engine_text(String::from_utf8_lossy(&out.stderr).trim());
         let class = "resident-boot-stderr";
         if bench_runner::error::record_private_engine_text(class, &stderr).is_err() {
@@ -293,8 +302,7 @@ pub fn boot_leg(
         let sealed = bench_runner::error::engine_text_seal(&stderr);
         eprintln!("benchd: engine diagnostic: class={class} {sealed}");
         return Err(format!(
-            "{LEG_SERVE_BOOT_FAILED}: the {label} leg's resident did not boot ({}): {}",
-            out.status, sealed
+            "{LEG_SERVE_BOOT_FAILED}: the {label} leg's resident boot exited abnormally: {sealed}"
         ));
     }
     let socket = std::fs::read_to_string(&socket_out)
@@ -371,8 +379,8 @@ mod tests {
     fn socket_file_log_seals_the_text() {
         let planted = "/tmp/PLANTED-PROMPT-TEXT.sock";
         let sealed = socket_file_text_seal(planted);
-        assert!(sealed.starts_with("class=resident-socket-file sha256="));
-        assert!(sealed.contains(&format!("length={}", planted.len())));
+        assert_eq!(sealed, "class=resident-socket-file value=withheld");
+        assert!(!sealed.contains("sha256=") && !sealed.contains("length="));
         assert!(!sealed.contains(planted));
         assert!(!sealed.contains("PLANTED"));
     }
@@ -438,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_script_stderr_is_digest_sealed() {
+    fn stop_script_stderr_is_withheld() {
         let dir = stub_workspace(Platform::Mlx, "/tmp/stop-stderr.sock");
         let leg = boot_leg(&dir, None, "candidate", Platform::Mlx).unwrap();
         let script = dir.join(leg_serve_script(Platform::Mlx));
@@ -453,7 +461,8 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let error = leg.stop().unwrap_err();
-        assert!(error.contains("engine-text-sha256="), "{error}");
+        assert!(error.contains("engine-text-withheld"), "{error}");
+        assert!(!error.contains("status 2"), "{error}");
         assert!(
             !error.contains("PLANTED") && !error.contains("4242"),
             "{error}"
@@ -668,7 +677,8 @@ mod tests {
             let err = boot_leg(&dir, None, "serial-control", Platform::Mlx).unwrap_err();
             assert!(err.contains(LEG_SERVE_BOOT_FAILED), "{name}: {err}");
             if name == "nonzero" {
-                assert!(err.contains("engine-text-sha256="), "{err}");
+                assert!(err.contains("engine-text-withheld"), "{err}");
+                assert!(!err.contains("status 2"), "{err}");
                 assert!(!err.contains("PLANTED") && !err.contains("4242"), "{err}");
             }
             let _ = std::fs::remove_dir_all(&dir);
