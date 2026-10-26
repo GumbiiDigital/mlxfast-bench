@@ -685,6 +685,10 @@ OPTIONS:
     --golden-bytes <N>           Integrity pin: refuse the golden unless its byte count matches
                                  (both pin flags must be given together; checked before parse).
                                  Repeatable, as --golden-sha256.
+    --correctness-golden <PATH>  OFFICIAL ONLY. The hidden correctness GoldenDocument pinned by
+                                 the contract. Its sha256+bytes must match the fixture pin; when it
+                                 differs from the sealed timed golden, its full correctness set runs
+                                 on a second fresh worker.
     --cool-gate                  Force the local GPU cool-down gate ON before each timed phase.
     --no-cool-gate               Force the cool-down gate OFF (overrides the per-mode default,
                                  e.g. local-submit's default-ON).
@@ -3779,6 +3783,9 @@ struct IterateArgs {
     /// The `--golden-sha256` / `--golden-bytes` pins, matched to `goldens` by position. Empty, or
     /// one per golden.
     golden_pins: Vec<GoldenIntegrityPin>,
+    /// The hidden correctness golden attested by the track fixture. Official paired runs execute
+    /// its full correctness set even when a different timed-pool golden is sealed.
+    correctness_golden: Option<PathBuf>,
     baseline_prefill_spt: Option<f64>,
     baseline_decode_spt: Option<f64>,
     mode: Mode,
@@ -3887,6 +3894,7 @@ static ITERATE_FLAGS: &[FlagSpec] = &[
     // Repeatable for the paired path, which cycles its pairs over the goldens. Each pin flag
     // matches `--golden` by position.
     FlagSpec::repeatable(&["--golden"]).required(),
+    FlagSpec::value(&["--correctness-golden"]),
     FlagSpec::value(&["--baseline-prefill-spt"]),
     FlagSpec::value(&["--baseline-decode-spt"]),
     FlagSpec::value(&["--mode"]),
@@ -3931,6 +3939,45 @@ static ITERATE_CLI: CliSpec<IterateArgs> = CliSpec {
     parse: parse_iterate_args,
 };
 
+const ITERATE_CORRECTNESS_GOLDEN_DIE8: &str = "correctness-golden pre-GPU refusal (die 8): ";
+
+fn iterate_correctness_golden_die8(message: impl std::fmt::Display) -> String {
+    format!("{ITERATE_CORRECTNESS_GOLDEN_DIE8}{message}")
+}
+
+fn load_iterate_contract(
+    path: Option<&Path>,
+    mode: Mode,
+) -> Result<
+    (
+        Option<contract::LoadedContract>,
+        Option<CorrectnessGoldenPin>,
+    ),
+    String,
+> {
+    if mode != Mode::Official {
+        return Ok((path.map(contract::load).transpose()?, None));
+    }
+    match path {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("--contract read failed ({}): {e}", path.display()))?;
+            let correctness_pin =
+                hidden_correctness_golden_pin_from_contract(&bytes).map_err(|e| {
+                    iterate_correctness_golden_die8(format!(
+                        "--contract correctness-golden pin: {e}"
+                    ))
+                })?;
+            let loaded = contract::LoadedContract {
+                contract: contract::Contract::parse(&bytes)?,
+                sha256: sha256_hex(&bytes),
+            };
+            Ok((Some(loaded), correctness_pin))
+        }
+        None => Ok((None, None)),
+    }
+}
+
 fn run_iterate(args: &[String]) -> ExitCode {
     run_cli(&ITERATE_CLI, args, |parsed| {
         // `Ok` means the run REACHED ITS END, not that a score exists. On a scored run a score
@@ -3941,7 +3988,14 @@ fn run_iterate(args: &[String]) -> ExitCode {
         // fail is an `Err` below.
         execute_iterate(parsed)
             .map(iterate_exit_status)
-            .map_err(|msg| (1, msg))
+            .map_err(|msg| {
+                let exit = if msg.starts_with(ITERATE_CORRECTNESS_GOLDEN_DIE8) {
+                    8
+                } else {
+                    1
+                };
+                (exit, msg)
+            })
     })
 }
 
@@ -4328,8 +4382,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // — reads THOSE bytes. STEP 3 (David 2026-09-15) made the file REQUIRED on every mode: the
     // per-track tables are gone, so a run without one cannot resolve a window, a model shape, a
     // denominator, a band or a weight, and it refuses BY NAME at the first of them rather than
-    // measuring under values nobody declared. `contract::load` also digests them, and the digest is sealed below as
-    // `metrics.contract_sha256` (THE MIGRATION PIN, David 2026-09-15), so the artifact records
+    // measuring under values nobody declared. The single read below also digests them, and the
+    // digest is sealed as `metrics.contract_sha256` (THE MIGRATION PIN, David 2026-09-15), so the artifact records
     // which fixture set the rules it was scored under. Loading here also certifies the fixture's
     // declared ranges BEFORE any worker spawns.
     //
@@ -4337,7 +4391,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // must be long enough for, and the checked-step arity the loader demands — is one of the values
     // the fixture may declare. A golden cannot be validated against a window the run has not
     // resolved yet.
-    let loaded_contract = args.contract.as_deref().map(contract::load).transpose()?;
+    let (loaded_contract, fixture_correctness_pin) =
+        load_iterate_contract(args.contract.as_deref(), args.mode)?;
     // THE FIXTURE EVERY RESOLVER READS FIRST (STEP 1 of the constants→contract migration, David
     // 2026-09-15). A run given no `--contract` resolves against `Contract::NONE_DECLARED` — a
     // fixture that declares nothing — so "no fixture" and "a fixture silent about this group" are
@@ -4389,10 +4444,88 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let golden = &goldens[0];
 
+    // The hidden correctness artifact is attested and parsed before any worker or resident opens.
+    // Reuse an already-loaded timed golden with the pinned digest; otherwise parse the attested
+    // bytes through the same GoldenDocument loader used for `--golden`.
+    let attested_correctness_bytes = if args.mode == Mode::Official {
+        match args.correctness_golden.as_ref() {
+            Some(path) => Some(std::fs::read(path).map_err(|e| {
+                iterate_correctness_golden_die8(format!(
+                    "--correctness-golden read failed ({}): {e}",
+                    path.display()
+                ))
+            })?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if args.mode == Mode::Official {
+        let attested_correctness_pin = attested_correctness_bytes
+            .as_ref()
+            .map(|bytes| CorrectnessGoldenPin {
+                sha256: sha256_hex(bytes),
+                bytes: bytes.len() as u64,
+            })
+            .or_else(|| {
+                fixture_correctness_pin.as_ref().and_then(|pin| {
+                    goldens
+                        .iter()
+                        .find(|golden| golden.sha256 == pin.sha256)
+                        .map(|golden| CorrectnessGoldenPin {
+                            sha256: golden.sha256.clone(),
+                            bytes: golden.byte_len,
+                        })
+                })
+            });
+        verify_correctness_golden_attestation(
+            attested_correctness_pin.as_ref(),
+            fixture_correctness_pin.as_ref(),
+        )
+        .map_err(iterate_correctness_golden_die8)?;
+    }
+    let loaded_correctness_golden = if args.mode == Mode::Official {
+        match fixture_correctness_pin.as_ref() {
+            Some(pin) if goldens.iter().all(|golden| golden.sha256 != pin.sha256) => {
+                let bytes = attested_correctness_bytes.as_deref().ok_or_else(|| {
+                    iterate_correctness_golden_die8(
+                        "the fixture-pinned correctness golden was not among the loaded --golden \
+                         files and no --correctness-golden bytes were available after attestation",
+                    )
+                })?;
+                Some(
+                    load_golden_bytes_checked(
+                        bytes,
+                        None,
+                        args.mode.golden_required_steps(&window),
+                        None,
+                        &track_id,
+                        &identity,
+                    )
+                    .map_err(iterate_correctness_golden_die8)?,
+                )
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let pinned_correctness_golden = if args.mode == Mode::Official {
+        fixture_correctness_pin.as_ref().and_then(|pin| {
+            goldens
+                .iter()
+                .find(|golden| golden.sha256 == pin.sha256)
+                .or(loaded_correctness_golden.as_ref())
+        })
+    } else {
+        None
+    };
+
     let validated_private_dir =
         if args.mode == Mode::Official && declared_contract.require_private_dir == Some(true) {
             let mut candidate_paths = args.goldens.clone();
             candidate_paths.extend(args.warmup_golden.iter().cloned());
+            candidate_paths.extend(args.correctness_golden.iter().cloned());
             Some(require_paired_private_dir(
                 std::env::var_os("MLXFAST_PRIVATE_DIR").as_deref(),
                 &candidate_paths,
@@ -4404,6 +4537,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             None
         };
     let mut sandbox_run_inputs = args.goldens.clone();
+    sandbox_run_inputs.extend(args.correctness_golden.iter().cloned());
     sandbox_run_inputs.extend(args.control_goldens.iter().cloned());
     sandbox_run_inputs.extend(args.warmup_golden.iter().cloned());
     sandbox_run_inputs.extend(args.baseline_calibration.iter().cloned());
@@ -4739,6 +4873,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         )?;
         official::official_gates_only(
             golden,
+            pinned_correctness_golden,
             ScoringInputs {
                 baseline_prefill_spt: baseline_prefill,
                 baseline_decode_spt: baseline_decode,
@@ -5124,6 +5259,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 decode_window_includes_seed: declared_contract.decode_window_includes_seed,
                 warmup_golden: warmup_golden.as_ref(),
                 decode_golden_offset: declared_contract.decode_golden_offset,
+                pinned_correctness_golden,
                 weights,
                 // The fixture is the only source. Absent keeps the exact rule.
                 token_tolerance_per_thousand: declared_contract.timed_token_tolerance_per_thousand,
@@ -5303,7 +5439,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                         .unwrap_or_else(|| args.mode.cool_gate_on_by_default()),
                     std::rc::Rc::clone(&gate_log),
                 );
-                let mut payload = official::official_core_windowed(
+                let mut payload = official::official_core_windowed_with_pinned_correctness(
                     official::OfficialParams {
                         golden,
                         scoring: ScoringInputs {
@@ -5318,6 +5454,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                         window: &window,
                     },
                     official.bands,
+                    pinned_correctness_golden,
                     spawn_timed,
                     cool_gate_fn,
                 );
@@ -7168,6 +7305,10 @@ fn build_iterate_args(flags: &ParsedFlags) -> Result<IterateArgs, String> {
             })
         })?
         .unwrap_or(Mode::LocalIterate);
+    let correctness_golden = flags.path("--correctness-golden");
+    if correctness_golden.is_some() && mode != Mode::Official {
+        return Err("--correctness-golden is only valid with --mode official".to_string());
+    }
     // Tri-state (#60.3): the table already refused the two spellings together, so at most one is
     // present and the reader is a plain lookup.
     let cool_gate = if flags.present("--cool-gate") {
@@ -7407,6 +7548,7 @@ fn build_iterate_args(flags: &ParsedFlags) -> Result<IterateArgs, String> {
         weights,
         goldens,
         golden_pins,
+        correctness_golden,
         baseline_prefill_spt,
         baseline_decode_spt,
         mode,
@@ -7683,6 +7825,48 @@ mod tests {
             .unwrap_err();
             assert!(error.starts_with("SANDBOX-OVERRIDE-REFUSED"), "{error}");
         }
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn correctness_golden_private_dir_guard_rejects_outside_and_escaping_symlink() {
+        let temp = std::env::temp_dir().join(format!(
+            "benchd-correctness-private-dir-test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let private = temp.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let public_golden = private.join("public.json");
+        let outside_correctness = temp.join("hidden.json");
+        std::fs::write(&public_golden, b"{}").unwrap();
+        std::fs::write(&outside_correctness, b"{}").unwrap();
+
+        let candidates = vec![public_golden.clone(), outside_correctness.clone()];
+        let error =
+            require_paired_private_dir(Some(private.as_os_str()), &candidates, &[], false, false)
+                .unwrap_err();
+        assert!(error.starts_with("GOLDEN-OUTSIDE-PRIVATE-DIR"), "{error}");
+
+        #[cfg(unix)]
+        {
+            let escaping = private.join("hidden-link.json");
+            std::os::unix::fs::symlink(&outside_correctness, &escaping).unwrap();
+            let candidates = vec![public_golden, escaping];
+            let error = require_paired_private_dir(
+                Some(private.as_os_str()),
+                &candidates,
+                &[],
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("GOLDEN-OUTSIDE-PRIVATE-DIR"), "{error}");
+        }
+
         std::fs::remove_dir_all(&temp).unwrap();
     }
 
@@ -9785,6 +9969,69 @@ mod tests {
         assert!(err.contains("--contract"), "{err}");
     }
 
+    #[test]
+    fn correctness_golden_is_a_usage_error_outside_official_mode() {
+        for extra in [
+            vec!["--mode", "local-iterate"],
+            vec!["--mode", "local-submit"],
+            vec!["--capture-baseline", "capture.json"],
+        ] {
+            let mut raw = vec![
+                "--engine",
+                "engine",
+                "--weights",
+                "weights",
+                "--golden",
+                "public.json",
+                "--correctness-golden",
+                "hidden.json",
+            ];
+            raw.extend(extra);
+            let args = argv(&raw);
+            let error = match parse_iterate_args(&args) {
+                Err(error) => error,
+                Ok(_) => panic!("non-official --correctness-golden must be a usage error"),
+            };
+            assert_eq!(
+                error,
+                "--correctness-golden is only valid with --mode official"
+            );
+            assert_eq!(run_iterate(&args), ExitCode::from(2));
+        }
+    }
+
+    #[test]
+    fn non_official_fixture_pin_does_not_reject_a_different_public_golden() {
+        let temp = std::env::temp_dir().join(format!(
+            "benchd-local-contract-pin-test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("fixture.json");
+        let fixture_pin = "f".repeat(64);
+        std::fs::write(
+            &path,
+            format!(r#"{{"hidden_correctness_golden":{{"sha256":"{fixture_pin}","bytes":7}}}}"#),
+        )
+        .unwrap();
+
+        let legacy = contract::load(&path).unwrap();
+        let (loaded, extracted_pin) =
+            load_iterate_contract(Some(&path), Mode::LocalIterate).unwrap();
+        let loaded = loaded.unwrap();
+        let public_golden = crate::testgolden::TestGolden::new().fixture();
+        assert_ne!(public_golden.sha256, fixture_pin);
+        assert!(extracted_pin.is_none());
+        assert_eq!(loaded.sha256, legacy.sha256);
+        assert_eq!(loaded.contract.track_id, legacy.contract.track_id);
+
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
     /// LOAD-BEARING PROOF that the arm gate survived the move into flow A: the OFFICIAL path's
     /// `enforce_official_arm_gate` (the file-read + parse + verdict the scored seal is gated on)
     /// REFUSES a fixture that declares `official_scoring_enabled: false` AND one that declares it not
@@ -11130,6 +11377,8 @@ mod tests {
             "w-dir",
             "--golden",
             "g.json",
+            "--correctness-golden",
+            "hidden.json",
             "--mode",
             "official",
             "--contract",
@@ -11146,6 +11395,10 @@ mod tests {
         ]);
         let parsed = parse_iterate_args(&official).unwrap().unwrap();
         assert_eq!(parsed.mode, Mode::Official);
+        assert_eq!(
+            parsed.correctness_golden,
+            Some(PathBuf::from("hidden.json"))
+        );
         assert_eq!(parsed.contract, Some(PathBuf::from("fixture.json")));
         assert_eq!(parsed.warmup_golden, Some(PathBuf::from("warm.json")));
         let warmup_pin = parsed.warmup_golden_pin.as_ref().unwrap();

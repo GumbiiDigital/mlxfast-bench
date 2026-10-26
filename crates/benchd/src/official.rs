@@ -718,9 +718,28 @@ where
     Ok((measured, warmup, held_session))
 }
 
+#[cfg(test)]
 pub fn official_core_windowed<T, FT, G>(
     run: OfficialParams<'_>,
     bands: AcceptanceBands,
+    spawn_timed: FT,
+    cool_gate: G,
+) -> ScorePayload
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    official_core_windowed_with_pinned_correctness(run, bands, None, spawn_timed, cool_gate)
+}
+
+/// The stored-baseline official path with the fixture-pinned correctness golden threaded
+/// separately from the timed/sealed golden. A distinct pin gets the same full conformance run on
+/// a second fresh worker that the paired official path uses.
+pub fn official_core_windowed_with_pinned_correctness<T, FT, G>(
+    run: OfficialParams<'_>,
+    bands: AcceptanceBands,
+    pinned_correctness_golden: Option<&GoldenFixture>,
     mut spawn_timed: FT,
     mut cool_gate: G,
 ) -> ScorePayload
@@ -783,20 +802,15 @@ where
     // take-closure hands `finish_official` that one held session exactly once.
     let mut held = Some(held_session);
     finish_official(
-        golden,
+        CorrectnessGoldens::new(golden, pinned_correctness_golden),
         scoring,
         bands,
         digests,
         commit,
         &measured,
-        move || {
-            held.take().ok_or_else(|| {
-                RunnerError::Protocol(
-                    "the window correctness phase was requested but the resident session was \
-                     already consumed"
-                        .to_string(),
-                )
-            })
+        move || match held.take() {
+            Some(session) => Ok(session),
+            None => spawn_timed(),
         },
     )
 }
@@ -1068,6 +1082,9 @@ pub struct PairedWindow<'a, G> {
     pub warmup_golden: Option<&'a GoldenFixture>,
     /// Decode displacement in the live golden set. Absent keeps the legacy same-golden path.
     pub decode_golden_offset: Option<usize>,
+    /// The fixture-pinned hidden correctness golden. It is separate from the timed prompt pool;
+    /// when present, official correctness must cover it even when another prompt's pair is sealed.
+    pub pinned_correctness_golden: Option<&'a GoldenFixture>,
     /// The composite weights this run scores and gates under, from the pinned track fixture
     /// (`score_decode_weight` / `score_prefill_weight`; STEP 1 of the constants→contract
     /// migration, David 2026-09-15), falling back to the 0.75/0.25 constants while no fixture
@@ -1109,7 +1126,9 @@ pub struct PairedWindow<'a, G> {
 ///   first pair that fails refuses the run ([`first_failing_pair`]). The run-level timing figures
 ///   are the means of the per-pair figures ([`seal_pair_means`]).
 ///
-/// Either way the full correctness set runs on the candidate golden of the lower-median pair.
+/// Either way the full correctness set runs on the candidate golden of the lower-median pair. If
+/// the fixture pins a different hidden correctness golden, its full set then runs on a fresh
+/// worker before the run can pass.
 ///
 /// RESIDENCY is sequential, and it brackets each leg on BOTH levels. `open_baseline_leg` /
 /// `open_candidate_leg` are the platform's per-leg ENGINE lifecycle: on a platform whose worker
@@ -1210,6 +1229,7 @@ where
         decode_window_includes_seed,
         warmup_golden,
         decode_golden_offset,
+        pinned_correctness_golden,
         weights,
         token_tolerance_per_thousand,
         near_tie_relative_gap,
@@ -1709,20 +1729,18 @@ where
     } else {
         let mut held = held_session;
         finish_official(
-            sealed_goldens.candidate,
+            CorrectnessGoldens::new(sealed_goldens.candidate, pinned_correctness_golden),
             paired_scoring,
             bands,
             digests,
             commit,
             candidate,
             move || {
-                held.take().ok_or_else(|| {
-                    RunnerError::Protocol(
-                        "the window correctness phase was requested but the resident session \
-                         was already consumed"
-                            .to_string(),
-                    )
-                })
+                if let Some(session) = held.take() {
+                    Ok(session)
+                } else {
+                    spawn_timed()
+                }
             },
         )
     };
@@ -2414,8 +2432,20 @@ fn with_measured_pairs(mut payload: ScorePayload, records: Vec<PairedLegRecord>)
 /// (non-finite → floors → bands), then FULL-scope correctness on a fresh worker, then the
 /// passing-score assembly. Separated from the timed phase so both the gating (with synthetic
 /// in-band timings) and the orchestration (with a mock timed phase) are unit-testable.
+#[derive(Clone, Copy)]
+struct CorrectnessGoldens<'a> {
+    sealed: &'a GoldenFixture,
+    pinned: Option<&'a GoldenFixture>,
+}
+
+impl<'a> CorrectnessGoldens<'a> {
+    fn new(sealed: &'a GoldenFixture, pinned: Option<&'a GoldenFixture>) -> Self {
+        Self { sealed, pinned }
+    }
+}
+
 fn finish_official<T, FC>(
-    golden: &GoldenFixture,
+    correctness_goldens: CorrectnessGoldens<'_>,
     scoring: ScoringInputs,
     bands: AcceptanceBands,
     digests: RunDigests<'_>,
@@ -2427,6 +2457,10 @@ where
     T: LineTransport,
     FC: FnMut() -> bench_runner::Result<Session<T>>,
 {
+    let CorrectnessGoldens {
+        sealed: golden,
+        pinned: pinned_correctness_golden,
+    } = correctness_goldens;
     let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     // 2. Official GATING, evaluated BEFORE correctness (Swift Score.swift:50-126,
     //    QwenRuntimeBenchmark.swift:513-558): non-finite score → the fixture's speedup floors
@@ -2537,6 +2571,79 @@ where
                 checked_steps: report.checked_steps(),
             },
         );
+    }
+
+    // The hidden correctness golden is a separate authority from the timed pool. When the sealed
+    // pair used another golden, run its full set on a newly spawned worker; dropping the first
+    // session before calling the spawner again makes the two correctness residencies independent.
+    drop(correctness_session);
+    if let Some(pinned) = pinned_correctness_golden.filter(|pinned| pinned.sha256 != golden.sha256)
+    {
+        let prefix = "pinned correctness golden: ";
+        let mut pinned_session = match spawn_correctness() {
+            Ok(session) => session,
+            Err(error) => {
+                return official_failed_with_timing(
+                    golden,
+                    digests,
+                    commit,
+                    format!("{prefix}correctness worker spawn failed: {error}"),
+                    timing,
+                    scoring,
+                )
+            }
+        };
+        let pinned_report = {
+            let mut adapter = SessionEngine {
+                session: &mut pinned_session,
+                drained_once: false,
+            };
+            match run_conformance(
+                &mut adapter,
+                pinned,
+                bench_core::constants::CORRECTNESS_STEPS,
+                CorrectnessScope::Full,
+                digests.model.vocab_size,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    return official_failed_with_timing(
+                        golden,
+                        digests,
+                        commit,
+                        format!("{prefix}{error}"),
+                        timing,
+                        scoring,
+                    )
+                }
+            }
+        };
+        if let Err(error) = pinned_session.close_phase() {
+            return official_failed_with_timing(
+                golden,
+                digests,
+                commit,
+                format!("{prefix}{error}"),
+                timing,
+                scoring,
+            );
+        }
+        if !pinned_report.passed {
+            let (case, step, error) = official_correctness_failure(&pinned_report);
+            return official_failed_with_timing_and_case(
+                golden,
+                digests,
+                commit,
+                format!("{prefix}{error}"),
+                timing,
+                scoring,
+                CorrectnessFailure {
+                    first_failing_case: case,
+                    first_failing_step: step,
+                    checked_steps: pinned_report.checked_steps(),
+                },
+            );
+        }
     }
 
     // 4. PASSING official score: the weighted-geometric-mean score (never coarsened),
@@ -2745,6 +2852,7 @@ pub fn author_sealed_commit(
 
 pub fn official_gates_only<T, FC>(
     golden: &GoldenFixture,
+    pinned_correctness_golden: Option<&GoldenFixture>,
     scoring: ScoringInputs,
     digests: RunDigests<'_>,
     commit: &str,
@@ -2828,6 +2936,77 @@ where
                 checked_steps: report.checked_steps(),
             },
         ));
+    }
+
+    // A fixture pin is an independent correctness authority. When it differs from the golden
+    // whose gates-only payload is sealed, execute its full set on a second fresh worker and fail
+    // closed at every boundary with an unmistakable prefix.
+    drop(correctness_session);
+    if let Some(pinned) = pinned_correctness_golden.filter(|pinned| pinned.sha256 != golden.sha256)
+    {
+        let prefix = "pinned correctness golden: ";
+        let mut pinned_session = match spawn_correctness() {
+            Ok(session) => session,
+            Err(error) => {
+                return Ok(official_gates_failed(
+                    golden,
+                    scoring,
+                    digests,
+                    commit,
+                    GatesFailure::message(format!(
+                        "{prefix}correctness worker spawn failed: {error}"
+                    )),
+                ))
+            }
+        };
+        let pinned_report = {
+            let mut adapter = SessionEngine {
+                session: &mut pinned_session,
+                drained_once: false,
+            };
+            match run_conformance(
+                &mut adapter,
+                pinned,
+                bench_core::constants::CORRECTNESS_STEPS,
+                CorrectnessScope::Full,
+                digests.model.vocab_size,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Ok(official_gates_failed(
+                        golden,
+                        scoring,
+                        digests,
+                        commit,
+                        GatesFailure::message(format!("{prefix}{error}")),
+                    ))
+                }
+            }
+        };
+        if let Err(error) = pinned_session.close_phase() {
+            return Ok(official_gates_failed(
+                golden,
+                scoring,
+                digests,
+                commit,
+                GatesFailure::message(format!("{prefix}{error}")),
+            ));
+        }
+        if !pinned_report.passed {
+            let (case, step, error) = official_correctness_failure(&pinned_report);
+            return Ok(official_gates_failed(
+                golden,
+                scoring,
+                digests,
+                commit,
+                GatesFailure {
+                    error: format!("{prefix}{error}"),
+                    first_failing_case: case,
+                    first_failing_step: step,
+                    checked_steps: pinned_report.checked_steps(),
+                },
+            ));
+        }
     }
 
     // PASSING gates-only score: partial_result=true (awaiting the timed overlay), null score,
@@ -3442,7 +3621,7 @@ mod tests {
         FC: Fn() -> MockEngine,
     {
         finish_official(
-            golden,
+            CorrectnessGoldens::new(golden, None),
             ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
@@ -3730,6 +3909,7 @@ mod tests {
             ));
         official_gates_only(
             golden,
+            None,
             ScoringInputs::local(prefill, decode),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3784,6 +3964,41 @@ mod tests {
         assert_eq!(
             payload.metrics.checked_steps,
             bench_core::constants::CORRECTNESS_STEPS as i64
+        );
+    }
+
+    #[test]
+    fn gates_only_runs_distinct_pinned_correctness_golden_and_fails_on_corruption() {
+        let sealed = official_golden(None);
+        let mut pinned = sealed.clone();
+        pinned.sha256 = "c".repeat(64);
+        pinned.cases[0].expected_tokens.fill(99);
+        let spawns = Cell::new(0usize);
+        let payload = official_gates_only(
+            &sealed,
+            Some(&pinned),
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            || {
+                spawns.set(spawns.get() + 1);
+                Session::connect(conformant_engine()).map(|(session, _)| session)
+            },
+        )
+        .unwrap();
+
+        assert!(!payload.passed);
+        assert_eq!(spawns.get(), 2, "the distinct pin needs a fresh worker");
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("pinned correctness golden: "),
+            "{}",
+            payload.metrics.error
         );
     }
 
@@ -4714,7 +4929,7 @@ mod tests {
         let mut timing = in_band_timing();
         timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
         let payload = finish_official(
-            &golden,
+            CorrectnessGoldens::new(&golden, None),
             ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
@@ -4778,7 +4993,7 @@ mod tests {
             emitted_tokens: Vec::new(),
         };
         finish_official(
-            golden,
+            CorrectnessGoldens::new(golden, None),
             ScoringInputs {
                 baseline_prefill_spt: CANDIDATE_PREFILL_SPT * prefill_speedup,
                 baseline_decode_spt: CANDIDATE_DECODE_SPT * decode_speedup,
@@ -4899,7 +5114,7 @@ mod tests {
         let mut timing = in_band_timing();
         timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
         let payload = finish_official(
-            &golden,
+            CorrectnessGoldens::new(&golden, None),
             ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
@@ -6194,6 +6409,7 @@ mod tests {
             decode_window_includes_seed: None,
             warmup_golden: None,
             decode_golden_offset: None,
+            pinned_correctness_golden: None,
             weights: ScoringWeights::DEFAULT,
             token_tolerance_per_thousand: None,
             near_tie_relative_gap: None,
@@ -7687,6 +7903,168 @@ mod tests {
         (first, second)
     }
 
+    fn run_three_golden_pinned_correctness_regression(combine: PairCombine) -> ScorePayload {
+        let mut candidate: Vec<_> = (0..3).map(prompt_distinct_golden).collect();
+        candidate[0].cases[0].expected_tokens.fill(99);
+        let control = candidate.clone();
+        let paired: Vec<_> = candidate
+            .iter()
+            .zip(&control)
+            .enumerate()
+            .map(|(index, (candidate, control))| PairedGoldens {
+                candidate,
+                control,
+                prompt: match index {
+                    0 => "prompt-0",
+                    1 => "prompt-1",
+                    _ => "prompt-2",
+                },
+            })
+            .collect();
+        let calibration = three_prompt_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let mut window = open_paired_window(3, combine);
+        window.pinned_correctness_golden = Some(&candidate[0]);
+
+        let payload = official_core_paired(
+            &paired,
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || {
+                    Session::connect(delayed_engine(1, 1, 25)).map(|(session, _)| session)
+                },
+                spawn_timed: || {
+                    let index = candidate_spawns.get();
+                    candidate_spawns.set(index + 1);
+                    let decode_ms = [50, 25, 1].get(index).copied().unwrap_or(1);
+                    Session::connect(delayed_engine(1, 1, decode_ms)).map(|(session, _)| session)
+                },
+            },
+            window,
+        );
+        assert_ne!(payload.metrics.golden_hash, candidate[0].sha256);
+        payload
+    }
+
+    #[test]
+    fn mean_mode_runs_pinned_correctness_golden_when_sealed_pair_uses_another_golden() {
+        let payload = run_three_golden_pinned_correctness_regression(PairCombine::Mean);
+        assert!(!payload.passed);
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("pinned correctness golden: "),
+            "{}",
+            payload.metrics.error
+        );
+    }
+
+    #[test]
+    fn lower_median_mode_runs_pinned_correctness_golden_when_sealed_pair_uses_another_golden() {
+        let payload = run_three_golden_pinned_correctness_regression(PairCombine::LowerMedian);
+        assert!(!payload.passed);
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("pinned correctness golden: "),
+            "{}",
+            payload.metrics.error
+        );
+    }
+
+    fn finish_with_pinned_and_spawn_count(
+        sealed: &GoldenFixture,
+        pinned: Option<&GoldenFixture>,
+        spawns: &Cell<usize>,
+    ) -> ScorePayload {
+        finish_official(
+            CorrectnessGoldens::new(sealed, pinned),
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &in_band_timing(),
+            || {
+                spawns.set(spawns.get() + 1);
+                Session::connect(conformant_engine()).map(|(session, _)| session)
+            },
+        )
+    }
+
+    #[test]
+    fn sealed_golden_is_pinned_golden_spawns_one_correctness_worker() {
+        let sealed = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let payload = finish_with_pinned_and_spawn_count(&sealed, Some(&sealed), &spawns);
+        assert!(payload.passed, "{}", payload.metrics.error);
+        assert_eq!(spawns.get(), 1);
+    }
+
+    #[test]
+    fn pinned_golden_clean_and_distinct_from_sealed_spawns_two_correctness_workers_and_passes() {
+        let sealed = official_golden(None);
+        let mut pinned = official_golden(None);
+        pinned.sha256 = "c".repeat(64);
+        let spawns = Cell::new(0usize);
+        let payload = finish_with_pinned_and_spawn_count(&sealed, Some(&pinned), &spawns);
+        assert!(payload.passed, "{}", payload.metrics.error);
+        assert_eq!(spawns.get(), 2);
+    }
+
+    #[test]
+    fn stored_baseline_official_runs_distinct_pinned_correctness_and_fails_on_corruption() {
+        let sealed = official_golden(None);
+        let mut pinned = sealed.clone();
+        pinned.sha256 = "c".repeat(64);
+        pinned.cases[0].expected_tokens.fill(99);
+        let spawns = Cell::new(0usize);
+
+        let payload = official_core_windowed_with_pinned_correctness(
+            test_run(
+                &sealed,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            FLOOR_ONLY_BANDS,
+            Some(&pinned),
+            || {
+                spawns.set(spawns.get() + 1);
+                Session::connect(delayed_engine(1, 1, 1)).map(|(session, _)| session)
+            },
+            |_phase: &str| Ok(()),
+        );
+
+        assert!(!payload.passed);
+        assert_eq!(spawns.get(), 2, "the distinct pin needs a fresh worker");
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("pinned correctness golden: "),
+            "{}",
+            payload.metrics.error
+        );
+    }
+
+    #[test]
+    fn no_correctness_pin_in_fixture_spawns_one_correctness_worker() {
+        let sealed = official_golden(None);
+        let spawns = Cell::new(0usize);
+        let payload = finish_with_pinned_and_spawn_count(&sealed, None, &spawns);
+        assert!(payload.passed, "{}", payload.metrics.error);
+        assert_eq!(spawns.get(), 1);
+    }
+
     /// THE PAIRS CYCLE OVER THE GOLDENS, in command-line order: with two goldens and four pairs,
     /// pairs 1 and 3 measure golden 1 and pairs 2 and 4 measure golden 2. Both legs of a pair are
     /// opened for the same golden. Each pair seals the golden it measured, `per_prompt` holds one
@@ -8276,7 +8654,7 @@ mod tests {
         candidate.prefill_seconds_per_token = control.prefill_seconds_per_token;
         candidate.decode_seconds_per_token = control.decode_seconds_per_token;
         let mut payload = finish_official(
-            &golden,
+            CorrectnessGoldens::new(&golden, None),
             ScoringInputs::local(
                 control.prefill_seconds_per_token,
                 control.decode_seconds_per_token,
@@ -9117,7 +9495,7 @@ mod tests {
                 (None, None),
             );
             let official = finish_official(
-                &golden,
+                CorrectnessGoldens::new(&golden, None),
                 scoring,
                 open_bands,
                 RunDigests::for_test(&weights),
@@ -9342,7 +9720,7 @@ mod tests {
                 // Single-leg official, and the paired lower-median gate on its scored pair: the
                 // same `finish_official` over the pair's own control leg.
                 let official = finish_official(
-                    &golden,
+                    CorrectnessGoldens::new(&golden, None),
                     scoring,
                     bands,
                     RunDigests::for_test(&weights),
